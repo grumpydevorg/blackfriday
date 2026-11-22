@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: BLACK FRIDAY AWS rehearsal (two real PHP migrations from one durable checkpoint).
+Parameters:
+  ArtifactBucket: {Type: String}
+  ImageKey: {Type: String}
+  BaseImageVersion: {Type: String}
+  WorkerKey: {Type: String}
+  WorkflowKey: {Type: String}
+  WebKey: {Type: String}
+  ReleaseId: {Type: String, AllowedPattern: '[0-9a-f]{64}'}
+Resources:
+  Runs:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}]
+      KeySchema: [{AttributeName: pk, KeyType: HASH}]
+      Tags: [{Key: project, Value: black-friday-demo}]
+  ImageLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda-microvms/black-friday-shop
+      RetentionInDays: 7
+  ImageBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: BuildOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/packages/image/*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ImageLogs.Arn
+  ShopImage:
+    Type: AWS::Lambda::MicrovmImage
+    Properties:
+      Name: black-friday-shop
+      BaseImageArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:microvm-image:al2023-1'
+      BaseImageVersion: !Ref BaseImageVersion
+      Description: Trusted PHP and PostgreSQL rehearsal runtime
+      AdditionalOsCapabilities: []
+      CpuConfigurations: [{Architecture: ARM_64}]
+      EnvironmentVariables: []
+      EgressNetworkConnectors:
+        - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS'
+      BuildRoleArn: !GetAtt ImageBuildRole.Arn
+      CodeArtifact: {Uri: !Sub 's3://${ArtifactBucket}/${ImageKey}'}
+      Resources: [{MinimumMemoryInMiB: 1024}]
+      Hooks:
+        Port: 8080
+        MicrovmImageHooks: {Ready: ENABLED, ReadyTimeoutInSeconds: 30}
+      Logging:
+        CloudWatch: {LogGroup: !Ref ImageLogs}
+      Tags: [{Key: project, Value: black-friday-demo}]
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/lambda/black-friday-evaluator, RetentionInDays: 7}
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EvaluateTrustedShop
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:RunMicrovm, lambda:GetMicrovm, lambda:TerminateMicrovm, lambda:CreateMicrovmAuthToken]
+                Resource: [!Ref ShopImage, !Sub '${ShopImage.ImageArn}:*']
+              - Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/runs/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt WorkerLogs.Arn
+  Evaluator:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: black-friday-evaluator
+      Architectures: [arm64]
+      Runtime: python3.13
+      Handler: evaluator.handler
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref WorkerKey}
+      Role: !GetAtt WorkerRole.Arn
+      LoggingConfig: {LogGroup: !Ref WorkerLogs}
+      Environment:
+        Variables:
+          ARTIFACT_BUCKET: !Ref ArtifactBucket
+          IMAGE_ARN: !Ref ShopImage
+          IMAGE_VERSION: !GetAtt ShopImage.LatestActiveImageVersion
+          RELEASE_ID: !Ref ReleaseId
+      MemorySize: 512
+      Timeout: 300
+      ReservedConcurrentExecutions: 4
+      Tags: [{Key: project, Value: black-friday-demo}]
+  EvaluatorVersion:
+    Type: AWS::Lambda::Version
+    UpdateReplacePolicy: Retain
+    Properties: {FunctionName: !Ref Evaluator, Description: !Ref ReleaseId}
+  WorkflowLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: /aws/lambda/black-friday-workflow, RetentionInDays: 7}
+  WorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RehearsalWorkflow
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:CheckpointDurableExecution, lambda:GetDurableExecutionState]
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:black-friday-workflow:*'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub '${Evaluator.Arn}:*'
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt Runs.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt WorkflowLogs.Arn
+  Workflow:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: black-friday-workflow
+      Architectures: [arm64]
+      Runtime: python3.13
+      Handler: workflow.handler
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref WorkflowKey}
+      Role: !GetAtt WorkflowRole.Arn
+      LoggingConfig: {LogGroup: !Ref WorkflowLogs}
+      Timeout: 90
+      MemorySize: 512
+      DurableConfig: {ExecutionTimeout: 172800, RetentionPeriodInDays: 7}
+      Environment:
+        Variables:
+          RUN_TABLE: !Ref Runs
+          EVALUATOR_ARN: !Ref EvaluatorVersion
+      Tags: [{Key: project, Value: black-friday-demo}]
+  WorkflowVersion:
+    Type: AWS::Lambda::Version
+    UpdateReplacePolicy: Retain
+    Properties: {FunctionName: !Ref Workflow, Description: !Ref ReleaseId}
+  WebRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: StageControls
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:PutItem]
+                Resource: !GetAtt Runs.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref WorkflowVersion
+              - Effect: Allow
+                Action: lambda:ListDurableExecutionsByFunction
+                Resource: [!GetAtt Workflow.Arn, !Sub '${Workflow.Arn}:*']
+              - Effect: Allow
+                Action: [lambda:GetDurableExecution, lambda:SendDurableExecutionCallbackSuccess]
+                Resource: !Sub '${Workflow.Arn}:*/durable-execution/*'
+  Web:
+    Type: AWS::Lambda::WebFunction
+    Properties:
+      FunctionName: black-friday-rehearsal
+      Tags: [{Key: project, Value: black-friday-demo}]
+  WebRevision:
+    Type: AWS::Lambda::WebFunctionRevision
+    Properties:
+      FunctionName: !Ref Web
+      BuildConfig:
+        CodeConfig: {S3Object: {Bucket: !Ref ArtifactBucket, Key: !Ref WebKey}}
+        RuntimeConfig: {Runtime: nodejs24.x}
+      ServiceConfig:
+        ExecutionRoleArn: !GetAtt WebRole.Arn
+        TimeoutSeconds: 15
+        MaxConcurrencyPerEnvironment: 8
+        EnvironmentVariables:
+          AWS_LAMBDA_NODEJS_ENTRYPOINT: index.mjs
+          RUN_TABLE: !Ref Runs
+          WORKFLOW_ARN: !Ref WorkflowVersion
+  Stage:
+    Type: AWS::Lambda::WebFunctionEndpoint
+    Properties:
+      FunctionName: !Ref Web
+      EndpointName: stage
+      EndpointType: HomeRegion
+      AuthType: IamAuth
+      RevisionWeights: [{RevisionId: !GetAtt WebRevision.RevisionId, Weight: 100}]
+      ScalingConfig: {MaxEnvironments: 2}
+      ThrottleConfig: {RateLimit: 100}
+Outputs:
+  StageUrl: {Value: !Sub 'https://${Stage.DomainName}'}
+  RunTable: {Value: !Ref Runs}
+  EvaluatorVersion: {Value: !Ref EvaluatorVersion}
+  WorkflowVersion: {Value: !Ref WorkflowVersion}
+  ImageArn: {Value: !Ref ShopImage}
+  ImageVersion: {Value: !GetAtt ShopImage.LatestActiveImageVersion}
+  ArtifactBucket: {Value: !Ref ArtifactBucket}
+  WorkerKey: {Value: !Ref WorkerKey}
+  WorkerRole: {Value: !GetAtt WorkerRole.Arn}

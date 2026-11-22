@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Disposable BLACK FRIDAY launch-wave scoring and Lambda fan-out proof.
+Parameters:
+  ArtifactBucket: {Type: String}
+  ArtifactKey: {Type: String}
+  ArtifactVersion: {Type: String}
+Resources:
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: 1
+  WorkflowLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-round'
+      RetentionInDays: 1
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteWorkerLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt WorkerLogs.Arn
+  Worker:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Architectures: [arm64]
+      Runtime: python3.13
+      Handler: launch_jobs.worker
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref ArtifactKey, S3ObjectVersion: !Ref ArtifactVersion}
+      Role: !GetAtt WorkerRole.Arn
+      LoggingConfig: {LogGroup: !Ref WorkerLogs}
+      MemorySize: 512
+      Timeout: 30
+      ReservedConcurrentExecutions: 8
+  WorkerVersion:
+    Type: AWS::Lambda::Version
+    Properties: {FunctionName: !Ref Worker}
+  WorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrchestrateLaunch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:CheckpointDurableExecution, lambda:GetDurableExecutionState]
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-round:*'
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref WorkerVersion
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt WorkflowLogs.Arn
+  Workflow:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-round'
+      Architectures: [arm64]
+      Runtime: python3.13
+      Handler: launch_jobs.workflow
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref ArtifactKey, S3ObjectVersion: !Ref ArtifactVersion}
+      Role: !GetAtt WorkflowRole.Arn
+      LoggingConfig: {LogGroup: !Ref WorkflowLogs}
+      MemorySize: 512
+      Timeout: 60
+      DurableConfig: {ExecutionTimeout: 300, RetentionPeriodInDays: 1}
+      Environment:
+        Variables: {LAUNCH_WORKER: !Ref WorkerVersion}
+  WorkflowVersion:
+    Type: AWS::Lambda::Version
+    Properties: {FunctionName: !Ref Workflow}
+Outputs:
+  WorkflowVersion: {Value: !Ref WorkflowVersion}
