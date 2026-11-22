@@ -138,21 +138,78 @@
   .rel .row span:first-child { font-family: var(--mono); font-size: 42px; }
   .verdict { margin-top: auto; font-family: var(--head); font-weight: 800; font-size: 60px; }
 
-  /* 8 showdown */
-  .tbl { width: 100%; border-collapse: collapse; font-size: 42px; }
-  .tbl td { padding: 26px 8px; border-top: 2px solid var(--line); }
-  .tbl tr:first-child td { border-top: 0; }
-  .tbl td:last-child { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .tbl .win td:last-child { color: var(--green); }
-  .tbl .lose td:last-child { color: var(--red); }
-  .side-note { margin-top: 30px; font-size: 44px; line-height: 1.3; color: var(--text); }
-  .side-note b { color: var(--amber); }
+  /* new section: status tags */
+  .status { position: absolute; top: 58px; right: 110px; display: flex; gap: 14px; }
+  .status .tag { font-size: 28px; padding: 6px 22px; background: rgba(6, 10, 28, .7); }
+  .pill { font-size: 22px; padding: 1px 12px; margin-left: 10px; white-space: nowrap; vertical-align: middle; }
+  h2.sm { font-size: 66px; }
+  code { font-family: var(--mono); color: var(--blue); }
+  .measured { margin-top: 18px; display: flex; gap: 22px; align-items: center; padding: 18px 28px; border: 2px solid var(--green); border-radius: 18px;
+              background: rgba(61, 220, 132, .07); font-size: 32px; line-height: 1.28; }
+  .measured b { color: var(--green); }
+  .cols2 { display: grid; grid-template-columns: 840px 1fr; gap: 40px; margin-top: 8px; align-items: stretch; }
+  .foot code { font-size: 24px; }
 
-  /* 9 fan-out */
-  .flow { display: flex; align-items: center; gap: 22px; margin: 20px 0 44px; }
-  .node { flex: 1; text-align: center; padding: 30px 16px; border-radius: 18px; border: 2px solid var(--c); background: var(--panel-2);
-          font-size: 38px; line-height: 1.2; color: var(--muted); }
-  .node b { display: block; font-family: var(--head); font-size: 50px; color: var(--c); margin-bottom: 6px; }
+  /* 8 two sides */
+  .sides { display: grid; grid-template-columns: 1fr 210px 1.25fr; align-items: stretch; margin-top: 10px; flex: 1; margin-bottom: 20px; }
+  .side { border-top: 10px solid var(--c); padding: 26px 32px; }
+  .side h3 { font-family: var(--head); font-weight: 800; font-size: 42px; line-height: 1.12; margin-bottom: 16px; }
+  .side p { font-size: 34px; line-height: 1.3; color: var(--muted); }
+  .side p b { color: var(--text); font-weight: 600; }
+  .code1 { font-family: var(--mono); font-size: 40px; font-weight: 700; color: var(--blue); }
+  .push { align-self: center; text-align: center; font-family: var(--mono); font-size: 30px; font-weight: 700; color: var(--orange); }
+  .push .big { font-size: 100px; line-height: .9; }
+  .rows .r { display: grid; grid-template-columns: 290px 1fr; gap: 18px; align-items: center; padding: 10px 0 10px 18px; border-left: 8px solid var(--c); margin-bottom: 12px; }
+  .rows .r b { font-family: var(--head); font-weight: 800; font-size: 36px; color: var(--c); line-height: 1.1; }
+  .rows .r span { font-size: 30px; line-height: 1.22; color: var(--text); }
+  .rows .r span.tag { color: var(--amber); display: inline-block; margin: 4px 0 0; }
+  .rows .r em span.tag { margin: 0 0 0 8px; }
+  #s14 .foot { margin-top: 24px; }
+  .side p { font-size: 38px; }
+  #s9 .pr { padding: 8px 0; }
+  .rows .r em { font-style: normal; color: var(--amber); }
+  .headline-line { font-family: var(--head); font-weight: 800; font-style: italic; font-size: 62px; text-align: center; line-height: 1.1; margin-bottom: 14px; }
+  .headline-line span { color: var(--orange); }
+
+  /* 9 tiny cloud */
+  .snippet { padding: 26px 30px; }
+  .snippet pre { font-family: var(--mono); font-size: 25px; line-height: 1.5; color: var(--text); white-space: pre; }
+  .plan { padding: 22px 30px; }
+  .plan .ph { font-size: 24px; letter-spacing: 3px; text-transform: uppercase; color: var(--muted); font-weight: 600; margin-bottom: 6px; }
+  .pr { display: grid; grid-template-columns: 46px 1fr auto; column-gap: 12px; padding: 12px 0; border-top: 2px solid var(--line); }
+  .pr:first-of-type { border-top: 0; }
+  .pr .sym { font-family: var(--mono); font-weight: 800; font-size: 40px; color: var(--c); line-height: 1.1; }
+  .pr .nm { font-family: var(--head); font-weight: 800; font-size: 36px; }
+  .pr .co { font-family: var(--mono); font-size: 30px; font-weight: 700; color: var(--c); align-self: center; }
+  .pr .sp { grid-column: 2 / 4; font-size: 28px; color: var(--muted); line-height: 1.22; }
+  .pr.bad .sp { color: #ffb3ad; }
+
+  /* 10 MicroVM */
+  .c10 { grid-template-columns: 1fr 700px; }
+  .diag { display: flex; align-items: center; gap: 10px; }
+  .judge { padding: 18px 14px; border-radius: 16px; border: 2px solid var(--orange); background: var(--panel-2); text-align: center; font-size: 26px; color: var(--muted); }
+  .judge b { display: block; font-family: var(--head); font-size: 32px; color: var(--orange); }
+  .vm { flex: 1; border: 3px dashed var(--green); border-radius: 22px; padding: 18px 20px 6px; background: rgba(61, 220, 132, .06); }
+  .vm .lab { font-size: 24px; letter-spacing: 3px; text-transform: uppercase; color: var(--green); font-weight: 700; margin-bottom: 12px; }
+  .vm .line { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .vm .n { flex: 1; text-align: center; padding: 14px 6px; border-radius: 14px; background: var(--panel-2); border: 2px solid var(--line); font-size: 24px; line-height: 1.2; color: var(--muted); }
+  .vm .n b { display: block; font-family: var(--head); font-size: 30px; color: var(--text); }
+  .vm .n.out { border: 2px dashed var(--orange); }
+  .vm .arrow { font-size: 34px; }
+  .diag > .arrow { font-size: 42px; }
+  .limits { padding: 26px 32px; }
+  .limits ul { list-style: none; font-size: 34px; line-height: 1.25; color: var(--muted); }
+  .limits li { padding: 11px 0 11px 34px; position: relative; border-top: 2px solid var(--line); }
+  .limits li:first-child { border-top: 0; }
+  .limits li::before { content: ""; position: absolute; left: 0; top: 24px; width: 14px; height: 14px; border-radius: 50%; background: var(--green); }
+  .limits b { color: var(--text); font-weight: 600; }
+  .warn-line { margin-top: 18px; display: flex; gap: 20px; align-items: center; padding: 16px 24px; border: 3px solid var(--amber); border-radius: 18px;
+               background: rgba(255, 194, 51, .09); font-size: 30px; line-height: 1.25; color: var(--text); }
+
+  .flow { display: flex; align-items: center; gap: 22px; margin: 14px 0 30px; }
+  .node { flex: 1; text-align: center; padding: 26px 16px; border-radius: 18px; border: 2px solid var(--c); background: var(--panel-2);
+          font-size: 34px; line-height: 1.2; color: var(--muted); }
+  .node b { display: block; font-family: var(--head); font-size: 46px; color: var(--c); margin-bottom: 6px; }
   .flow .arrow { font-size: 60px; }
   .stats { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 28px; }
   .stat { text-align: center; padding: 44px 12px; }
@@ -160,30 +217,60 @@
   .stat .l { font-size: 38px; color: var(--muted); margin-top: 16px; line-height: 1.25; }
   .stat.a .v { color: var(--red); } .stat.b .v { color: var(--green); }
   .stat.c .v { color: var(--amber); } .stat.d .v { color: var(--blue); font-size: 100px; }
-  #s9 .foot { font-size: 30px; }
+  #s11 .foot { font-size: 28px; }
+  #s9 .foot { margin-top: 20px; font-size: 25px; }
+  #s10 .diag { margin-top: 10px; }
+  #s10 .judge { font-size: 30px; } #s10 .judge b { font-size: 38px; }
+  #s10 .vm .n { font-size: 28px; padding: 20px 6px; } #s10 .vm .n b { font-size: 34px; }
+  #s10 .vm .line { margin-bottom: 22px; } #s10 .vm .lab { font-size: 28px; }
+  #s10 .measured { font-size: 36px; padding: 24px 30px; }
+  #s10 .limits ul { font-size: 38px; } #s10 .limits li::before { top: 28px; }
+  #s10 .limits li { padding: 18px 0 18px 36px; }
+  #s10 .warn-line { font-size: 36px; margin-top: 24px; }
+  #s11 .tnote { font-size: 42px; margin-top: 44px; }
+  #s11 .stat .l { font-size: 42px; }
+  #s12 table.lay td { padding: 30px 30px; font-size: 40px; } #s12 table.lay td:first-child { font-size: 44px; width: 560px; }
+  #s12 .steps { margin-top: 36px; } #s12 .steps .chip { font-size: 34px; padding: 22px 10px; }
+  #s12 .foot { font-size: 32px; }
+  /* 11 judging note */
+  #s11 .stat { padding: 30px 12px; }
+  #s11 .stat .v { font-size: 104px; }
+  #s11 .stat.d .v { font-size: 88px; }
+  .tnote { margin-top: 26px; font-size: 36px; line-height: 1.3; color: var(--text); }
 
-  /* 10 microvms */
-  .three { display: grid; grid-template-columns: 1fr 1fr 1.1fr; gap: 34px; margin-top: 20px; flex: 1; margin-bottom: 10px; }
-  .col h3 { font-family: var(--head); font-weight: 800; font-size: 48px; margin: 16px 0 20px; line-height: 1.1; }
-  .col ul { list-style: none; font-size: 38px; line-height: 1.28; color: var(--muted); }
-  .col li { margin-bottom: 18px; padding-left: 36px; position: relative; }
-  .col li::before { content: ""; position: absolute; left: 0; top: .5em; width: 16px; height: 16px; border-radius: 50%; background: var(--c); }
-  .col li b { color: var(--text); font-weight: 600; }
-  .col { border-top: 10px solid var(--c); padding: 34px 36px; }
+  /* 12 layers */
+  table.lay { width: 100%; border-collapse: separate; border-spacing: 0 12px; margin-top: 6px; }
+  table.lay td { background: var(--panel-2); padding: 20px 26px; font-size: 34px; line-height: 1.25; vertical-align: middle; border-top: 2px solid var(--line); border-bottom: 2px solid var(--line); }
+  table.lay td:first-child { border-left: 10px solid var(--c); border-radius: 16px 0 0 16px; font-family: var(--head); font-weight: 800; font-size: 38px; width: 520px; }
+  table.lay td:last-child { border-right: 2px solid var(--line); border-radius: 0 16px 16px 0; color: var(--muted); }
+  table.lay td b { color: var(--green); font-weight: 600; }
+  .steps { display: flex; align-items: center; gap: 12px; margin-top: 22px; }
+  .steps .chip { flex: 1; text-align: center; padding: 16px 10px; border-radius: 14px; background: var(--panel-2); border: 2px solid var(--blue); font-family: var(--mono); font-size: 30px; font-weight: 700; white-space: nowrap; }
+  .steps .arrow { font-size: 40px; }
 
-  /* 11 managed */
+  /* 13 line */
+  .line2 { flex: 1; margin-bottom: 20px; margin-top: 16px; }
+  .xl { list-style: none; font-size: 42px; line-height: 1.25; margin-top: 10px; }
+  .xl li { padding: 16px 0; border-top: 2px solid var(--line); }
+  .xl li:first-child { border-top: 0; }
+  .xl small { display: block; font-size: 28px; color: var(--muted); }
+
+  /* 14 managed */
   .notmeasured { margin-top: 30px; border: 3px solid var(--amber); border-radius: 22px; padding: 44px 48px; background: rgba(255, 194, 51, .08); }
   .notmeasured h3 { font-family: var(--head); font-weight: 800; font-size: 84px; color: var(--amber); margin-bottom: 14px; }
   .notmeasured p { font-size: 46px; line-height: 1.3; color: var(--text); }
-  #s11 .lede { font-size: 46px; margin-bottom: 30px; }
-  #s11 .rel { padding: 34px 40px; }
-  #s11 .rel h3 { font-size: 58px; }
-  #s11 .rel .what { font-size: 42px !important; }
+  #s14 .lede { font-size: 46px; margin-bottom: 30px; }
+  #s14 .rel { padding: 34px 40px; }
+  #s14 .rel h3 { font-size: 58px; }
+  #s14 .rel .what { font-size: 42px !important; }
 
-  /* 12 arena */
-  .arena-split { display: grid; grid-template-columns: 1180px 1fr; gap: 56px; align-items: center; margin-top: 10px; }
-  .takeaway { font-family: var(--head); font-weight: 800; font-style: italic; font-size: 54px; line-height: 1.2; }
-  .takeaway span { color: var(--orange); display: block; margin-top: 22px; }
+  /* 15 arena */
+  .arena-split { display: grid; grid-template-columns: 960px 1fr; gap: 44px; align-items: start; margin-top: 10px; }
+  .arena-side { display: flex; flex-direction: column; gap: 22px; }
+  .arena-side .panel { border-top: 10px solid var(--c); padding: 24px 30px; }
+  .arena-side h3 { font-family: var(--head); font-weight: 800; font-size: 46px; margin: 10px 0 8px; }
+  .arena-side p { font-size: 36px; line-height: 1.3; color: var(--muted); }
+  .arena-side code { font-size: 30px; white-space: nowrap; }
 
   /* 13 fine print */
   .fine { list-style: none; font-size: 44px; line-height: 1.26; margin-top: 10px; }
@@ -344,31 +431,100 @@
 
   <!-- 8 -->
   <section class="slide" id="s8">
-    <div class="kicker">Teams decide how to scale the shop</div>
-    <h2>More replicas <span class="hot">didn&rsquo;t fix it</span></h2>
-    <div class="split" style="grid-template-columns: 1fr 600px;">
-      <div class="figure">
-        <img class="img" src="../assets/architecture-showdown.png" alt="Concept art: a healthy architecture beside a failing one">
-        <div class="caption">Concept art, not results</div>
+    <div class="kicker">Two sides of the infrastructure</div>
+    <div class="status"><span class="tag ok">Built and run</span><span class="tag warn">Proposed</span></div>
+    <h2>The team&rsquo;s cloud, <span class="hot">our Lambda</span></h2>
+    <div class="sides">
+      <div class="panel side" style="--c:var(--amber)">
+        <h3>The team&rsquo;s side: a small, constrained cloud</h3>
+        <span class="tag warn pill" style="margin:0 0 22px">Proposed</span>
+        <div class="code1">infra/template.yaml</div>
+        <p>declaring <b>EC2 &middot; Auto Scaling &middot; RDS &middot; ElastiCache &middot; ALB</b></p>
+        <div class="code1" style="margin-top:26px">app/</div>
+        <p>the shop code</p>
       </div>
-      <div>
-        <div class="panel" style="padding: 22px 30px;">
-          <table class="tbl">
-            <tr class="lose"><td>Small</td><td>1,558 sales</td></tr>
-            <tr class="lose"><td>Extra replica</td><td>1,558 sales</td></tr>
-            <tr class="win"><td>Large</td><td>2,216 sales</td></tr>
-            <tr class="win"><td>Cached</td><td>2,216 sales</td></tr>
-          </table>
+      <div class="push"><div class="big">&rarr;</div>git push</div>
+      <div class="panel side" style="--c:var(--green)">
+        <h3>Our side: real Lambda</h3>
+        <div class="rows">
+          <div class="r" style="--c:var(--blue)"><b>Web Function</b><span>arena <em>&middot; registration &middot; leaderboard <span class="tag warn pill">Proposed</span></em></span></div>
+          <div class="r" style="--c:var(--purple)"><b>Durable Function</b><span>rounds, cutoffs, fan-out</span></div>
+          <div class="r" style="--c:var(--orange)"><b>Event Functions</b><span>one judge per team &times; week</span></div>
+          <div class="r" style="--c:var(--red)"><b>MicroVMs</b><span>each &lsquo;EC2 instance&rsquo; is a tiny disposable VM</span></div>
+          <div class="r" style="--c:var(--amber)"><b>Virtual RDS</b><span>shared state outside the VM <span class="tag warn pill">Proposed</span></span></div>
         </div>
-        <div class="side-note">The storage tier was the <b>bottleneck</b>.</div>
       </div>
     </div>
-    <div class="foot">Measured: Launch wave, 4 designs &times; 8 seeded scenarios, Oregon, 22 Nov 2026.</div>
+    <div class="headline-line">Teams scale the shop. <span>We scale the judging.</span></div>
   </section>
 
   <!-- 9 -->
   <section class="slide" id="s9">
-    <div class="kicker">Organisers decide how to scale the judging</div>
+    <div class="kicker">The team&rsquo;s side</div>
+    <div class="status"><span class="tag warn">Proposed</span></div>
+    <h2>The team&rsquo;s <span class="hot">tiny cloud</span></h2>
+    <div class="cols2">
+      <div class="panel snippet">
+<pre>Db:
+  Type: AWS::RDS::DBInstance
+  Properties: {DBInstanceClass: db.t4g.large}
+Cache:
+  Type: AWS::ElastiCache::CacheCluster
+ShopA:            # ShopB is the same
+  Type: AWS::EC2::Instance
+  Properties: {InstanceType: t4g.small}
+TargetGroup:
+  Type: AWS::ElasticLoadBalancingV2::TargetGroup</pre>
+      </div>
+      <div class="panel plan">
+        <div class="ph">Plan, posted as a GitHub check</div>
+        <div class="pr" style="--c:var(--green)"><span class="sym">+</span><span class="nm">Cache</span><span class="co">+$12/week</span><span class="sp">ElastiCache cache.t4g.micro</span></div>
+        <div class="pr" style="--c:var(--amber)"><span class="sym">~</span><span class="nm">Db</span><span class="co">+$30/week</span><span class="sp">db.t4g.small &rarr; db.t4g.large, modify</span></div>
+        <div class="pr" style="--c:var(--blue)"><span class="sym">&minus;</span><span class="nm">ShopB</span><span class="co">&minus;$8/week</span><span class="sp">EC2 t4g.small</span></div>
+        <div class="pr bad" style="--c:var(--red)"><span class="sym">!</span><span class="nm">Db</span><span class="co">REPLACE</span><span class="sp">Engine postgres &rarr; aurora: data will NOT carry over without a migration</span></div>
+      </div>
+    </div>
+    <div class="measured"><span class="tag ok">Measured</span><span>Oregon launch-wave run: an extra replica sold the same as small (<b>1,558</b>); large and cached sold <b>2,216</b>. The storage tier was the bottleneck.</span></div>
+    <div class="foot">Allowed types only; IAM, Lambda, custom resources and Transform are rejected. CDK is fine locally: commit the synthesized template (we never run <code>cdk synth</code>).</div>
+  </section>
+
+  <!-- 10 -->
+  <section class="slide" id="s10">
+    <div class="kicker">MicroVMs</div>
+    <div class="status"><span class="tag ok">Built and run</span></div>
+    <h2>One instance = <span class="hot">one tiny MicroVM</span></h2>
+    <div class="cols2 c10">
+      <div class="leftcol">
+        <div class="diag">
+          <div class="judge"><b>Judge</b>HTTP in</div>
+          <div class="arrow">&rarr;</div>
+          <div class="vm">
+            <div class="lab">MicroVM</div>
+            <div class="line"><div class="n"><b>gateway</b>:8080</div><div class="arrow">&rarr;</div><div class="n"><b>app</b>the shop</div><div class="arrow">&rarr;</div><div class="n"><b>/state</b>SQLite / PostgreSQL</div></div>
+            <div class="line"><div class="n"><b>payment relay</b></div><div class="arrow">&rarr;</div><div class="n out"><b>S3 receipt</b>one-use, leaves the VM</div></div>
+          </div>
+        </div>
+        <div class="measured" style="margin-top:26px"><span class="tag ok">Measured</span><span>A reviewed PHP shop at a frozen Git commit ran in a real Oregon MicroVM: <b>82 sales &times; $25 = $2,050</b>. No outside code run.</span></div>
+      </div>
+      <div class="rightcol">
+        <div class="panel limits">
+          <ul>
+            <li><b>Max 120&nbsp;s</b>, then destroyed</li>
+            <li><b>No AWS role</b></li>
+            <li><b>Inbound only from the judge</b>: port 8080, 3-minute token</li>
+            <li><b>Fixed size</b>: 1&nbsp;GiB, ARM64</li>
+            <li><b>Fresh VM per stage</b>; only the exported database carries forward</li>
+          </ul>
+        </div>
+        <div class="warn-line"><span class="tag warn">Warning</span><span>Outbound internet is still on &mdash; must be off before running anyone else&rsquo;s code.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 11 -->
+  <section class="slide" id="s11">
+    <div class="kicker">Our side scales the judging</div>
+    <div class="status"><span class="tag ok">Built and run</span></div>
     <h2>Durable fans out <span class="hot">Event judges</span></h2>
     <div class="flow">
       <div class="node" style="--c:var(--purple)"><b>Durable workflow</b>runs the round</div>
@@ -383,49 +539,58 @@
       <div class="panel stat c"><div class="v">6.5&times;</div><div class="l">faster</div></div>
       <div class="panel stat d"><div class="v">Same</div><div class="l">scores</div></div>
     </div>
+    <div class="tnote">In a tournament, teams run in parallel; each team&rsquo;s weeks run in order, because state carries forward. <span class="tag warn pill">Proposed</span></div>
     <div class="foot"><b>One observation</b>, Oregon, 22 Nov 2026. Not cold-start controlled; excludes stack setup and teardown. 62,336 real loopback HTTP requests per pass.</div>
   </section>
 
-  <!-- 10 -->
-  <section class="slide" id="s10">
-    <div class="kicker">MicroVMs</div>
-    <h2>Real code, <span class="hot">apart from the judge</span></h2>
-    <div class="three">
-      <div class="panel col" style="--c:var(--green)">
-        <span class="tag ok">Run</span>
-        <h3>What we have shown</h3>
-        <ul>
-          <li>One <b>reviewed</b> PHP fixture at a frozen commit</li>
-          <li>In a real Oregon MicroVM</li>
-          <li><b>82 sales &times; $25 = $2,050</b></li>
-          <li>Disposable, roleless, 120&nbsp;s cap</li>
+  <!-- 12 -->
+  <section class="slide" id="s12">
+    <div class="kicker">What is stored</div>
+    <div class="status"><span class="tag warn">Proposed</span></div>
+    <h2 class="sm">Resources are records. <span class="hot">VMs exist only while running.</span></h2>
+    <table class="lay">
+      <tr style="--c:var(--blue)"><td>Our infrastructure</td><td>Real CloudFormation stacks</td></tr>
+      <tr style="--c:var(--amber)"><td>Team&rsquo;s declared infrastructure</td><td>Frozen template plus per-resource records (S3 + DynamoDB). Changes once per round.</td></tr>
+      <tr style="--c:var(--green)"><td>Team&rsquo;s data and business</td><td>Database contents, carts, orders, payments, returning customers, profit. <b>A new saved copy every simulated week, never overwritten.</b></td></tr>
+    </table>
+    <div class="steps">
+      <div class="chip">restore</div><div class="arrow">&rarr;</div><div class="chip">boot</div><div class="arrow">&rarr;</div><div class="chip">play the week</div><div class="arrow">&rarr;</div><div class="chip">export</div><div class="arrow">&rarr;</div><div class="chip">destroy</div><div class="arrow">&rarr;</div><div class="chip">save</div>
+    </div>
+    <div class="foot">Same commit + template + scenario + seed + starting state + judge version = same result, so retries never double count.</div>
+  </section>
+
+  <!-- 13 -->
+  <section class="slide" id="s13">
+    <div class="kicker">Where the line sits</div>
+    <div class="status"><span class="tag ok">Built and run</span><span class="tag warn">Proposed</span></div>
+    <h2>What crosses <span class="hot">the line</span></h2>
+    <div class="two line2">
+      <div class="panel rel" style="--c:var(--green)">
+        <h3>Crosses the line</h3>
+        <ul class="xl">
+          <li>HTTP to the shop <small>judge &rarr; VM</small></li>
+          <li>Named database calls <small>VM &rarr; Virtual RDS</small> <span class="tag warn pill">Proposed</span></li>
+          <li>Payment receipts <small>VM &rarr; S3, one-use link</small></li>
+          <li>Scores <small>judge &rarr; arena</small></li>
         </ul>
       </div>
-      <div class="panel col" style="--c:var(--amber)">
-        <span class="tag warn">Not run</span>
-        <h3>What we have not</h3>
-        <ul>
-          <li>No audience code</li>
-          <li>No outside code</li>
-          <li>No tournament</li>
-        </ul>
-      </div>
-      <div class="panel col" style="--c:var(--red)">
-        <span class="tag bad">Not built</span>
-        <h3>Hosting outside code needs</h3>
-        <ul>
-          <li>A <b>separate AWS account</b></li>
-          <li>Isolated build and run MicroVMs</li>
-          <li>Egress controls enforced <b>externally</b></li>
-          <li>Independent scoring</li>
+      <div class="panel rel" style="--c:var(--red)">
+        <h3>Never crosses</h3>
+        <ul class="xl">
+          <li>AWS credentials</li>
+          <li>The internet <small>once egress is off</small> <span class="tag warn pill">Proposed</span></li>
+          <li>Other teams&rsquo; VMs</li>
+          <li>The referee&rsquo;s ledger</li>
         </ul>
       </div>
     </div>
+    <div class="foot">No tag means built and run.</div>
   </section>
 
-  <!-- 11 -->
-  <section class="slide" id="s11">
+  <!-- 14 -->
+  <section class="slide" id="s14">
     <div class="kicker">Managed Instances</div>
+    <div class="status"><span class="tag warn">Proposed</span></div>
     <h2>When steady judging could <span class="hot">justify a pool</span></h2>
     <div class="lede">An Event Function compute option on an <b>AWS-managed EC2 pool in your account</b>.</div>
     <div class="two" style="margin-top:0">
@@ -439,21 +604,34 @@
     <div class="foot">Described only. Nothing on this slide was run.</div>
   </section>
 
-  <!-- 12 -->
-  <section class="slide" id="s12">
+  <!-- 15 -->
+  <section class="slide" id="s15">
     <div class="kicker">The arena</div>
-    <h2>Watch the <span class="hot">judging</span> happen</h2>
+    <div class="status"><span class="tag ok">Built and run</span><span class="tag warn">Proposed</span></div>
+    <h2>Today, and <span class="hot">next</span></h2>
     <div class="arena-split">
       <div class="figure">
         <img class="img" src="../assets/arena-dashboard.png" alt="Concept art: a leaderboard and metric dashboard">
         <div class="caption">Concept art, not results. Teams, numbers and services are invented.</div>
       </div>
-      <div class="takeaway">The teams decide how to scale the shop.<br><span>We decide how to scale the judging.</span></div>
+      <div class="arena-side">
+        <div class="panel" style="--c:var(--green)">
+          <span class="tag ok">Built and run</span>
+          <h3>Today</h3>
+          <p>A presenter page on a Web Function: Launch &rarr; Deploy &rarr; Shopper returns. The Durable workflow pauses for a click.</p>
+        </div>
+        <div class="panel" style="--c:var(--amber)">
+          <span class="tag warn">Proposed</span>
+          <h3>Next</h3>
+          <p>Install the BLACK FRIDAY GitHub App on your repo = registration. Push to <code>submit/round-N</code> = entry. Public leaderboard.</p>
+        </div>
+      </div>
     </div>
   </section>
 
-  <!-- 13 -->
-  <section class="slide" id="s13">
+
+  <!-- 16 -->
+  <section class="slide" id="s16">
     <div class="kicker">Fine print for Adelaide</div>
     <h2>Before you <span class="hot">build on it</span></h2>
     <ul class="fine">
@@ -466,8 +644,8 @@
     </ul>
   </section>
 
-  <!-- 14 -->
-  <section class="slide" id="s14">
+  <!-- 17 -->
+  <section class="slide" id="s17">
     <div class="kicker">Get the code</div>
     <h2>Play <span class="hot">BLACK FRIDAY</span></h2>
     <div class="final">
