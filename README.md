@@ -33,6 +33,7 @@ need](docs/processes/running-outside-code.md) is written down.
 | Path | Contents |
 |:--|:--|
 | [`docs/game.md`](docs/game.md) | The game on one page |
+| [`docs/architecture.md`](docs/architecture.md) | Both sides of the infrastructure: what is built, what is proposed, how state is managed |
 | [`docs/design.md`](docs/design.md) | The full design specification |
 | [`docs/processes/`](docs/processes/) | How to run each part: locally, in AWS, Git submissions, MicroVMs |
 | [`talk/`](talk/) | Slides (`index.html`, opens offline) and speaker notes |

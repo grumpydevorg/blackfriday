@@ -7,7 +7,8 @@ market. Teams decide how to scale the shop; the organisers decide how to scale
 the judging. The winner has the highest profit after the AWS bill, not the most
 AWS services.
 
-Full rules: [design.md](design.md). Runnable steps: [processes](processes/README.md).
+Full rules: [design.md](design.md). How it is built: [architecture.md](architecture.md).
+Runnable steps: [processes](processes/README.md).
 
 ## Rules
 
