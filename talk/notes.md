@@ -94,7 +94,7 @@ Today is **built and run**: a presenter page on a Web Function walks Launch → 
 
 ### 16. Fine print for Adelaide — 1.5 minutes
 
-Web Functions is Node.js only and is available in N. Virginia, Ohio, Oregon, Tokyo and Ireland, not Sydney; memory is still billed while waiting [S4, S7]. For MicroVMs, suspended time counts towards the eight-hour limit and snapshot storage is billed [S5, S7]. Managed Instances' 90-minute timeout does not apply to synchronous calls [S6, S7]. Check data residency before sending agent work offshore, and recheck region support and pricing before building.
+Web Functions runs Node.js 24 and 26, with Python 3.15 in public preview, and is available in N. Virginia, Ohio, Oregon, Tokyo and Ireland, not Sydney; memory is still billed while waiting [S4, S7]. For MicroVMs, suspended time counts towards the eight-hour limit and snapshot storage is billed [S5, S7]. Managed Instances' 90-minute timeout does not apply to synchronous calls, which get 30 minutes since 19 November 2026 [S6, S7]. Check data residency before sending agent work offshore, and recheck region support and pricing before building.
 
 ### 17. Get the code — 1 minute
 
