@@ -539,7 +539,7 @@ TargetGroup:
       <div class="panel stat c"><div class="v">6.5&times;</div><div class="l">faster</div></div>
       <div class="panel stat d"><div class="v">Same</div><div class="l">scores</div></div>
     </div>
-    <div class="tnote">In a tournament, teams run in parallel; each team&rsquo;s weeks run in order, because state carries forward. <span class="tag warn pill">Proposed</span></div>
+    <div class="tnote">In a tournament, every team plays a week in parallel; Durable waits for all of them, hands out the switchers, then starts the next week. <span class="tag warn pill">Proposed</span></div>
     <div class="foot"><b>One observation</b>, Oregon, 22 Nov 2026. Not cold-start controlled; excludes stack setup and teardown. 62,336 real loopback HTTP requests per pass.</div>
   </section>
 

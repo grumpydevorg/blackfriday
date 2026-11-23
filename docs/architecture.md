@@ -312,36 +312,45 @@ Prices in this example are illustrative; the price list is not set.
 
 ### A round
 
-Each week depends on the previous week's state, so a team's weeks run in order
-and different teams run in parallel.
+Each week depends on the previous week's state, and with the
+[switchers pool](design.md#the-switchers-pool-proposed) on every team's results
+from that week. So the weeks run in order, and within each week the teams run in
+parallel. Durable fans the teams out, waits for all of them, allocates the
+switchers in a checkpointed step, then starts the next week.
 
 ```mermaid
 flowchart LR
   C[Cutoff: freeze SHA and template] --> P[Apply plan: new declared state]
-  P --> F{{Durable: one branch per team}}
-  F --> W1[Week 5] --> W2[Week 6] --> W3[Week 7] --> W4[Week 8]
-  W4 --> R[Round result and leaderboard]
+  P --> F5{{Week 5: one judge per team, in parallel}}
+  F5 --> S5[Allocate switchers]
+  S5 --> F6{{Week 6: one judge per team}} --> S6[Allocate switchers]
+  S6 --> F7{{Week 7}} --> S7[Allocate switchers] --> F8{{Week 8}}
+  F8 --> R[Round result and leaderboard]
 ```
 
-Each week is one Event judge:
+Each team's week is one Event judge:
 
 1. **Restore** last week's saved state: database contents, returning customers,
-   payment record.
+   the switchers allocated to this team, payment record.
 2. **Boot** what the template declares: MicroVMs at the frozen commit, Virtual
    RDS loaded with the saved data, an empty cache, our load balancer.
 3. **Play** the week's traffic; the referee checks every order and payment.
 4. **Export** the database and destroy the VMs.
 5. **Save** a new copy named by its checksum and record the score.
 
-Durable saves progress after each week, so a failed week 7 reruns from week 6.
+Durable saves progress after each week and after each allocation, so a failed
+week 7 judge reruns from week 6 without changing anyone's switchers. A week
+waits for its slowest team. If a team's judge still fails after its retry limit,
+that team's week is scored as an outage (every checkout failed) and the round
+moves on.
 
 ### Rules
 
 - **Saved states are never overwritten.** The pointer moves only after the
   referee's result is recorded.
 - **Reuse key:** commit, template checksum, scenario version, seed, starting state
-  checksum and judge version. The same key gives the same result, so a retry
-  reuses it rather than counting twice.
+  checksum, inbound switchers checksum and judge version. The same key gives the
+  same result, so a retry reuses it rather than counting twice.
 - **Practice runs** read official saved states and write only to a practice area.
 - **One official timeline per team.** Extra seeds are for practice and robustness.
 

@@ -120,8 +120,8 @@ There are no points for adopting a service.
 
 Synthetic customers have stable identities and a limited schedule of purchase
 opportunities. They browse, save or retrieve carts, attempt purchases and come
-back to inspect orders. There are no competing retailers. Each experience
-changes the chance of a return next week:
+back to inspect orders. Each experience changes the chance of a return next
+week:
 
 | Outcome | Next-week return probability |
 |:--|--:|
@@ -131,11 +131,43 @@ changes the chance of a return next week:
 | Lost history or serious integrity failure | 5% |
 
 These are game parameters, not consumer research. A frustrated customer can
-return. Combine fixed new arrivals with retained customers. Share scenario
-seeds, purchase opportunities and per-customer, per-week retention draws across
-contestants, so one team’s outcomes do not perturb another team’s random stream.
-The **realised** traffic can diverge: better retention earns future sales
-opportunities and creates additional load.
+return. Combine fixed new arrivals with retained customers. Every team starts
+from an identical copy of the same customers and receives the same new arrivals
+each week. Share scenario seeds, purchase opportunities and per-customer,
+per-week retention draws across contestants, so one team's outcomes do not
+perturb another team's random stream. The **realised** traffic can diverge:
+better retention earns future sales opportunities and creates additional load.
+
+### The switchers pool (proposed)
+
+A customer who does not return after a failed checkout, a timeout or lost
+history does not simply disappear: they become a **switcher**. A customer who
+does not return after a successful checkout has no grievance and leaves the
+game.
+
+At the end of each week, the referee pools every team's switchers and hands
+them out for the next week:
+
+- **Share:** each team receives switchers in proportion to its verified fast
+  checkouts that week. A team with none receives none.
+- **Never back to the shop they left:** a switcher is only offered to other teams.
+- **Deterministic:** switchers are ordered by stable customer ID and divided by
+  largest remainder, with ties broken by the week's published seed, so the same
+  week's results always produce the same allocation.
+- **New to the receiving shop:** a switcher arrives with no cart or order
+  history there, then follows the same return rules as any other customer.
+
+So one team's outage becomes another team's extra traffic, often during the
+same spike that caused it. The cost is independence: a team's official score
+now depends on the other teams in the field. Each team's own starting customers
+and new arrivals stay identical, so the base remains fair; only the switchers
+differ. A replay of one team re-runs that team against the switchers it actually
+received, from the saved allocation, and never changes the official scores.
+
+Each simulated week becomes a synchronisation point: every team's week must be
+judged before switchers can be allocated for the next one (see
+[architecture](architecture.md#a-round)). None of this is built: the referee,
+Virtual RDS and the judges hold no cross-team state today.
 
 ## 8. Business Referee
 

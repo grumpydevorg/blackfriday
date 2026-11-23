@@ -25,6 +25,10 @@ Runnable steps: [processes](processes/README.md).
   exactly one payment. HTTP success alone is not a sale.
 - **Customers remember.** Lost carts and slow pages cut future sales, even when
   `/health` is green. A bad migration can destroy business already built.
+- **Switchers (proposed).** Every team starts with the same customers. A
+  customer you fail and who does not come back joins a shared pool of
+  switchers, handed out next week to the other shops in proportion to their
+  verified fast checkouts. A rival's outage is your Black Friday.
 
 ## Four rounds, 13 simulated weeks
 
@@ -46,7 +50,9 @@ after a slow one, 20% after a failure, 5% after lost history.
 
 - **Teams scale their shops:** instance size, replicas, storage tier, caches.
 - **Organisers scale the judging:** frozen release × scenario, fanned out in
-  parallel. Every evaluation is independent, so more workers judge faster.
+  parallel. Within a week every evaluation is independent, so more workers
+  judge faster; with the switchers pool, all teams finish a week before the
+  next one starts.
 
 ## Five Lambda choices
 

@@ -74,7 +74,7 @@ This is built and run. Inside each MicroVM a gateway listens on :8080 and hands 
 
 ### 11. Our side scales the judging — 2.5 minutes (Built and run)
 
-A Durable workflow fans out Event judges: four shop designs × eight seeded scenarios is 32 evaluations. With one worker the Launch-wave pass took 147.12 seconds; with eight it took 22.61 seconds, 6.5× faster with identical scores, across 62,336 real loopback HTTP requests per pass. It is one Oregon observation on 22 November 2026, not cold-start controlled and excluding stack setup and teardown. A later repeat ran 96 on-demand evaluations at an estimated worker charge of US$0.0029. The tournament sentence at the bottom is **Proposed**: teams would run in parallel, while each team's weeks run in order because state carries forward.
+A Durable workflow fans out Event judges: four shop designs × eight seeded scenarios is 32 evaluations. With one worker the Launch-wave pass took 147.12 seconds; with eight it took 22.61 seconds, 6.5× faster with identical scores, across 62,336 real loopback HTTP requests per pass. It is one Oregon observation on 22 November 2026, not cold-start controlled and excluding stack setup and teardown. A later repeat ran 96 on-demand evaluations at an estimated worker charge of US$0.0029. The tournament sentence at the bottom is **Proposed**: every team plays a week in parallel, then Durable waits for all of them and hands out the switchers before the next week starts.
 
 ### 12. Resources are records — 2.5 minutes (Proposed)
 
