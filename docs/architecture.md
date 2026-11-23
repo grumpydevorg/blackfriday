@@ -46,14 +46,15 @@ The constraints make the game fair (everyone gets the same tiny cloud), safe
 
 ## Our side today: built and run
 
-Everything runs in Oregon (`us-west-2`) on Lambda, S3 and DynamoDB. There is no
-real EC2, RDS, load balancer, VPC or NAT gateway.
+Everything runs in Sydney (`ap-southeast-2`) on Lambda, S3 and DynamoDB; it was
+built and measured in Oregon (`us-west-2`) first. There is no real EC2, RDS,
+load balancer, VPC or NAT gateway.
 
 ```mermaid
 flowchart LR
   P["Presenter laptop<br/>operate.py present<br/>(localhost, signs requests)"] -->|"AWS-signed HTTPS"| W
+  W["Web Function<br/>black-friday-arena<br/>(created by operate.py)"]
   subgraph R["Stack BlackFridayRehearsal"]
-    W["Web Function<br/>black-friday-rehearsal"]
     D["Durable Function<br/>workflow"]
     E["Event Function<br/>black-friday-evaluator"]
     M["MicroVM image<br/>black-friday-shop"]
@@ -73,7 +74,7 @@ flowchart LR
 
 | Resource | Kind | Job | Limits |
 |:--|:--|:--|:--|
-| `black-friday-rehearsal` ([`rehearsal.yaml`](../demo/aws/rehearsal.yaml)) | Web Function, Node.js 24 | Arena page and API | AWS-signed requests only; at most 2 environments, 100 requests/s, 15 s timeout |
+| `black-friday-arena` ([`operate.py`](../demo/aws/operate.py)) | Web Function, Node.js 24 | Arena page and API | AWS-signed requests only; at most 2 environments, 100 requests/s, 15 s timeout |
 | Workflow | Durable Function | Launch → pause for the presenter → Growth migrations; saves progress at each step | 48 h execution, 7-day history |
 | `black-friday-evaluator` | Event Function | Starts MicroVMs, drives the shop, checks orders and payments, saves results | 512 MB, 300 s, at most 4 at once |
 | `black-friday-shop` | MicroVM image | PHP shop with SQLite or PostgreSQL 17 | ARM64, 1 GiB; each VM at most 120 s, no role |

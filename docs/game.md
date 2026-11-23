@@ -67,9 +67,10 @@ after a slow one, 20% after a failure, 5% after lost history.
 
 Exists and has been run:
 
-- An Oregon (`us-west-2`) rehearsal: Web arena, version-pinned Durable workflow,
-  Event evaluator, disposable roleless MicroVMs. From one Launch checkpoint, two
-  Growth migrations both passed `/health`; only one kept a saved cart.
+- An AWS rehearsal (Oregon, then Sydney since 23 Nov 2026): Web arena,
+  version-pinned Durable workflow, Event evaluator, disposable roleless
+  MicroVMs. From one Launch checkpoint, two Growth migrations both passed
+  `/health`; only one kept a saved cart.
 - Git submission intake: push to `submit/round-1`, signed webhook, exact SHA
   queued, archive pinned and hashed, frozen export.
 - One reviewed PHP fixture at a frozen commit ran in a real MicroVM and earned

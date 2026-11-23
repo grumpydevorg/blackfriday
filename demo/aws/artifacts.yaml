@@ -49,7 +49,7 @@ Resources:
             Resource: !Sub '${Artifacts.Arn}/packages/web/*'
             Condition:
               ArnLike:
-                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:web-function/black-friday-rehearsal/revision/*'
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:web-function/black-friday-arena/revision/*'
           - Sid: TransportSecurity
             Effect: Deny
             Principal: '*'

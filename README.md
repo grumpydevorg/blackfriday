@@ -59,7 +59,7 @@ uv run --no-project --with pytest --with boto3==1.44.9 --with pydantic==2.13.4 p
 
 The local arena (Docker), the AWS rehearsal and the Lambda fan-out are in
 [`docs/processes/`](docs/processes/). The AWS scripts only run against the
-account named in `BLACK_FRIDAY_AWS_ACCOUNT`, in Oregon (`us-west-2`), and
+account named in `BLACK_FRIDAY_AWS_ACCOUNT`, in Sydney (`ap-southeast-2`), and
 delete what they create; read the process before running one.
 
 ## Licence

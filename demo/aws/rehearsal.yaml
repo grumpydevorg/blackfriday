@@ -6,7 +6,9 @@ Parameters:
   BaseImageVersion: {Type: String}
   WorkerKey: {Type: String}
   WorkflowKey: {Type: String}
-  WebKey: {Type: String}
+  # The Web Function itself is created by operate.py through the Lambda Web API:
+  # since Nov 2026 CreateWebFunction needs its revision and endpoint in the same
+  # call, which AWS::Lambda::WebFunction does not send.
   ReleaseId: {Type: String, AllowedPattern: '[0-9a-f]{64}'}
 Resources:
   Runs:
@@ -197,38 +199,8 @@ Resources:
               - Effect: Allow
                 Action: [lambda:GetDurableExecution, lambda:SendDurableExecutionCallbackSuccess]
                 Resource: !Sub '${Workflow.Arn}:*/durable-execution/*'
-  Web:
-    Type: AWS::Lambda::WebFunction
-    Properties:
-      FunctionName: black-friday-rehearsal
-      Tags: [{Key: project, Value: black-friday-demo}]
-  WebRevision:
-    Type: AWS::Lambda::WebFunctionRevision
-    Properties:
-      FunctionName: !Ref Web
-      BuildConfig:
-        CodeConfig: {S3Object: {Bucket: !Ref ArtifactBucket, Key: !Ref WebKey}}
-        RuntimeConfig: {Runtime: nodejs24.x}
-      ServiceConfig:
-        ExecutionRoleArn: !GetAtt WebRole.Arn
-        TimeoutSeconds: 15
-        MaxConcurrencyPerEnvironment: 8
-        EnvironmentVariables:
-          AWS_LAMBDA_NODEJS_ENTRYPOINT: index.mjs
-          RUN_TABLE: !Ref Runs
-          WORKFLOW_ARN: !Ref WorkflowVersion
-  Stage:
-    Type: AWS::Lambda::WebFunctionEndpoint
-    Properties:
-      FunctionName: !Ref Web
-      EndpointName: stage
-      EndpointType: HomeRegion
-      AuthType: IamAuth
-      RevisionWeights: [{RevisionId: !GetAtt WebRevision.RevisionId, Weight: 100}]
-      ScalingConfig: {MaxEnvironments: 2}
-      ThrottleConfig: {RateLimit: 100}
 Outputs:
-  StageUrl: {Value: !Sub 'https://${Stage.DomainName}'}
+  WebRole: {Value: !GetAtt WebRole.Arn}
   RunTable: {Value: !Ref Runs}
   EvaluatorVersion: {Value: !Ref EvaluatorVersion}
   WorkflowVersion: {Value: !Ref WorkflowVersion}

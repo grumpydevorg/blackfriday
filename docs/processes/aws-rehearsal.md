@@ -50,12 +50,12 @@ export BLACK_FRIDAY_AWS_PROFILE=<AWS CLI profile>
 aws sso login --profile "$BLACK_FRIDAY_AWS_PROFILE"
 ```
 
-The rehearsal runs entirely in Oregon, where it was built and tested.
-[Web Functions](https://aws.amazon.com/about-aws/whats-new/2026/10/aws-lambda-web-functions/)
-also ran in Sydney in a test on 23 November 2026, although the launch post does
-not list it, and
+The rehearsal runs entirely in Sydney (`ap-southeast-2`). It was built and first
+run in Oregon, then moved on 23 November 2026, when a full Launch → migrate →
+compare run passed in Sydney. Sydney is missing from the
+[Web Functions launch post](https://aws.amazon.com/about-aws/whats-new/2026/10/aws-lambda-web-functions/),
+but Web Functions run there, and
 [MicroVMs are available in Sydney](https://aws.amazon.com/about-aws/whats-new/2026/08/lambda-microvms-5-additional-regions/).
-The rehearsal has not been deployed there.
 
 ## Deploy and present
 
@@ -66,10 +66,14 @@ uv run aws/operate.py present
 ```
 
 `deploy` checks that the credentials belong to `$BLACK_FRIDAY_AWS_ACCOUNT` in
-`us-west-2` before making changes. `deploy --keep-failed` preserves failed stack
+`ap-southeast-2` before making changes. `deploy --keep-failed` preserves failed stack
 resources for diagnosis. It creates project-scoped CloudFormation stacks
-`BlackFridayRehearsalArtifacts` and `BlackFridayRehearsal`. `uv run
-aws/operate.py package <output>` builds the deployment archives without AWS.
+`BlackFridayRehearsalArtifacts` and `BlackFridayRehearsal`, then creates or
+updates the `black-friday-arena` Web Function through the Lambda Web API.
+CloudFormation's `AWS::Lambda::WebFunction` cannot create one any more: since
+November 2026 `CreateWebFunction` needs its first revision and endpoint in the
+same call. Web Function names are unique across all Regions in an account.
+`uv run aws/operate.py package <output>` builds the deployment archives without AWS.
 
 The endpoint requires IAM. `present` runs a loopback proxy (default
 <http://127.0.0.1:8767/>, `--port` to change) that signs requests with your
@@ -95,8 +99,9 @@ execution, including real VM termination and S3 ledger checks.
 
 ## Teardown
 
-When no run should resume, stop the presenter, then delete `BlackFridayRehearsal`
-with CloudFormation in the same account and Region. The artifact bucket is
+When no run should resume, stop the presenter, run `uv run aws/operate.py
+remove-web`, then delete `BlackFridayRehearsal` with CloudFormation in the same
+account and Region. The artifact bucket is
 retained on purpose; identify it from the `BlackFridayRehearsalArtifacts`
 stack's `Bucket` output before deleting that stack. Delete the retained bucket,
 including versions, only after deciding the packages and rehearsal evidence are

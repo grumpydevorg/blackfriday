@@ -104,7 +104,7 @@ bridge uses the emulator's target registration to decide whether to forward shop
 HTTP requests. The emulator's native ALB listener does **not** forward to AWS;
 the bridge takes that hop using the real MicroVM's port-scoped token.
 
-The script uses the already deployed Oregon image for the PHP/SQLite Launch shop
+The script uses the deployed rehearsal image for the PHP/SQLite Launch shop
 in one roleless MicroVM. It makes the checkout lose its first payment reply,
 then retries with the same key. It requires one write-once S3 object, the paid
 order and saved cart to survive a PHP restart, and HTTP 503 after

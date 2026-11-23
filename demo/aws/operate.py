@@ -14,6 +14,7 @@ from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import sleep
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -32,10 +33,12 @@ DEMO = AWS_DIR.parent
 # The scripts refuse to touch any account but this one. The profile is optional;
 # without it boto3 and the AWS CLI use their default credential chain.
 ACCOUNT = os.environ.get('BLACK_FRIDAY_AWS_ACCOUNT', '')
-REGION = 'us-west-2'
+REGION = 'ap-southeast-2'
 PROFILE = os.environ.get('BLACK_FRIDAY_AWS_PROFILE') or None
 ARTIFACTS = 'BlackFridayRehearsalArtifacts'
 STACK = 'BlackFridayRehearsal'
+WEB_FUNCTION = 'black-friday-arena'  # names are unique across all Regions in an account
+WEB_ENDPOINT = 'stage'
 LOGGER = logging.getLogger(__name__)
 
 
@@ -155,6 +158,92 @@ def available_base_version(session) -> str:
     return max(versions)[1]
 
 
+def wait_web(web, *, revision: str | None = None, endpoint: bool = False) -> dict:
+    for _ in range(100):
+        if revision:
+            item = web.get_web_function_revision(functionName=WEB_FUNCTION, revisionId=revision)
+            done = item['state'] != 'Pending'
+        else:
+            item = web.get_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
+            done = item['state'] != 'Pending' and item.get('updateStatus') != 'InProgress'
+        if done:
+            if item['state'] == 'Failed' or item.get('updateStatus') == 'Failed':
+                raise RuntimeError(f'Web Function {"revision" if revision else "endpoint"} failed: '
+                                   f'{item.get("stateReason") or item.get("updateStatusReason")}')
+            return item
+        sleep(3)
+    raise TimeoutError('Web Function did not become active')
+
+
+def deploy_web(session, bucket: str, key: str) -> str:
+    """Create or update the arena Web Function through the Lambda Web API.
+
+    CreateWebFunction now needs its first revision and endpoint in one call, so
+    the function is not a CloudFormation resource. A new revision is created only
+    when the code object or its settings change, then the endpoint is pointed at it.
+    """
+    outputs = stack_outputs(session, STACK)
+    version = session.client('s3').head_object(Bucket=bucket, Key=key)['VersionId']
+    build = {
+        'codeConfig': {'s3Object': {'bucket': bucket, 'key': key, 'versionId': version}},
+        'runtimeConfig': {'runtime': 'nodejs24.x'},
+    }
+    service = {
+        'executionRoleArn': outputs['WebRole'], 'timeoutSeconds': 15, 'maxConcurrencyPerEnvironment': 8,
+        'environmentVariables': {
+            'AWS_LAMBDA_NODEJS_ENTRYPOINT': 'index.mjs',
+            'RUN_TABLE': outputs['RunTable'], 'WORKFLOW_ARN': outputs['WorkflowVersion'],
+        },
+    }
+    web = session.client('lambda-web')
+    try:
+        current = web.get_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
+    except web.exceptions.ResourceNotFoundException:
+        created = web.create_web_function(
+            functionName=WEB_FUNCTION, tags={'project': 'black-friday-demo'},
+            revisionConfig={'buildConfig': build, 'serviceConfig': service},
+            endpointConfig={
+                'endpointName': WEB_ENDPOINT, 'endpointType': 'HomeRegion', 'authType': 'IamAuth',
+                'autoDeploymentMode': 'Disabled', 'scalingConfig': {'maxEnvironments': 2},
+                'throttleConfig': {'rateLimit': 100},
+            },
+        )
+        wait_web(web, revision=created['revision']['revisionId'])
+    else:
+        live = web.get_web_function_revision(functionName=WEB_FUNCTION, revisionId=current['revisionWeights'][0]['revisionId'])
+        same = (
+            live['buildConfig']['codeConfig']['s3Object'] == build['codeConfig']['s3Object']
+            and {name: live['serviceConfig'].get(name) for name in service} == service
+        )
+        if not same:
+            revision = web.create_web_function_revision(functionName=WEB_FUNCTION, buildConfig=build, serviceConfig=service)['revisionId']
+            wait_web(web, revision=revision)
+            web.update_web_function_endpoint(
+                functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT, revisionWeights=[{'revisionId': revision, 'weight': 100}],
+            )
+    return 'https://' + wait_web(web, endpoint=True)['domainName']
+
+
+def remove_web() -> None:
+    session = account_session()
+    web = session.client('lambda-web')
+    try:
+        web.delete_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
+    except web.exceptions.ResourceNotFoundException:
+        pass
+    for _ in range(40):
+        try:
+            web.delete_web_function(functionName=WEB_FUNCTION)
+            print(f'Deleted Web Function {WEB_FUNCTION}', flush=True)
+            return
+        except web.exceptions.ResourceNotFoundException:
+            print('No Web Function to delete', flush=True)
+            return
+        except web.exceptions.ConflictException:
+            sleep(3)
+    raise TimeoutError('The Web Function endpoint is still deleting')
+
+
 def deploy(*, keep_failed: bool = False) -> None:
     session = account_session()
     base_version = available_base_version(session)
@@ -169,9 +258,15 @@ def deploy(*, keep_failed: bool = False) -> None:
         cloudformation_deploy(
             'rehearsal.yaml', STACK, keep_failed=keep_failed, ArtifactBucket=bucket,
             BaseImageVersion=base_version, ReleaseId=release,
-            **{f'{kind.title()}Key': key for kind, (key, _) in artifacts.items()},
+            **{f'{kind.title()}Key': key for kind, (key, _) in artifacts.items() if kind != 'web'},
         )
-    print(json.dumps(stack_outputs(session, STACK), indent=2))
+    url = deploy_web(session, bucket, artifacts['web'][0])
+    print(json.dumps({**stack_outputs(session, STACK), 'StageUrl': url}, indent=2))
+
+
+def stage_url(session) -> str:
+    endpoint = session.client('lambda-web').get_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
+    return 'https://' + endpoint['domainName']
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -181,9 +276,9 @@ class NoRedirect(HTTPRedirectHandler):
 
 def present(port: int) -> None:
     session = account_session()
-    endpoint = stack_outputs(session, STACK)['StageUrl']
-    if not re.fullmatch(r'https://[a-z0-9.-]+\.lambda-web\.us-west-2\.on\.aws', endpoint):
-        raise RuntimeError('Unexpected CloudFormation stage endpoint')
+    endpoint = stage_url(session)
+    if not re.fullmatch(rf'https://[a-z0-9.-]+\.lambda-web\.{re.escape(REGION)}\.on\.aws', endpoint):
+        raise RuntimeError('Unexpected Web Function stage endpoint')
     credentials = session.get_credentials()
     allowed_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
     allowed_get = {'/', '/api/state', '/art/cloud-surge.png'}
@@ -256,11 +351,14 @@ def main() -> None:
     deploy_command.add_argument('--keep-failed', action='store_true', help='Preserve failed stack resources for diagnosis')
     stage = commands.add_parser('present', help='Run the localhost IAM-signing proxy')
     stage.add_argument('--port', type=int, default=8767)
+    commands.add_parser('remove-web', help='Delete the arena Web Function (before deleting the stacks)')
     args = parser.parse_args()
     if args.command == 'deploy':
         deploy(keep_failed=args.keep_failed)
     elif args.command == 'present':
         present(args.port)
+    elif args.command == 'remove-web':
+        remove_web()
     else:
         packages(args.output)
 

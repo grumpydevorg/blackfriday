@@ -49,7 +49,7 @@ report.json` shows a compact score and concurrency summary.
 
 ## Limits and cleanup
 
-The operator creates a private, temporary stack in Oregon; it does not update
+The operator creates a private, temporary stack in Sydney; it does not update
 the rehearsal. Limits: 1–8 cohorts, up to eight workers, 30 seconds per worker,
 and a five-minute Durable execution ceiling. There is no public URL, database
 instance, or contestant code. The operator deletes the execution history, stack
