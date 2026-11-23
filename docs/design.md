@@ -236,7 +236,9 @@ are revealed after scoring. The referee checks externally observable outcomes
 and independently verifies order and payment effects. Calibrate timing and
 repeat equivalent runs where host noise is significant. Any comparison or repeat
 starts from the same checkpoint on a separate evaluation fork; it never rewrites
-official business history.
+official business history. With the switchers pool, the switchers a team
+receives are the one input that differs between teams; a repeat uses the saved
+allocation for that week, never a fresh one.
 
 ## 12. Player experience
 
@@ -303,7 +305,8 @@ Acceptance:
 5. A successful database migration preserves customers, carts and orders.
 6. A faulty migration causes observable customer and revenue consequences even
    when `/health` still passes.
-7. Identical releases on equivalent inputs produce comparable results.
+7. Identical releases on equivalent inputs, including the same inbound
+   switchers, produce comparable results.
 8. All four rounds complete with a verified 13-week profit score.
 9. The postmortem links changes in score to observable architectural outcomes.
 
