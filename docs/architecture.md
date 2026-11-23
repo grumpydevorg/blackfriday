@@ -313,7 +313,7 @@ Prices in this example are illustrative; the price list is not set.
 ### A round
 
 Each week depends on the previous week's state, and with the
-[switchers pool](design.md#the-switchers-pool-proposed) on every team's results
+[switchers pool](design.md#the-switchers-pool) on every team's results
 from that week. So the weeks run in order, and within each week the teams run in
 parallel. Durable fans the teams out, waits for all of them, allocates the
 switchers in a checkpointed step, then starts the next week.

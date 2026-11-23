@@ -138,36 +138,30 @@ per-week retention draws across contestants, so one team's outcomes do not
 perturb another team's random stream. The **realised** traffic can diverge:
 better retention earns future sales opportunities and creates additional load.
 
-### The switchers pool (proposed)
+### The switchers pool
 
-A customer who does not return after a failed checkout, a timeout or lost
-history does not simply disappear: they become a **switcher**. A customer who
-does not return after a successful checkout has no grievance and leaves the
-game.
+Every team starts with the same customers and gets the same new arrivals, so
+most of the score is a like-for-like comparison. Teams interact in one place:
+a customer who does not return after a failed checkout, a timeout or lost
+history becomes a **switcher** and moves to another shop. A customer who does
+not return after a good checkout just leaves.
 
-At the end of each week, the referee pools every team's switchers and hands
-them out for the next week:
+At the end of each week the referee shares out every team's switchers:
 
-- **Share:** each team receives switchers in proportion to its verified fast
-  checkouts that week. A team with none receives none.
-- **Never back to the shop they left:** a switcher is only offered to other teams.
-- **Deterministic:** switchers are ordered by stable customer ID and divided by
-  largest remainder, with ties broken by the week's published seed, so the same
-  week's results always produce the same allocation.
-- **New to the receiving shop:** a switcher arrives with no cart or order
-  history there, then follows the same return rules as any other customer.
+- **By fast checkouts:** each other team receives switchers in proportion to its
+  verified fast checkouts that week. None for none.
+- **Never back:** a switcher never returns to the shop that failed them.
+- **No luck:** switchers are ordered by customer ID and divided by largest
+  remainder; the week's published seed breaks ties. The same results always give
+  the same allocation.
+- **New there:** a switcher arrives with no cart or order history, then follows
+  the normal return rules.
 
-So one team's outage becomes another team's extra traffic, often during the
-same spike that caused it. The cost is independence: a team's official score
-now depends on the other teams in the field. Each team's own starting customers
-and new arrivals stay identical, so the base remains fair; only the switchers
-differ. A replay of one team re-runs that team against the switchers it actually
-received, from the saved allocation, and never changes the official scores.
-
-Each simulated week becomes a synchronisation point: every team's week must be
-judged before switchers can be allocated for the next one (see
-[architecture](architecture.md#a-round)). None of this is built: the referee,
-Virtual RDS and the judges hold no cross-team state today.
+One team's outage becomes another team's traffic, often in the spike that caused
+it. A team's score therefore depends partly on the field, through the switchers
+only. Every week is a synchronisation point: all teams are judged before the
+next week's switchers are allocated ([architecture](architecture.md#a-round)).
+A replay uses the saved allocation and never changes official scores.
 
 ## 8. Business Referee
 
