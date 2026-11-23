@@ -94,7 +94,7 @@ Today is **built and run**: a presenter page on a Web Function walks Launch → 
 
 ### 16. Fine print for Adelaide — 1.5 minutes
 
-Web Functions runs Node.js 24 and 26, with Python 3.15 in public preview, and is available in N. Virginia, Ohio, Oregon, Tokyo and Ireland, not Sydney; memory is still billed while waiting [S4, S7]. For MicroVMs, suspended time counts towards the eight-hour limit and snapshot storage is billed [S5, S7]. Managed Instances' 90-minute timeout does not apply to synchronous calls, which get 30 minutes since 19 November 2026 [S6, S7]. Check data residency before sending agent work offshore, and recheck region support and pricing before building.
+Web Functions runs Node.js 24 and 26, with Python 3.15 in public preview. The launch post lists N. Virginia, Ohio, Oregon, Tokyo and Ireland, but a test Web Function created in Sydney on 23 November 2026 went Active and answered a signed request from `ap-southeast-2`, so the list is out of date. Memory is still billed while waiting [S4, S7]. For MicroVMs, suspended time counts towards the eight-hour limit and snapshot storage is billed [S5, S7]. Managed Instances' 90-minute timeout does not apply to synchronous calls, which get 30 minutes since 19 November 2026 [S6, S7]. Check data residency before sending agent work offshore, and recheck region support and pricing before building.
 
 ### 17. Get the code — 1 minute
 
@@ -107,7 +107,7 @@ These are the public source links recorded in the talk's research outline. The 2
 - **S1 — AWS, 2014 launch:** [Run Code in the Cloud](https://aws.amazon.com/blogs/aws/run-code-cloud/). Preview date, initial triggers, runtime, memory, 60-second limit and billing granularity.
 - **S2 — AWS, October 2015 update:** [Python, VPC, increased function duration, scheduling and more](https://aws.amazon.com/blogs/aws/aws-lambda-update-python-vpc-increased-function-duration-scheduling-and-more/). Five-minute timeout.
 - **S3 — AWS:** [Lambda turns ten](https://aws.amazon.com/blogs/aws/aws-lambda-turns-ten-the-first-decade-of-serverless-innovation). Historical context; the outline's Part 1 records the 2018 15-minute limit. Additional reference: [Lambda timeline](https://hidekazu-konishi.com/entry/aws_history_and_timeline_amazon_lambda.html).
-- **S4 — AWS, October 2026:** [Web Functions](https://aws.amazon.com/about-aws/whats-new/2026/10/aws-lambda-web-functions/). Announcement; the outline provides the Node.js and region list.
+- **S4 — AWS, October 2026:** [Web Functions](https://aws.amazon.com/about-aws/whats-new/2026/10/aws-lambda-web-functions/). Announcement; its region list omits Sydney, where a Web Function ran in our test on 23 November 2026.
 - **S5 — AWS, June 2026:** [MicroVMs](https://aws.amazon.com/about-aws/whats-new/2026/06/aws-lambda-microvms/). Announcement; the outline records the suspended-time and snapshot-storage caveats.
 - **S6 — AWS, September 2026:** [Managed Instances 90-minute functions](https://aws.amazon.com/about-aws/whats-new/2026/09/aws-lambda-90-minute-function/). The outline records the synchronous-call exclusion.
 - **S7 — Supplied research outline:** “What Is Going On With Lambda? Talk outline”, Part 1 §2–5 and Part 4 §15. Source for the specific fine-print wording.

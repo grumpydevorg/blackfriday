@@ -50,10 +50,12 @@ export BLACK_FRIDAY_AWS_PROFILE=<AWS CLI profile>
 aws sso login --profile "$BLACK_FRIDAY_AWS_PROFILE"
 ```
 
-Oregon keeps the whole rehearsal in one Region.
+The rehearsal runs entirely in Oregon, where it was built and tested.
 [Web Functions](https://aws.amazon.com/about-aws/whats-new/2026/10/aws-lambda-web-functions/)
-are available there but not in Sydney;
+also ran in Sydney in a test on 23 November 2026, although the launch post does
+not list it, and
 [MicroVMs are available in Sydney](https://aws.amazon.com/about-aws/whats-new/2026/08/lambda-microvms-5-additional-regions/).
+The rehearsal has not been deployed there.
 
 ## Deploy and present
 
