@@ -82,10 +82,10 @@ flowchart LR
 | Resource | Kind | Job | Limits |
 |:--|:--|:--|:--|
 | `black-friday-round` ([`operate.py`](../demo/aws/operate.py), [`web.mjs`](../demo/aws/web.mjs), roster rules in [`roster.mjs`](../demo/aws/roster.mjs)) | Web Function, Node.js 24 | Player page, presenter page, API | Public endpoint (`ApplicationManaged`); presenter routes need a sign-in cookie or the SSM key; 10 failed sign-ins per 10 minutes; 2 KiB bodies; at most 10 environments, 100 requests/s, 15 s timeout; request logs kept 7 days; HSTS; a 270 KB hero image cached for an hour |
-| `black-friday-round-workflow` ([`workflow.py`](../demo/aws/workflow.py)) | Durable Function | Launch → wait for Close → one migration per team → wait → one shopper check per team → scoreboard | 48 h execution, 23 h callbacks, 7-day history |
+| `black-friday-round-workflow` ([`workflow.py`](../demo/aws/workflow.py)) | Durable Function | Launch → wait for Close → one checkpointed step draws the bots and every team's roll → one migration per option in use → wait → one shopper check per option in use → scoreboard | 48 h execution, 23 h callbacks, 7-day history; at most 3 migration and 3 check MicroVMs for any number of teams |
 | `black-friday-round-evaluator` ([`evaluator.py`](../demo/aws/evaluator.py)) | Event Function | Starts MicroVMs, drives the shop, checks orders and payments, scores the architecture, saves results | 512 MB, 300 s, at most 10 at once |
 | `black-friday-round-shop` | MicroVM image | PHP shop with SQLite or PostgreSQL 17 | ARM64, 1 GiB; each VM at most 120 s, no role |
-| Round table | DynamoDB, on demand | Round state, teams and picks | At most 8 audience teams + 2 house teams |
+| Round table | DynamoDB, on demand | Round state, teams and picks | A safety cap of 200 audience teams + 2 house teams; about 160 KB at the cap, against a 400 KB item limit |
 | Artifacts ([`artifacts.yaml`](../demo/aws/artifacts.yaml)) | S3, versioned | Code packages, checkpoints between stages, payment receipts | Objects expire after 7 days; old versions after 1 day |
 
 The rehearsal is the same shape with names `BlackFridayRehearsal`,
@@ -189,9 +189,13 @@ trusted Python test shop uses it today.
 rules in [`game.mjs`](../demo/aws/game.mjs)) serves two pages.
 
 - **Player page** ([`player.html`](../demo/aws/player.html), public): join a
-  team, pick a release and an architecture, watch the round, see the scoreboard.
-  A team token kept on the phone guards its pick. Other teams' picks are hidden
-  until the round closes.
+  team, tap one of three options ([`options.json`](../demo/aws/options.json):
+  Lift & shift 5%, Scale up 10% and +$40, Refactor 30%), watch the round, see the
+  scoreboard: the top 10 and the viewer's own row, with "+N more teams". A team
+  token kept on the phone guards its pick. Other teams' picks are hidden until
+  the round closes. `/api/state` stays small: before Close it carries only each
+  team's id, name, house flag and picked flag, and after the shoppers it carries
+  the board instead of the roster (about 16 KB raw, 2.6 KB gzipped, for 200 teams).
 - **Presenter page** ([`host.html`](../demo/aws/host.html)): the page is public
   but shows only a passphrase form until sign-in
   ([`host_auth.mjs`](../demo/aws/host_auth.mjs)). The passphrase is Rick's own

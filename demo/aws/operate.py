@@ -137,15 +137,18 @@ def packages(out: Path) -> dict[str, tuple[str, Path]]:
             }, {}),
             'worker': ({
                 'evaluator.py': AWS_DIR / 'evaluator.py', 'scoring.py': AWS_DIR / 'scoring.py',
+                'options.json': AWS_DIR / 'options.json',
                 'virtual_rds.py': DEMO / 'virtual_rds.py', 'arena.py': DEMO / 'arena.py',
             }, {'': root / 'sdk'}),
             'workflow': ({
                 'workflow.py': AWS_DIR / 'workflow.py', 'scoring.py': AWS_DIR / 'scoring.py',
+                'options.json': AWS_DIR / 'options.json',
             }, {'': root / 'sdk'}),
             'web': ({
                 'index.mjs': AWS_DIR / 'web.mjs',
                 **{name: AWS_DIR / name for name in (
-                    'game.mjs', 'host_auth.mjs', 'roster.mjs', 'player.html', 'host.html', 'round.js', 'round.css',
+                    'game.mjs', 'host_auth.mjs', 'roster.mjs', 'options.json',
+                    'player.html', 'host.html', 'round.js', 'round.css',
                 )},
                 'art/cloud-surge.jpg': AWS_DIR / 'art' / 'cloud-surge.jpg',  # derived from assets/cloud-surge.png
             }, {'node_modules/': web / 'node_modules'}),

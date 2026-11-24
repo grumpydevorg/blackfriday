@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import secrets
 from typing import Any
 
 import boto3
@@ -13,7 +14,7 @@ from aws_durable_execution_sdk_python import (
 )
 from aws_durable_execution_sdk_python.config import CallbackConfig, Duration
 from botocore.exceptions import ClientError
-from scoring import rank, total_profit, validate_teams
+from scoring import KIND, OPTIONS, plan_round, rank, team_row, validate_teams
 
 DB = boto3.client('dynamodb')
 TABLE = os.environ['RUN_TABLE']
@@ -74,20 +75,20 @@ def publish(
             raise
 
 
-def evaluate_forks(context: DurableContext, run_id: str, action: str, teams: list[dict]) -> list[dict[str, Any]]:
-    def fork(team: dict):
+def evaluate_forks(context: DurableContext, run_id: str, action: str, options: list[str]) -> list[dict[str, Any]]:
+    """One branch per option in use, however many teams picked it: at most three MicroVMs per stage."""
+
+    def fork(option: str):
         def run(child: DurableContext) -> dict[str, Any]:
-            event = {'id': run_id, 'action': action, 'team': team['id'], 'kind': team['kind']}
-            if action == 'compare':
-                event['architecture'] = team['architecture']
-            return {**child.invoke(EVALUATOR, event, name=f'{action}-{team["id"]}'), 'id': team['id']}
+            event = {'id': run_id, 'action': action, 'team': option, 'kind': KIND}
+            return {**child.invoke(EVALUATOR, event, name=f'{action}-{option}'), 'id': option}
 
         return run
 
-    result = context.parallel([fork(team) for team in teams], name=f'{action}-every-team')
+    result = context.parallel([fork(option) for option in options], name=f'{action}-every-option')
     result.throw_if_error()
-    by_team = {branch['id']: branch for branch in result.get_results()}
-    return [by_team[team['id']] for team in teams]
+    by_option = {branch['id']: branch for branch in result.get_results()}
+    return [by_option[option] for option in options]
 
 
 def wait_for_action(context, run_id, arn, previous, phase, busy, action, fields) -> dict:
@@ -129,18 +130,17 @@ def handler(event: dict[str, Any], context: DurableContext) -> dict[str, str]:
         'launch_vm_state': launch['vm_state'],
     })
     teams = validate_teams(closed.get('teams'))
-    migrations = evaluate_forks(context, run_id, 'migrate', teams)
+    # The one place randomness enters the round: bots for a thin room, then one roll per team.
+    # A durable step is checkpointed, so a replay gets the recorded draws back and never draws again.
+    plan = context.step(lambda _: plan_round(teams, secrets.randbelow), name='migration-risk')
+    teams, risks = plan['teams'], plan['risks']
+    options = [option for option in OPTIONS if any(team['option'] == option for team in teams)]
+    migrations = evaluate_forks(context, run_id, 'migrate', options)
     wait_for_action(context, run_id, arn, 'migrating', 'migrated', 'comparing', 'compare', {
         'migrations_data': json.dumps(migrations),
     })
-    outcomes = evaluate_forks(context, run_id, 'compare', teams)
-    results = []
-    for team, migration, outcome in zip(teams, migrations, outcomes, strict=True):
-        results.append({
-            **migration, **outcome,
-            'id': team['id'], 'name': team['name'], 'house': team['house'], 'release': team['release'],
-            'cumulative_cents': total_profit(outcome['profit_cents']),
-        })
+    shared = {outcome['id']: outcome for outcome in evaluate_forks(context, run_id, 'compare', options)}
+    results = [team_row(team, risks[team['id']], shared[team['option']]) for team in teams]
     context.step(
         lambda _: publish(run_id, arn, ('comparing',), 'compared', {'outcomes_data': json.dumps(rank(results))}),
         name='publish-comparison',

@@ -1,18 +1,15 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLACK FRIDAY · Growth round</title><link rel="stylesheet" href="/round.css"><script src="/round.js" defer></script></head>
 <body><main>
-<header class="hero"><p class="kicker">AWS User Group Adelaide · Growth round</p><h1>BLACK FRIDAY</h1><p>One shop. Your release. Most profit wins.</p></header>
+<header class="hero"><p class="kicker">AWS User Group Adelaide · Growth round</p><h1>BLACK FRIDAY</h1><p>One shop. One choice. Most profit wins.</p></header>
 <ol class="timeline"><li id="stage-launch">1 · Launch</li><li id="stage-migrate">2 · Deploy</li><li id="stage-compare">3 · Shoppers return</li></ol>
 <h2 id="headline">Connecting to the arena…</h2><p id="progress" class="muted"></p><p id="error" role="status"></p>
-<section id="join-section" class="panel" hidden><h2>Join as a team</h2><p>Up to eight audience teams. No code, just choices.</p><form id="join"><label>Team name <input id="team-name" name="name" maxlength="20" required autocomplete="organization" placeholder="1–20 characters"></label><button>Join the round</button></form></section>
-<section id="pick-section" class="panel" hidden><h2 id="your-team"></h2><p>Choose before Rick closes the round. Your pick stays private until then.</p>
-<form id="pick"><label>Migration release<select id="release"><option value="A">Release A: migrate every table · $2</option><option value="B">Release B: customers, products and orders only — faster · $1</option></select></label><p class="hint">B does not migrate saved carts.</p>
-<label>Storage tier<select id="storage"><option value="local">Local · $0 · data dies with the shop</option><option value="small" selected>Small shared · $1 · 80 units/s</option><option value="large">Large shared · $4 · 160 units/s</option></select></label>
-<label>Shop replicas<select id="replicas"><option value="1">1 replica · $1</option><option value="2">2 replicas · $2</option></select></label>
-<label class="check"><input id="cache" type="checkbox"> Cache immutable order history · $0</label>
-<p class="hint">Prices are modelled per round, not real AWS charges. Shared replicas use the same database capacity. Cache is free in this model.</p><button>Save my pick</button><p id="saved" class="green" role="status"></p></form></section>
+<section id="join-section" class="panel" hidden><h2>Join as a team</h2><p>No code, just one choice.</p><form id="join"><label>Team name <input id="team-name" name="name" maxlength="20" required autocomplete="organization" placeholder="1–20 characters"></label><button>Join the round</button></form></section>
+<section id="pick-section" class="panel" hidden><h2 id="your-team"></h2><p>Pick one before Rick closes the round. Tap another to change it. Your pick stays private until then.</p>
+<div id="options" class="options"></div>
+<p class="hint">Every option really migrates every table. When the round closes, each team rolls its own dice once: if the roll is under the risk, the migration breaks on Black Friday and the shop earns nothing from the wave. Prices are modelled, not real AWS charges.</p><p id="saved" class="green" role="status"></p></section>
 <section id="waiting" class="panel" hidden><h2 id="waiting-title">Waiting for the round to close</h2><p id="waiting-detail"></p></section>
 <section id="own-result" class="panel" hidden></section>
-<section id="scoreboard" hidden><h2>Profit after the AWS bill</h2><p class="muted">Modelled dollars. Ties share a rank.</p><div id="scores" class="scores"></div><p class="hint">Profit = $9 Launch + architecture-wave profit + $10 × Maya's sales − migration. Maya buys now only if her cart survived; the shared retention draw determines one modelled sale next week.</p></section>
+<section id="scoreboard" hidden><h2>Profit after the AWS bill</h2><p class="muted">Modelled dollars. Top 10, and you. Ties share a rank.</p><div id="scores" class="scores"></div><p id="more" class="muted"></p><p class="hint">Profit = $9 Launch + the shop's profit on the Black Friday wave (nothing sold if the migration broke, so just its cost) + $10 × Maya's sales − $2 migration. Maya buys now, and the shared retention draw decides one modelled sale next week.</p></section>
 <section class="panel"><h2>In the arena</h2><p id="capacity" class="muted"></p><ul id="teams"></ul></section>
 </main></body></html>

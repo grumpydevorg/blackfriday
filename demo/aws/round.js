@@ -2,8 +2,12 @@
 const $ = id => document.getElementById(id);
 const host = document.body.dataset.host === 'true';
 const money = cents => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(cents / 100);
-const titles = { ready: 'The Growth round is open', launching: '1 · Launch is running', launch: 'Launch saved · choose your release', migrating: '2 · Every team is deploying', migrated: 'Every deployment is healthy', comparing: '3 · The shoppers are returning', compared: 'The scores are in', expired: 'The round expired', failed: 'The round could not finish' };
-const messages = { ready: 'Join now and save your pick. Rick starts the shop.', launching: 'A real MicroVM sells a mug, saves Maya’s cart, then terminates.', launch: 'The checkpoint is saved. Joining and picking stay open until Close.', migrating: 'Picks are frozen. Each team migrates the same checkpoint in its own MicroVM.', migrated: 'The databases are healthy and the old order exists. Did Maya’s cart survive?', comparing: 'Fresh MicroVMs check the carts. Event judges score your architecture on the same traffic wave.', compared: 'Profit wins, not most servers. Real migration checks; modelled capacity, costs and next-week sales.' };
+const titles = { ready: 'The Growth round is open', launching: '1 · Launch is running', launch: 'Launch saved · pick your path', migrating: '2 · Every team is deploying', migrated: 'Every deployment is healthy', comparing: '3 · The shoppers are returning', compared: 'The scores are in', expired: 'The round expired', failed: 'The round could not finish' };
+const messages = { ready: 'Join now and pick one option. Rick starts the shop.', launching: 'A real MicroVM sells a mug, saves Maya’s cart, then terminates.', launch: 'The checkpoint is saved. Joining and picking stay open until Close.', migrating: 'Picks are frozen and each team’s risk is rolled once. Every team migrates the same checkpoint in its own MicroVM.', migrated: 'The databases are healthy and the old order exists. Which migrations held on Black Friday?', comparing: 'Fresh MicroVMs check the carts. Event judges replay the Black Friday wave on each team’s shop.', compared: 'Profit wins, not most servers. Real migration checks; modelled capacity, costs and next-week sales.' };
+const optionOf = id => (current?.options ?? []).find(option => option.id === id);
+const optionLabel = id => optionOf(id)?.label ?? id;
+const whole = cents => `$${cents / 100}`;
+const optionLine = option => `${option.blurb}${option.extra_cost_cents ? `, +${whole(option.extra_cost_cents)}` : ''} · breaks ${option.risk}%`;
 let identity;
 try { identity = JSON.parse(localStorage.getItem('black-friday-team')); } catch { identity = null; }
 let current, initializedPick = false, pending = false;
@@ -36,22 +40,44 @@ async function api(path, input, action = false) {
   }
   return data;
 }
+// One line per team so ten of them fit a projector screen; the working is in the tooltip and on the viewer's own result.
 function score(row) {
-  const card = make('article', '', 'score');
-  card.append(make('span', `#${row.rank}`, 'rank'), make('h3', row.name), make('div', money(row.cumulative_cents), 'money'));
-  const arch = row.architecture;
-  card.append(make('p', `Release ${row.release} · ${arch.storage} · ${arch.replicas} replica${arch.replicas === 1 ? '' : 's'} · cache ${arch.cache ? 'on' : 'off'}`));
-  card.append(make('p', row.cart_status === 200 ? 'Maya’s cart kept · checkout verified' : 'Maya’s cart lost · she leaves', row.cart_status === 200 ? 'green' : 'red'));
-  card.append(make('small', `Architecture: ${arch.verified_sales} verified sales · cost ${money(arch.cost_cents)}`));
-  card.append(make('small', `Maya: ${row.verified_sales} verified sale now + ${row.returns_next_week ? '1' : '0'} modelled next week (${row.return_probability}% chance, draw 42)`));
-  card.append(make('small', `Launch $9 + architecture ${money(arch.profit_cents)} + Maya ${money(row.maya_sales * 1000)} − migration ${money(row.migration_cost_cents)}`));
-  return card;
+  const line = make('article', '', `row ${row.broke ? 'broke' : 'held'}${row.id === identity?.id ? ' own' : ''}`);
+  const name = make('span', row.name, 'name');
+  if (row.bot) name.append(' ', make('span', 'bot', 'pill'));
+  else if (row.house) name.append(' ', make('span', 'house', 'pill'));
+  const extra = row.architecture.extra_cost_cents ? ` · +${whole(row.architecture.extra_cost_cents)}` : '';
+  line.append(
+    make('span', `#${row.rank}`, 'rank'), name,
+    make('span', `${optionLabel(row.option)} · ${row.risk}%${extra}`, 'pick'),
+    make('span', row.broke ? `Broke on Black Friday (rolled ${row.roll}, under ${row.risk})` : `Held (rolled ${row.roll})`,
+      row.broke ? 'outcome red' : 'outcome green'),
+    make('span', money(row.cumulative_cents), 'money'),
+  );
+  line.title = `${row.broke ? 'The wave was lost: 0 verified sales' : `The wave: ${row.architecture.verified_sales} verified sales`}, shop cost ${money(row.architecture.cost_cents)} · Launch $9 + shop ${money(row.architecture.profit_cents)} + Maya ${money(row.maya_sales * 1000)} − migration ${money(row.migration_cost_cents)}`;
+  return line;
+}
+let optionsKey = '';
+// Three big buttons; the saved one is highlighted. Rebuilt only when something changed, so a tap is never lost to a poll.
+function renderOptions(state, team) {
+  const chosen = team.picked ? team.option : '';
+  const key = JSON.stringify([state.options, chosen]);
+  if (key === optionsKey) return;
+  optionsKey = key;
+  $('options').replaceChildren(...state.options.map(option => {
+    const button = make('button', '', chosen === option.id ? 'option selected' : 'option');
+    button.type = 'button';
+    button.dataset.option = option.id;
+    button.setAttribute('aria-pressed', String(chosen === option.id));
+    button.append(make('span', option.label, 'option-label'), make('span', optionLine(option), 'option-line'));
+    return button;
+  }));
 }
 function render(state) {
   current = state;
   if (!host && identity && identity.run_id !== state.id) {
     identity = null; initializedPick = false; localStorage.removeItem('black-friday-team');
-  } else if (!host && identity && !state.teams.some(team => team.id === identity.id)) {
+  } else if (!host && identity && !state.me) {
     identity = null; initializedPick = false; localStorage.removeItem('black-friday-team');
     $('error').textContent = 'Your team was removed. You can join again.';
   }
@@ -59,48 +85,47 @@ function render(state) {
   $('progress').textContent = state.message || messages[state.phase] || '';
   const step = ['ready', 'launching'].includes(state.phase) ? 'launch' : ['launch', 'migrating'].includes(state.phase) ? 'migrate' : 'compare';
   for (const name of ['launch', 'migrate', 'compare']) $(`stage-${name}`).classList.toggle('active', name === step);
-  $('capacity').textContent = `${state.audience_count} / 8 audience teams · ${state.open ? 'joining and picks open' : 'round closed'}`;
+  $('capacity').textContent = `${state.audience_count} team${state.audience_count === 1 ? '' : 's'} joined · ${state.open ? 'joining and picks open' : 'round closed'}`;
   $('teams').replaceChildren(...state.teams.map(team => {
-    const row = make('li', `${team.name}${team.house ? ' · house' : ''} · ${team.picked ? 'pick saved' : 'default pick (not saved)'}${!state.open ? ` · Release ${team.release} · ${team.architecture.storage} / ${team.architecture.replicas} / cache ${team.architecture.cache ? 'on' : 'off'}` : ''}`);
+    const row = make('li', `${team.name}${team.house ? ' · house' : ''}${team.picked ? ' ✓' : ''}${!state.open && team.option ? ` · ${optionLabel(team.option)}` : ''}`, 'team');
     if (host && state.open && !team.house) {
       const button = make('button', 'Remove', 'secondary small');
       button.type = 'button';
       button.addEventListener('click', () => removeTeam(team));
-      row.append(' ', button);
+      row.append(button);
     }
     return row;
   }));
   const finished = state.phase === 'compared';
   $('scoreboard').hidden = !finished;
-  if (finished) $('scores').replaceChildren(...state.branches.map(score));
+  if (finished) {
+    $('scores').replaceChildren(...state.board.rows.map(score));
+    $('more').textContent = state.board.more > 0 ? `+${state.board.more} more team${state.board.more === 1 ? '' : 's'}` : '';
+  }
   if (host) {
     for (const [name, phase] of [['launch', 'ready'], ['migrate', 'launch'], ['compare', 'migrated']]) {
       $(name).disabled = pending || (state.phase !== phase && state.retry_action !== name);
     }
     $('reset').hidden = !['ready', 'compared', 'expired', 'failed'].includes(state.phase);
     $('execution').textContent = state.execution_arn || 'Not started';
-    $('checkpoint').textContent = state.checkpoint ? `Launch checkpoint ${state.checkpoint} · VM ${state.launch_vm_id} · ${state.launch_vm_state}` : '';
+    $('checkpoint').hidden = !state.checkpoint; $('checkpoint').textContent = state.checkpoint ? `Launch checkpoint ${state.checkpoint} · VM ${state.launch_vm_id} · ${state.launch_vm_state}` : '';
     $('public-url').textContent = state.public_url ?? 'PUBLIC_HOST is not configured'; $('public-url').href = state.public_url ?? '#';
     $('logout').hidden = state.auth_mode === 'key'; // the helper adds its own key; there is no cookie to clear
     return;
   }
-  const team = state.teams.find(team => team.id === identity?.id);
+  const team = state.me;
   $('join-section').hidden = Boolean(team) || !state.open;
   $('pick-section').hidden = !team || !state.open;
   $('waiting').hidden = finished || (!team && state.open);
   $('waiting-title').textContent = state.open ? 'Waiting for the round to close' : 'Watching the judges';
-  $('waiting-detail').textContent = team ? `${team.name}: ${team.picked ? 'your pick is saved' : 'using the default pick until you save'}. ${state.open ? 'You can change it above until Close.' : 'Your release is frozen.'}` : 'The round is closed. Watch the results with everyone else.';
+  $('waiting-detail').textContent = team ? `${team.name}: ${team.picked ? `you picked ${optionLabel(team.option)}` : 'using Lift & shift until you pick'}. ${state.open ? 'You can change it above until Close.' : 'Your pick is frozen.'}` : 'The round is closed. Watch the results with everyone else.';
   if (team) {
     $('your-team').textContent = team.name;
-    if (!initializedPick && team.architecture) {
-      $('release').value = team.release; $('storage').value = team.architecture.storage;
-      $('replicas').value = team.architecture.replicas; $('cache').checked = team.architecture.cache;
-      initializedPick = true;
-    }
+    renderOptions(state, team);
   }
-  const own = finished && state.branches.find(row => row.id === identity?.id);
+  const own = finished && state.board.rows.find(row => row.id === identity?.id);
   $('own-result').hidden = !own;
-  if (own) $('own-result').replaceChildren(make('h2', `Your result · #${own.rank}`), make('p', `${own.name} · ${money(own.cumulative_cents)} profit`));
+  if (own) $('own-result').replaceChildren(make('h2', `Your result · #${own.rank}`), make('p', `${own.name} · ${own.broke ? `broke on Black Friday (rolled ${own.roll}, under ${own.risk})` : `held (rolled ${own.roll})`} · ${money(own.cumulative_cents)} profit`), make('p', `${own.broke ? 'The wave was lost: 0 verified sales' : `The wave: ${own.architecture.verified_sales} verified sales`}, shop cost ${money(own.architecture.cost_cents)}. Launch $9 + shop ${money(own.architecture.profit_cents)} + Maya ${money(own.maya_sales * 1000)} − migration ${money(own.migration_cost_cents)}.`, 'hint'));
 }
 function signedOut() {
   $('panel').hidden = true;
@@ -168,11 +193,12 @@ if (host) {
       initializedPick = false;
     });
   });
-  $('pick').addEventListener('submit', async event => {
-    event.preventDefault();
+  $('options').addEventListener('click', async event => {
+    const button = event.target.closest('button[data-option]');
+    if (!button || !identity) return;
     await act(async () => {
-      await api('pick', { id: identity.id, token: identity.token, release: $('release').value, storage: $('storage').value, replicas: Number($('replicas').value), cache: $('cache').checked });
-      $('saved').textContent = 'Pick saved. Waiting for the round to close.';
+      await api('pick', { id: identity.id, token: identity.token, option: button.dataset.option });
+      $('saved').textContent = `Saved: ${optionLabel(button.dataset.option)}. Waiting for the round to close.`;
     });
   });
 }

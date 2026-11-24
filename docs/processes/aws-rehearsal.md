@@ -4,7 +4,7 @@ Two separate deployments run the same story in Sydney (`ap-southeast-2`):
 
 | Deployment | Who plays | Endpoint | Presenter page |
 |:--|:--|:--|:--|
-| **round** | Up to 8 audience teams plus two house teams | Public (`ApplicationManaged`): players open it on their phones | <http://127.0.0.1:8768/host> |
+| **round** | Everyone in the room (up to 200 teams) plus two house teams, and bots if the room is thin | Public (`ApplicationManaged`): players open it on their phones | <http://127.0.0.1:8768/host> |
 | **rehearsal** | Nobody: the presenter compares two releases | IAM only | <http://127.0.0.1:8767/> |
 
 Select one with `BLACK_FRIDAY_DEPLOYMENT=round` or `rehearsal` (the default).
@@ -14,34 +14,46 @@ be torn down without touching the other. The rehearsal is frozen at tag
 account and is the last fallback.
 
 **The story.** In Launch, the unchanged PHP/SQLite shop sells a mug in a real
-MicroVM and leaves Maya's cart saved, then the VM is terminated. Every team's
-release migrates that same checkpoint to PostgreSQL in its own MicroVM. Both
-releases pass `/health`; only release A keeps carts. Maya then returns to every
-shop, and each team's architecture is scored. The winner has the most profit
-after the modelled AWS bill.
+MicroVM and leaves Maya's cart saved, then the VM is terminated. Each team picks
+one of three paths. Every path is really migrated from that same checkpoint to
+PostgreSQL, once per path in use, in its own MicroVMs: at most three migrations
+and three shopper checks however many teams play. Maya's cart survives in all of
+them. What differs is the risk: when the round closes, every team rolls its own
+dice, and a roll under its path's risk means the migration broke on Black Friday
+and the shop earned nothing from the wave. The winner has the most profit after
+the modelled AWS bill.
 
 ## What players do (round)
 
-Nobody uploads code. A player picks among reviewed options; only the
-organiser's code runs.
+Nobody uploads code. A player makes one choice; only the organiser's code runs.
 
 1. Scan the QR on the presenter page or slide and open the public URL.
 2. **Join** with a team name: 1–20 printable characters, unique ignoring case.
    The phone keeps a team token; only that phone can change the team's pick.
-3. **Pick** before the round closes, and change it as often as they like:
-   - Release **A**, *migrate every table* ($2), or **B**, *customers, products
-     and orders only, faster* ($1). B silently drops carts.
-   - Storage tier: instance-local, small shared or large shared; one or two
-     replicas; cache on or off.
-4. Watch their own result and rank, then the full scoreboard.
+3. **Pick** one of three big buttons before the round closes, and change it as
+   often as they like. The options table is [`options.json`](../../demo/aws/options.json),
+   the single source for the phones, the web function and the scoring:
+
+   | Option | Shop | Breaks | Extra cost |
+   |:--|:--|--:|--:|
+   | **Lift & shift**: same code, same database | small shared database, 1 replica, no cache | 5% | none |
+   | **Scale up**: bigger database | large shared database, 1 replica, no cache | 10% | +$40 |
+   | **Refactor**: add a cache, fastest if it works | small shared database, 1 replica, cache | 30% | none |
+
+4. Watch the scoreboard: the top 10 and their own row, with the roll behind
+   it ("Held (rolled 63)" or "Broke on Black Friday (rolled 12, under 30)").
 
 Other teams' picks stay hidden until the round closes. A team that joins but
-never picks plays the default pick: release A, small storage, one replica, no
-cache. **House A** (release A) and **House B** (release B) always play with
-that same architecture, so the story works with no audience.
+never picks plays Lift & shift. **House A** plays Lift & shift and **House B**
+plays Refactor. If fewer than six teams are in at Close, bots (Bot Lambo, Bot
+Turbo, Bot Kevin, Bot Monolith, in that order) fill the board up to six, each
+with a random option, and are labelled "bot"; their names are reserved so no
+player can take one. Rolls and bot picks are drawn once, in one checkpointed
+Durable step, so a replay never draws again.
 
-Joining and picking are refused once the round closes, when all eight audience
-places are taken, or with the wrong team token.
+Joining and picking are refused once the round closes, with the wrong team
+token, and, as a safety cap on the roster item, past 200 teams ("The round is
+full").
 
 ## What the presenter does (round)
 
@@ -108,19 +120,24 @@ Removal is refused once the round closes.
    Launch runs once, for everyone. Players can join from the moment the round
    is reset until step 2.
 2. **Close round and deploy every release.** Freezes every pick into the
-   Durable callback, then runs one migration per team in parallel, each in its
-   own MicroVM and PostgreSQL schema.
-3. **Send the shoppers back.** One check per team in parallel: Maya's cart in
-   that team's shop, plus the team's architecture scored by the Virtual RDS
-   model. The scoreboard ranks the teams.
+   Durable callback, draws the bots and every team's roll in one checkpointed
+   step, then migrates each option in use (at most three) in its own MicroVM
+   and PostgreSQL schema (`bf_<run>_lift`, `…_scale`, `…_refactor`).
+3. **Send the shoppers back.** One check per option in use, in parallel: Maya's
+   cart in that option's shop, plus the option's architecture scored by the
+   Virtual RDS model. Every team inherits its option's real result and applies
+   its own roll on top. The scoreboard ranks the teams.
 
 **Reset to a fresh open round** clears the teams and starts again. Each callback
 waits at most 23 hours, so click Launch less than 23 hours before step 2.
 
-Score, in cents: Launch profit (900) + architecture profit from
-[`virtual_rds.py`](../../demo/virtual_rds.py) + $10 for each of Maya's sales
-(her checkout now, plus one next-week sale if the shared draw of 42 is below her
-return chance) − migration cost (A 200, B 100). Details: [game.md](../game.md#the-growth-round-built-and-run).
+Score, in cents: Launch profit (900) + the shop's profit on the Black Friday
+wave ([`virtual_rds.py`](../../demo/virtual_rds.py), minus the option's extra
+cost; if the migration broke, the wave's sales count as 0 and the shop earns
+minus its cost) + $10 for each of Maya's sales (her checkout now, plus one
+next-week sale if the shared draw of 42 is below her return chance) − the
+migration cost (200). Lift & shift 14,500 held / 2,500 broke; Scale up
+19,200 / −1,800; Refactor 23,500 / 2,500. Details: [game.md](../game.md#the-growth-round-built-and-run).
 
 ## What runs
 

@@ -195,7 +195,9 @@ Resources:
                 Resource: !GetAtt Runs.Arn
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !Ref WorkflowVersion
+                # Every published version, not only the current one: after a deploy, warm Web Function
+                # environments of the previous revision keep serving for a while and invoke their own version.
+                Resource: !Sub '${Workflow.Arn}:*'
               - Effect: Allow
                 Action: lambda:ListDurableExecutionsByFunction
                 Resource: [!GetAtt Workflow.Arn, !Sub '${Workflow.Arn}:*']

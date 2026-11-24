@@ -34,7 +34,7 @@ const joined = async name => {
   assert.ok(await writeRoster(store, item, [...teams(), team]));
   return { team, token };
 };
-const flip = (player, cache) => pick(teams(), item.phase.S, { id: player.team.id, token: player.token, release: 'A', storage: 'small', replicas: 1, cache });
+const flip = (player, option) => pick(teams(), item.phase.S, { id: player.team.id, token: player.token, option });
 """
 
 
@@ -47,19 +47,19 @@ def test_a_pick_that_wins_the_race_with_close_is_frozen_and_one_that_loses_is_re
       const player = await joined('Racer');
       // Pick A reads the roster, then Close lands, then pick A tries to write: it must lose.
       const stale = structuredClone(item);
-      const lateTeams = teams().map(t => t.id === player.team.id ? flip(player, true) : t);
+      const lateTeams = teams().map(t => t.id === player.team.id ? flip(player, 'refactor') : t);
       const closed = await closeRound(store, item, n(1));
       assert.ok(closed, 'Close always succeeds');
       assert.equal(await writeRoster(store, stale, lateTeams), false, 'the late pick is refused');
-      assert.throws(() => pick(teams(), item.phase.S, { id: player.team.id, token: player.token, release: 'A', storage: 'small', replicas: 1, cache: true }),
+      assert.throws(() => pick(teams(), item.phase.S, { id: player.team.id, token: player.token, option: 'refactor' }),
         e => e.status === 409);
-      assert.equal(frozen(JSON.parse(closed.frozen_data.S)).find(t => t.id === player.team.id).architecture.cache, false);
+      assert.equal(frozen(JSON.parse(closed.frozen_data.S)).find(t => t.id === player.team.id).option, 'lift');
       // A pick that committed first is in the frozen roster.
       Object.assign(item, { phase: s('launch'), callback_id: s('cb1') });
       delete item.frozen_data;
-      assert.ok(await writeRoster(store, item, teams().map(t => t.id === player.team.id ? flip(player, true) : t)));
+      assert.ok(await writeRoster(store, item, teams().map(t => t.id === player.team.id ? flip(player, 'refactor') : t)));
       const second = await closeRound(store, item, n(2));
-      assert.equal(frozen(JSON.parse(second.frozen_data.S)).find(t => t.id === player.team.id).architecture.cache, true);
+      assert.equal(frozen(JSON.parse(second.frozen_data.S)).find(t => t.id === player.team.id).option, 'refactor');
     """)
 
 
@@ -81,7 +81,7 @@ def test_a_flood_of_picks_around_close_never_blocks_close_and_never_changes_the_
         const next = (() => {
           try {
             return JSON.parse(snapshot.teams_data.S).map(t => t.id === player.team.id
-              ? pick(JSON.parse(snapshot.teams_data.S), snapshot.phase.S, { id: player.team.id, token: player.token, release: 'A', storage: 'small', replicas: 1, cache: flipCount % 2 === 0 }) : t);
+              ? pick(JSON.parse(snapshot.teams_data.S), snapshot.phase.S, { id: player.team.id, token: player.token, option: flipCount % 2 === 0 ? 'refactor' : 'scale' }) : t);
           } catch (error) { assert.equal(error.status, 409); return null; }
         })();
         if (flipCount === 20) closed = await closeRound(store, item, n(1));   // ...Close lands mid-flood...
@@ -105,7 +105,7 @@ def test_remove_only_audience_teams_only_while_open():
       assert.deepEqual(left.map(t => t.name), ['House A', 'House B']);
       assert.ok(await writeRoster(store, item, left));
       // The removed team's token no longer opens anything, and the name is free again.
-      assert.throws(() => pick(teams(), 'launch', { id: squatter.team.id, token: squatter.token, release: 'A', storage: 'small', replicas: 1, cache: false }),
+      assert.throws(() => pick(teams(), 'launch', { id: squatter.team.id, token: squatter.token, option: 'lift' }),
         e => e.status === 403);
       await joined('Squatter');
     """)

@@ -218,11 +218,13 @@ class Shop:
 
 @dataclass(frozen=True)
 class Rehearsal:
+    """One stage. After Close a stage is judged once per option in use, never once per team:
+    `team` is the option id ('lift', 'scale' or 'refactor'), which doubles as the schema and ledger id."""
+
     id: str
     action: str
     team: str
     kind: str
-    architecture: dict | None = None
 
     @classmethod
     def parse(cls, event: dict) -> 'Rehearsal':
@@ -234,15 +236,11 @@ class Rehearsal:
             raise ValueError('Invalid run id')
         if action == 'launch' and set(event) == {'id', 'action'}:
             return cls(run_id, action, '', '')
-        team_ok = isinstance(team, str) and scoring.TEAM_ID.fullmatch(team) is not None and kind in scoring.KINDS
-        if team_ok and action == 'migrate' and set(event) == {'id', 'action', 'team', 'kind'}:
-            return cls(run_id, action, team, kind)
-        if (
-            team_ok and action == 'compare' and set(event) == {'id', 'action', 'team', 'kind', 'architecture'}
-            and scoring.valid_architecture(event['architecture'])
+        if action in ('migrate', 'compare') and set(event) == {'id', 'action', 'team', 'kind'} and (
+            team in scoring.OPTIONS and kind == scoring.KIND
         ):
-            return cls(run_id, action, team, kind, event['architecture'])
-        raise ValueError('Invalid action, team, migration kind or unexpected event field')
+            return cls(run_id, action, team, kind)
+        raise ValueError('Invalid action, option or unexpected event field')
 
     @property
     def root(self) -> str:
@@ -331,10 +329,11 @@ class Rehearsal:
         }}
 
     def capacity(self) -> dict:
-        """Score this team's architecture on the Virtual RDS wave. Pure Python: no MicroVM involved."""
+        """Score this option on the Virtual RDS wave. Pure Python: no MicroVM involved."""
         from virtual_rds import Plan, run_round
 
-        plan = Plan(self.architecture['storage'], self.architecture['replicas'], self.architecture['cache'])
+        architecture = scoring.OPTIONS[self.team]['architecture']
+        plan = Plan(architecture['storage'], architecture['replicas'], architecture['cache'])
         result, _ = run_round(plan, RETURN_DRAW)
         return {
             'storage': plan.storage, 'replicas': plan.replicas, 'cache': plan.cached,
@@ -343,7 +342,7 @@ class Rehearsal:
             'cost_cents': result['modeled_cost_cents'], 'profit_cents': result['profit_cents'],
         }
 
-    def growth(self, store: Store, shop: Shop, architecture: dict | None) -> dict:
+    def growth(self, store: Store, shop: Shop, capacity: dict | None) -> dict:
         health = shop.check('/health')
         history = self.verify_order(store, shop, 'launch')
         if health.json().get('database') != 'pgsql':
@@ -358,28 +357,22 @@ class Rehearsal:
             store.put_once(self.artifact_key(self.step, digest, 'branch.dump'), artifact, 'application/octet-stream')
             return {**branch, 'dump': digest}
 
-        preserve = self.kind == 'preserve'
-        cart = shop.check('/cart/cart-saved', 200 if preserve else 404)
-        checkout = shop.checkout('growth-mug', 'cart-saved') if preserve else None
-        if checkout is not None:
-            self.verify_order(store, shop, self.team)
-            if checkout.elapsed is None:
-                raise RuntimeError('Missing checkout timing evidence')
-            sold = 1
-        else:
-            shop.check('/orders/order-growth-mug', 404)
-            sold = 0
-        probability = scoring.return_probability(self.kind, checkout.elapsed if checkout else None)
+        # Every option really migrates every table, so Maya's cart survives in every shop.
+        cart = shop.check('/cart/cart-saved')
+        checkout = shop.checkout('growth-mug', 'cart-saved')
+        self.verify_order(store, shop, self.team)
+        if checkout.elapsed is None:
+            raise RuntimeError('Missing checkout timing evidence')
+        probability = scoring.return_probability(checkout.elapsed)
         charges = self.observe_charge(store, self.team)
-        if charges != sold:
+        if charges != 1:
             raise RuntimeError('Growth ledger does not agree with verified sales')
-        maya = scoring.maya_sales(sold, probability)
-        return {**branch, 'cart_status': cart.status, 'checkout_status': checkout.status if checkout else None,
-                'checkout_ms': checkout.elapsed if checkout else None, 'charges': charges, 'verified_sales': sold,
+        maya = scoring.maya_sales(1, probability)
+        # No team's roll is known here: the workflow applies each team's own break on top.
+        return {**branch, 'cart_status': cart.status, 'checkout_status': checkout.status,
+                'checkout_ms': checkout.elapsed, 'charges': charges, 'verified_sales': 1,
                 'return_probability': probability, 'returns_next_week': RETURN_DRAW < probability,
-                'maya_sales': maya, 'architecture': architecture,
-                'migration_cost_cents': scoring.KINDS[self.kind],
-                'profit_cents': scoring.growth_profit(architecture['profit_cents'], maya, self.kind)}
+                'maya_sales': maya, 'architecture': capacity}
 
 
 def handler(event: dict, context) -> dict:
@@ -393,7 +386,7 @@ def handler(event: dict, context) -> dict:
     if candidate is None:
         architecture = stage.capacity() if stage.action == 'compare' else None
         data = stage.setup(store, fleet, work_deadline)
-        if stage.action == 'launch' or (stage.action == 'compare' and stage.kind == 'preserve'):
+        if stage.action in ('launch', 'compare'):
             phase = stage.team or stage.action
             data.update(store.payment_capability(stage.ledger_key(phase), stage.receipt(phase)))
         request_budget(work_deadline, 1)

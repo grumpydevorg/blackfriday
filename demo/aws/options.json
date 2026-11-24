@@ -1,0 +1,26 @@
+{
+  "options": {
+    "lift": {
+      "label": "Lift & shift",
+      "blurb": "Same code, same database",
+      "risk": 5,
+      "extra_cost_cents": 0,
+      "architecture": {"storage": "small", "replicas": 1, "cache": false}
+    },
+    "scale": {
+      "label": "Scale up",
+      "blurb": "Bigger database",
+      "risk": 10,
+      "extra_cost_cents": 4000,
+      "architecture": {"storage": "large", "replicas": 1, "cache": false}
+    },
+    "refactor": {
+      "label": "Refactor",
+      "blurb": "Add a cache. Fastest if it works.",
+      "risk": 30,
+      "extra_cost_cents": 0,
+      "architecture": {"storage": "small", "replicas": 1, "cache": true}
+    }
+  },
+  "bots": ["Bot Lambo", "Bot Turbo", "Bot Kevin", "Bot Monolith"]
+}

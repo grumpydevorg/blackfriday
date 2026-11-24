@@ -159,11 +159,11 @@ class Runtime:
             if set(data) != {'id', 'action', 'pay_url', 'receipt'}:
                 raise BadRequest('Invalid Launch configuration')
         elif (
-            action in ('migrate', 'compare') and kind in ('preserve', 'omit')
+            action in ('migrate', 'compare') and kind == 'preserve'
             and isinstance(team, str) and Team.fullmatch(team)
         ):
             fields = {'id', 'action', 'team', 'kind', 'input'}
-            if action == 'compare' and kind == 'preserve':
+            if action == 'compare':
                 fields |= {'pay_url', 'receipt'}
             if set(data) != fields:
                 raise BadRequest('Invalid Growth configuration')

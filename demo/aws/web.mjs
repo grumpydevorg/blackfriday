@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { gzipSync } from 'node:zlib';
 import { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
 import {
   GetDurableExecutionCommand,
@@ -10,7 +11,7 @@ import {
   SendDurableExecutionCallbackSuccessCommand,
 } from '@aws-sdk/client-lambda';
 import { SSMClient, GetParametersCommand } from '@aws-sdk/client-ssm';
-import { RequestError, houses, join, pick, remove, publicTeams, frozen, open } from './game.mjs';
+import { RequestError, MAX_TEAMS, OPTIONS, board, houses, join, ownTeam, pick, remove, publicOptions, publicTeams, frozen, open } from './game.mjs';
 import { presenterAuth, routeKind, MAX_FAILURES, WINDOW_MS } from './host_auth.mjs';
 import { s, n, writeRoster, closeRound } from './roster.mjs';
 import QRCode from 'qrcode';
@@ -79,6 +80,10 @@ async function initialized() {
   let row = await stored();
   if (!row) {
     await replace(fresh(), 'attribute_not_exists(pk)');
+    row = await stored();
+  } else if (row.phase.S === 'ready' && teamsOf(row).some(team => !(team.option in OPTIONS))) {
+    // A roster saved by an older build (releases and architectures, not options): start it afresh.
+    await replace(fresh(), 'run_id = :id AND phase = :ready', { ':id': row.run_id, ':ready': s('ready') });
     row = await stored();
   }
   return row;
@@ -162,12 +167,31 @@ async function start(token, row) {
   }
 }
 
+// A room of phones polls /api/state, and each poll used to ask Lambda for the execution's status:
+// at 40 players that is enough to be throttled. Ask at most once per two seconds per environment,
+// sharing one in-flight answer between concurrent requests. The phase itself is always read fresh.
+const statusCache = new Map();
+function durableStatus(arn) {
+  const hit = statusCache.get(arn);
+  if (hit && Date.now() - hit.at < 2000) return hit.promise;
+  if (statusCache.size > 16) statusCache.clear();
+  const promise = lambda.send(new GetDurableExecutionCommand({ DurableExecutionArn: arn, IncludeExecutionData: false }))
+    .then(({ Status }) => ({ status: Status }), error => {
+      if (error.name !== 'ResourceNotFoundException') throw error;
+      return { missing: true };
+    });
+  statusCache.set(arn, { at: Date.now(), promise });
+  promise.catch(() => statusCache.delete(arn));
+  return promise;
+}
+
 async function recoverStart(row) {
   if (row?.phase.S !== 'launching' || row.execution_arn || Date.now() < Number(row.start_deadline.N)) return row;
+  // AWS refuses a name filter once a version is given, as a Qualifier or inside the ARN, so list
+  // by the unqualified function: a run id is unique across versions.
   const arn = row.workflow_arn.S;
-  const separator = arn.lastIndexOf(':');
   const { DurableExecutions } = await lambda.send(new ListDurableExecutionsByFunctionCommand({
-    FunctionName: arn.slice(0, separator), Qualifier: arn.slice(separator + 1), DurableExecutionName: row.run_id.S,
+    FunctionName: arn.slice(0, arn.lastIndexOf(':')), DurableExecutionName: row.run_id.S,
   }));
   const found = DurableExecutions?.find(result => result.DurableExecutionName === row.run_id.S);
   if (found?.DurableExecutionArn) {
@@ -188,12 +212,10 @@ async function describe(row) {
   let phase = row.phase.S;
   let status;
   if (arn && (phase !== 'expired' || row.expired_action)) {
-    try {
-      ({ Status: status } = await lambda.send(new GetDurableExecutionCommand({
-        DurableExecutionArn: arn, IncludeExecutionData: false,
-      })));
-    } catch (error) {
-      if (error.name !== 'ResourceNotFoundException') throw error;
+    const answer = await durableStatus(arn);
+    if (!answer.missing) {
+      status = answer.status;
+    } else {
       // Immediately after Invoke, the execution may not be visible to Get yet.
       // A terminal state already recorded by the workflow remains authoritative
       // after execution history retention expires.
@@ -236,14 +258,8 @@ async function describe(row) {
     result.launch_vm_state = row.launch_vm_state.S;
   }
   if (phase === 'compared') {
-    result.branches = JSON.parse(row.outcomes_data.S);
+    result.outcomes = JSON.parse(row.outcomes_data.S);  // trimmed to a board by view(); never sent whole
     result.return_draw = 42;
-  } else if (row.migrations_data) {
-    // The schemas and evaluator metadata identify which migration preserved
-    // carts. Until the reveal, only send the two shared checks to the browser.
-    result.branches = JSON.parse(row.migrations_data.S).map(({ health_status, history_status }) => ({
-      health_status, history_status,
-    }));
   }
   if (row.callback_id && Number(row.lease_until?.N) <= Date.now()) {
     if (phase === 'migrating') result.retry_action = 'migrate';
@@ -292,11 +308,19 @@ async function resume(action, token, row, state) {
 }
 
 function send(response, code, type, body, extra = {}) {
-  response.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store',
+  const headers = { 'Content-Type': type, 'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
     'Strict-Transport-Security': 'max-age=31536000', ...extra,
     'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-  });
+  };
+  // A room of phones polls this: send the roster and the board gzipped when the client accepts it.
+  if (/^(application\/json|text\/|image\/svg)/.test(type) && Buffer.byteLength(body) >= 1024
+    && /\bgzip\b/.test(response.req?.headers['accept-encoding'] ?? '')) {
+    body = gzipSync(body);
+    headers['Content-Encoding'] = 'gzip';
+    headers.Vary = 'Accept-Encoding';
+  }
+  response.writeHead(code, headers);
   response.end(body);
 }
 
@@ -321,10 +345,18 @@ async function body(request) {
 
 async function view(row, headers, hostView = false, mode) {
   const result = await describe(row);
+  const teams = teamsOf(row);
   result.open = open(result.phase);
-  result.teams = publicTeams(teamsOf(row), result.phase, headers['x-team-id'], headers['x-team-token']);
-  result.max_audience_teams = 8;
-  result.audience_count = result.teams.filter(team => !team.house).length;
+  result.audience_count = teams.filter(team => !team.house).length;
+  result.max_audience_teams = MAX_TEAMS;
+  result.options = publicOptions();
+  // Once the shoppers have been through, the board is all anyone needs: not the roster.
+  result.teams = result.outcomes ? [] : publicTeams(teams, result.phase);
+  if (!hostView) result.me = ownTeam(teams, headers['x-team-id'], headers['x-team-token']);
+  if (result.outcomes) {
+    result.board = board(result.outcomes, result.me?.id);
+    delete result.outcomes;
+  }
   if (hostView) {
     // Never derived from request headers: unset PUBLIC_HOST means no URL, no QR code.
     result.public_url = process.env.PUBLIC_HOST ? `https://${process.env.PUBLIC_HOST}` : null;
@@ -337,7 +369,9 @@ async function view(row, headers, hostView = false, mode) {
 }
 
 async function changeTeam(input, action) {
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    // A room joining at once rewrites the one roster item: losers re-read and retry after a short jitter.
+    if (attempt) await new Promise(resolve => setTimeout(resolve, randomInt(10, 60)));
     const row = await initialized(), teams = teamsOf(row);
     let next = teams, reply;
     if (action === 'join') {
