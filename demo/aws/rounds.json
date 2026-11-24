@@ -1,0 +1,57 @@
+{
+  "player_cap": 100,
+  "min_players": 6,
+  "house": {"id": "house", "name": "House (does nothing)"},
+  "bots": ["Bot Lambo", "Bot Turbo", "Bot Kevin", "Bot Monolith", "Bot Spike"],
+  "names": {
+    "adjectives": ["Spiky", "Cold", "Warm", "Elastic", "Durable", "Serverless", "Idle", "Burst", "Lazy", "Eager", "Shiny", "Rusty", "Sharded", "Cached", "Async", "Frozen", "Hot", "Quiet", "Loud", "Sleepy", "Turbo", "Tiny", "Mighty", "Lucky"],
+    "nouns": ["Lambda", "Start", "Mug", "Cart", "Queue", "Shard", "Replica", "Bucket", "Cache", "Worker", "Region", "Node", "Packet", "Retry", "Checkout", "Shopper", "Server", "Cluster", "Router", "Ledger", "Pager", "Cookie", "Token", "Kettle"]
+  },
+  "recorded_evidence": {
+    "careful": {"cart_kept": true, "cart_status": 200, "charges": 1, "source": "recorded"},
+    "fast": {"cart_kept": false, "cart_status": 404, "charges": 0, "source": "recorded"}
+  },
+  "rounds": [
+    {
+      "id": "launch", "title": "Round 1 · Launch", "weeks": "Weeks 1–4",
+      "forecast": "Modest traffic. Pick a server size: idle capacity costs money, a slow shop loses customers.",
+      "market": {"text": "Demand vs forecast", "unit": "%", "min": 80, "max": 120},
+      "options": [
+        {"id": "small", "label": "Small server", "blurb": "Cheap. Slows down if demand runs hot.", "cost_text": "$", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"},
+        {"id": "medium", "label": "Medium server", "blurb": "Room for growth.", "cost_text": "$$", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"},
+        {"id": "large", "label": "Large server", "blurb": "Never slow. You pay for it every week.", "cost_text": "$$$", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"}
+      ]
+    },
+    {
+      "id": "growth", "title": "Round 2 · Growth", "weeks": "Weeks 5–8",
+      "forecast": "Traffic doubles. The database on your server's disk is the limit, and customers have saved carts.",
+      "market": {"text": "Demand vs forecast", "unit": "%", "min": 80, "max": 120},
+      "options": [
+        {"id": "stay", "label": "Stay on the server's disk", "blurb": "No migration. You can't add servers later.", "cost_text": "free", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"},
+        {"id": "careful", "label": "Careful migration", "blurb": "Copy every table to a shared PostgreSQL database.", "cost_text": "$$", "risk": 0, "dice_text": "", "requires": null, "evidence": "real"},
+        {"id": "fast", "label": "Fast migration", "blurb": "Skip the carts table. Cheap and quick.", "cost_text": "$", "risk": 30, "dice_text": "Under 30: saved carts are lost", "requires": null, "evidence": "real"}
+      ]
+    },
+    {
+      "id": "blackfriday", "title": "Round 3 · Black Friday", "weeks": "Weeks 9–10",
+      "forecast": "A huge spike and impatient shoppers who retry. Scale, queue or ride it out.",
+      "market": {"text": "Black Friday spike", "unit": "×", "min": 8, "max": 15},
+      "options": [
+        {"id": "ride", "label": "Ride it out", "blurb": "Keep the servers you have.", "cost_text": "free", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"},
+        {"id": "autoscale", "label": "Autoscale", "blurb": "Add servers as traffic grows. Cost grows with it.", "cost_text": "$$–$$$", "risk": 20, "dice_text": "Under 20: scaled too late, slow for the first hours", "requires": {"round": "growth", "options": ["careful", "fast"], "reason": "Needs a shared database from Round 2"}, "evidence": "modelled"},
+        {"id": "queue", "label": "Queue checkouts", "blurb": "Never fails, but confirmations are slower.", "cost_text": "$", "risk": 10, "dice_text": "Under 10: retries charged some customers twice", "requires": null, "evidence": "modelled"}
+      ]
+    },
+    {
+      "id": "christmas", "title": "Round 4 · Christmas", "weeks": "Weeks 11–13",
+      "forecast": "Steady high demand. Returning customers check their carts and orders.",
+      "market": {"text": "Demand vs forecast", "unit": "%", "min": 70, "max": 120},
+      "options": [
+        {"id": "keep", "label": "Keep what you have", "blurb": "Same capacity as Black Friday.", "cost_text": "$$", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"},
+        {"id": "down", "label": "Scale down", "blurb": "Cheap. Slow if demand stays high.", "cost_text": "$", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"},
+        {"id": "commit", "label": "Commit to steady capacity", "blurb": "Cheaper per hour, paid even when quiet. Pricing modelled, not measured.", "cost_text": "$ fixed", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"}
+      ]
+    }
+  ],
+  "model": {}
+}
