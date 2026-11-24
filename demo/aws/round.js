@@ -17,9 +17,15 @@ async function api(path, input, action = false) {
     if (action) { headers['X-Rehearsal-Action'] = '1'; headers['X-Rehearsal-Run'] = current.action_token; }
     else { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(input); }
   }
-  const response = await fetch(`/api/${path}`, options);
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  let response;
+  // The endpoint answers 429 (an HTML page) while it adds environments; wait and retry.
+  for (let attempt = 1; ; attempt++) {
+    response = await fetch(`/api/${path}`, options);
+    if (response.status !== 429 || attempt === 4) break;
+    await new Promise(resolve => setTimeout(resolve, 300 * attempt + Math.random() * 300));
+  }
+  const data = (response.headers.get('content-type') ?? '').includes('json') ? await response.json() : {};
+  if (!response.ok) throw new Error(data.error || (response.status === 429 ? 'Busy, try again' : `HTTP ${response.status}`));
   return data;
 }
 function score(row) {

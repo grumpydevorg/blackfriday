@@ -187,6 +187,12 @@ def wait_web(web, *, revision: str | None = None, endpoint: bool = False) -> dic
     raise TimeoutError('Web Function did not become active')
 
 
+# A room of phones arrives at once. With 2 environments, more than about five
+# simultaneous requests got HTTP 429 from the endpoint while it scaled (24 Nov
+# 2026); 10 environments served 24 at once. The throttle was not the limit.
+ENDPOINT_LIMITS = {'scalingConfig': {'maxEnvironments': 10}, 'throttleConfig': {'rateLimit': 100}}
+
+
 def deploy_web(session, bucket: str, key: str) -> str:
     """Create or update the arena Web Function through the Lambda Web API.
 
@@ -217,8 +223,7 @@ def deploy_web(session, bucket: str, key: str) -> str:
             revisionConfig={'buildConfig': build, 'serviceConfig': service},
             endpointConfig={
                 'endpointName': WEB_ENDPOINT, 'endpointType': 'HomeRegion', 'authType': 'ApplicationManaged',
-                'autoDeploymentMode': 'Disabled', 'scalingConfig': {'maxEnvironments': 2},
-                'throttleConfig': {'rateLimit': 100},
+                'autoDeploymentMode': 'Disabled', **ENDPOINT_LIMITS,
             },
         )
         wait_web(web, revision=created['revision']['revisionId'])
@@ -228,12 +233,13 @@ def deploy_web(session, bucket: str, key: str) -> str:
             live['buildConfig']['codeConfig']['s3Object'] == build['codeConfig']['s3Object']
             and {name: live['serviceConfig'].get(name) for name in service} == service
         )
-        if not same:
-            revision = web.create_web_function_revision(functionName=WEB_FUNCTION, buildConfig=build, serviceConfig=service)['revisionId']
-            wait_web(web, revision=revision)
-            web.update_web_function_endpoint(
-                functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT, revisionWeights=[{'revisionId': revision, 'weight': 100}],
-            )
+        update = {} if same else {'revisionWeights': [{'revisionId': web.create_web_function_revision(
+            functionName=WEB_FUNCTION, buildConfig=build, serviceConfig=service)['revisionId'], 'weight': 100}]}
+        if update:
+            wait_web(web, revision=update['revisionWeights'][0]['revisionId'])
+        update.update({name: value for name, value in ENDPOINT_LIMITS.items() if current.get(name) != value})
+        if update:
+            web.update_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT, **update)
     return 'https://' + wait_web(web, endpoint=True)['domainName']
 
 
