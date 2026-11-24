@@ -1,66 +1,65 @@
-# AWS round and rehearsal
+# AWS game and rehearsal
 
-Two separate deployments run the same story in Sydney (`ap-southeast-2`):
+Three separate deployments run in Sydney (`ap-southeast-2`):
 
-| Deployment | Who plays | Endpoint | Presenter page |
+| Deployment | What it is | Endpoint | Presenter page |
 |:--|:--|:--|:--|
-| **round** | Everyone in the room (up to 200 teams) plus two house teams, and bots if the room is thin | Public (`ApplicationManaged`): players open it on their phones | <http://127.0.0.1:8768/host> |
-| **rehearsal** | Nobody: the presenter compares two releases | IAM only | <http://127.0.0.1:8767/> |
+| **fourround** | The four-round game: everyone in the room plays, up to 100 players plus the house, and bots if the room is thin | Public (`ApplicationManaged`): players open it on their phones | <http://127.0.0.1:8770/host> |
+| **round** | The one-round game it replaced (up to 200 teams, one Growth round). Frozen at tag `round-fallback-2026-11-25` | Public | <http://127.0.0.1:8768/host> |
+| **rehearsal** | Nobody plays: the presenter compares two releases. Frozen at tag `rehearsal-fallback-2026-11-24b` | IAM only | <http://127.0.0.1:8767/> |
 
-Select one with `BLACK_FRIDAY_DEPLOYMENT=round` or `rehearsal` (the default).
-They share no stacks, functions, tables or Web Function, so one can change or
-be torn down without touching the other. The rehearsal is frozen at tag
-`rehearsal-fallback-2026-11-24b`; the [local demo](local-play.md) needs no AWS
-account and is the last fallback.
+Select one with `BLACK_FRIDAY_DEPLOYMENT=fourround`, `round` or `rehearsal` (the
+default). They share no stacks, functions, tables or Web Function, so one can
+change or be torn down without touching the others. `fourround` and `round`
+share one thing on purpose: the presenter key and passphrase in SSM. The
+[local demo](local-play.md) needs no AWS account and is the last fallback.
 
-**The story.** In Launch, the unchanged PHP/SQLite shop sells a mug in a real
-MicroVM and leaves Maya's cart saved, then the VM is terminated. Each team picks
-one of three paths. Every path is really migrated from that same checkpoint to
-PostgreSQL, once per path in use, in its own MicroVMs: at most three migrations
-and three shopper checks however many teams play. Maya's cart survives in all of
-them. What differs is the risk: when the round closes, every team rolls its own
-dice, and a roll under its path's risk means the migration broke on Black Friday
-and the shop earned nothing from the wave. The winner has the most profit after
-the modelled AWS bill.
+| | Stack | Artifacts stack | Web Function |
+|:--|:--|:--|:--|
+| fourround | `BlackFridayFourRound` | `BlackFridayFourRoundArtifacts` | `black-friday-four` |
+| round | `BlackFridayRound` | `BlackFridayRoundArtifacts` | `black-friday-round` |
+| rehearsal | `BlackFridayRehearsal` | `BlackFridayRehearsalArtifacts` | `black-friday-arena` |
 
-## What players do (round)
+**The story.** Four rounds, 13 simulated weeks: Launch (weeks 1–4), Growth
+(5–8), Black Friday (9–10), Christmas (11–13). Each player picks one of three
+options per round; the profit after the modelled AWS bill decides. The rules,
+the economics and the balance check are in [game.md](../game.md). What is
+real: after **Start** and before Round 1 opens, a MicroVM runs the unchanged
+PHP/SQLite shop and sells a mug, and both growth migrations (careful copies every
+table to PostgreSQL, fast omits the carts) are run and each checked in its own
+MicroVM. At most five MicroVMs per game (one Launch, two migrations, two
+checks); none after that. Everything else is modelled.
 
-Nobody uploads code. A player makes one choice; only the organiser's code runs.
+## What players do (fourround)
+
+Nobody uploads code. Players only pick; only the organiser's code runs.
 
 1. Scan the QR on the presenter page or slide and open the public URL.
-2. **Join** with a team name: 1–20 printable characters, unique ignoring case.
-   The phone keeps a team token; only that phone can change the team's pick.
-3. **Pick** one of three big buttons before the round closes, and change it as
-   often as they like. The options table is [`options.json`](../../demo/aws/options.json),
-   the single source for the phones, the web function and the scoring:
+2. **Join**, with a name or without: a blank name becomes a generated
+   `Adjective Noun`. The phone keeps a player token; only that phone can change
+   the player's name or picks. Tapping an option before joining joins and picks.
+   Names can change until the Launch round closes. Joining stays open until the
+   Growth round closes; at most 100 audience players.
+3. **Pick** one of three big buttons for the open round, and change it as often
+   as they like before the round closes. The options come from
+   [`rounds.json`](../../demo/aws/rounds.json); `autoscale` is greyed out, and
+   refused with 409, unless the player picked Careful or Fast in Growth.
+4. Watch the result: their own round (event, sales, slow, failed, cost, profit,
+   cumulative, rank, the roll against the risk, and whether the evidence was
+   real, recorded or modelled), the top 10 and their own row.
 
-   | Option | Shop | Breaks | Extra cost |
-   |:--|:--|--:|--:|
-   | **Lift & shift**: same code, same database | small shared database, 1 replica, no cache | 5% | none |
-   | **Scale up**: bigger database | large shared database, 1 replica, no cache | 10% | +$40 |
-   | **Refactor**: add a cache, fastest if it works | small shared database, 1 replica, cache | 30% | none |
+Other players' picks stay hidden. A player who does not pick plays the round's
+first option. Bots fill the board up to six players counting the audience and
+the house, and are labelled; their names are reserved. A player who joins during
+Growth starts from an all-default shop. Joining, renaming and picking are
+refused outside those windows and with the wrong token.
 
-4. Watch the scoreboard: the top 10 and their own row, with the roll behind
-   it ("Held (rolled 63)" or "Broke on Black Friday (rolled 12, under 30)").
-
-Other teams' picks stay hidden until the round closes. A team that joins but
-never picks plays Lift & shift. **House A** plays Lift & shift and **House B**
-plays Refactor. If fewer than six teams are in at Close, bots (Bot Lambo, Bot
-Turbo, Bot Kevin, Bot Monolith, in that order) fill the board up to six, each
-with a random option, and are labelled "bot"; their names are reserved so no
-player can take one. Rolls and bot picks are drawn once, in one checkpointed
-Durable step, so a replay never draws again.
-
-Joining and picking are refused once the round closes, with the wrong team
-token, and, as a safety cap on the roster item, past 200 teams ("The round is
-full").
-
-## What the presenter does (round)
+## What the presenter does (fourround)
 
 **Sign in on the page itself.** Open `<public URL>/host` on a laptop or phone, no
 helper and no Tailscale. The page is public but holds no secret: until you sign
-in it shows only a passphrase form. After sign-in it shows the buttons, QR, team
-list and execution ARN. The cookie is `__Host-bf_host` and lasts 12 hours
+in it shows only a passphrase form. After sign-in it shows the controls, QR,
+player list and execution ARN. The cookie is `__Host-bf_host` and lasts 12 hours
 (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`, no `Domain`, so a sibling
 subdomain cannot set or shadow it); **Sign out** clears it. When the page is
 driven through the helper below there is no cookie, so Sign out is hidden.
@@ -70,17 +69,18 @@ Set your own passphrase once (at least 8 characters), before the talk:
 ```sh
 cd demo
 export BLACK_FRIDAY_AWS_ACCOUNT=<12-digit account id> BLACK_FRIDAY_AWS_PROFILE=<AWS CLI profile>
-BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py passphrase
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py passphrase
 ```
 
 It asks twice with no echo (or reads one line from stdin when piped), stores it
-as the SSM SecureString `/black-friday/round/presenter-passphrase`, and confirms
-with the new parameter version, never the value. Console fallback: Systems
-Manager → Parameter Store → `/black-friday/round/presenter-passphrase` → Edit →
-SecureString value (at least 8 characters). Changing it signs every device out
-within 30 seconds: each cookie is an HMAC over its expiry, keyed by the SSM
-presenter key over the current passphrase, so neither secret is in it. Until a
-passphrase exists, sign-in answers 503 and presenter routes stay 403.
+as the SSM SecureString `/black-friday/round/presenter-passphrase` (shared with
+`round`, so changing it changes both), and confirms with the new parameter
+version, never the value. Console fallback: Systems Manager → Parameter Store →
+`/black-friday/round/presenter-passphrase` → Edit → SecureString value (at least
+8 characters). Changing it signs every device out within 30 seconds: each cookie
+is an HMAC over its expiry, keyed by the SSM presenter key over the current
+passphrase, so neither secret is in it. Until a passphrase exists, sign-in
+answers 503 and presenter routes stay 403.
 
 Sign-in is throttled across all of the Web Function's environments: ten failed
 attempts in ten minutes, then every sign-in gets 429 until the window passes.
@@ -92,52 +92,48 @@ one, an `Origin` equal to the endpoint's own origin.
 presenter key authorises presenter routes:
 
 ```sh
-BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py present --tailnet
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py present --tailnet
 ```
 
 `present` reads the presenter key from SSM (`/black-friday/round/presenter-key`)
-and runs a loopback proxy at <http://127.0.0.1:8768/host> that adds it to every
+and runs a loopback proxy at <http://127.0.0.1:8770/host> that adds it to every
 request. The key never reaches a browser. (The key is also the MAC secret of the
-cookie.)
+cookie.) It forwards only the presenter routes below and the page's own files.
 
 `--tailnet` also publishes the presenter page at
 `https://<this Mac's MagicDNS name>:8443/host`, so the presenter can drive the
-round from a phone on the same tailnet. It runs `tailscale serve` (tailnet only,
+game from a phone on the same tailnet. It runs `tailscale serve` (tailnet only,
 not Funnel) in the foreground, so the page disappears when `present` stops; the
-Mac must stay awake and online. A second loopback listener (port 8769) behind it
-accepts only requests that `serve` marks with the Mac owner's login, so another
-person on the tailnet or a tagged device gets 403, even where the tailnet policy
-lets them reach the Mac. A process on the Mac itself is trusted, as it already
-is for 8768. Without `--tailnet`, the page is on the laptop only.
+Mac must stay awake and online. A second loopback listener (port 8771 for
+`fourround`, one above the proxy's port) behind it accepts only requests that
+`serve` marks with the Mac owner's login, so another person on the tailnet or a
+tagged device gets 403, even where the tailnet policy lets them reach the Mac. A
+process on the Mac itself is trusted, as it already is for 8770. Without
+`--tailnet`, the page is on the laptop only.
 
-The page shows the public URL as text and a QR code, the teams and whether they
-have picked, the execution ARN, and three buttons. While the round is open each
-audience team has a **Remove** button (house teams have none): it frees a squatted
-or rude name, and that phone shows "Your team was removed" and can join again.
-Removal is refused once the round closes.
+The page shows the public URL as text and a QR code, the players and whether they
+have picked for the open round, the round's forecast and market range, the
+execution ARN, and three buttons:
 
-1. **Open round / Run Launch.** Starts the version-pinned Durable execution.
-   Launch runs once, for everyone. Players can join from the moment the round
-   is reset until step 2.
-2. **Close round and deploy every release.** Freezes every pick into the
-   Durable callback, draws the bots and every team's roll in one checkpointed
-   step, then migrates each option in use (at most three) in its own MicroVM
-   and PostgreSQL schema (`bf_<run>_lift`, `…_scale`, `…_refactor`).
-3. **Send the shoppers back.** One check per option in use, in parallel: Maya's
-   cart in that option's shop, plus the option's architecture scored by the
-   Virtual RDS model. Every team inherits its option's real result and applies
-   its own roll on top. The scoreboard ranks the teams.
+1. **Start.** Only before the game starts. Starts the version-pinned Durable
+   execution, which runs the real Launch and both migrations and checks, then
+   opens Round 1. Players can join from the moment the game is reset.
+2. **Close round N.** Only while a round is open. Freezes every pick, then the
+   workflow draws the market, bots and dice, scores the round, publishes its
+   results and opens the next round. After Round 4 the game is final and the
+   page says to reset. If the close callback's 20-second lease lapses without
+   AWS confirming it, the button becomes **Retry close round N**.
+3. **Reset.** In any phase: throws every player and score away and starts a fresh
+   lobby. The page asks first unless the game is waiting or over. A running
+   Durable execution is not stopped; its writes no longer match the new run.
 
-**Reset to a fresh open round** clears the teams and starts again. Each callback
-waits at most 23 hours, so click Launch less than 23 hours before step 2.
+While joining is open each audience player has a **Remove** button (the house
+and bots have none): it frees a squatted or rude name, and that phone shows it
+was removed and can join again. The server refuses removal while a round is
+closing.
 
-Score, in cents: Launch profit (900) + the shop's profit on the Black Friday
-wave ([`virtual_rds.py`](../../demo/virtual_rds.py), minus the option's extra
-cost; if the migration broke, the wave's sales count as 0 and the shop earns
-minus its cost) + $10 for each of Maya's sales (her checkout now, plus one
-next-week sale if the shared draw of 42 is below her return chance) − the
-migration cost (200). Lift & shift 14,500 held / 2,500 broke; Scale up
-19,200 / −1,800; Refactor 23,500 / 2,500. Details: [game.md](../game.md#the-growth-round-built-and-run).
+Each callback waits at most 23 hours, so click Start less than 23 hours before
+the first Close, and keep the gap between Closes under 23 hours.
 
 ## What runs
 
@@ -145,41 +141,60 @@ migration cost (200). Lift & shift 14,500 held / 2,500 broke; Scale up
 flowchart LR
   Ph[Players' phones] -->|public HTTPS| W[Web Function]
   P[Presenter: passphrase cookie, or the helper adds the key] -->|public HTTPS| W
-  W -->|start or callback| D[Durable Function: one round]
-  D -->|publish stage| T[(DynamoDB: round state)]
-  W -->|read stage| T
-  D -->|Launch, then one evaluation per team| E[Event Function: referee]
-  E -->|run trusted PHP| M[Disposable Lambda MicroVM per team]
+  W -->|Start, or the Close callback| D[Durable Function: one game]
+  D -->|publish round, publish results| T[(DynamoDB: arena + results items)]
+  W -->|read| T
+  D -->|Launch, migrations, checks: once, before Round 1| E[Event Function: referee]
+  E -->|run trusted PHP| M[Disposable Lambda MicroVM per stage]
   E -->|SQLite / PostgreSQL dump / results| S[(Private S3 bucket)]
   M -->|one signed conditional payment write| S
 ```
 
 The first MicroVM runs PHP/SQLite. Each migration MicroVM reads the same hashed
-checkpoint and writes a real PostgreSQL dump to S3; each shopper-return MicroVM
-restores its team's dump. Every environment finishes and is terminated before
-the workflow publishes the stage. PostgreSQL runs inside the disposable VM;
-there is no idle RDS instance. The image runs only trusted organiser code: it
-has no execution role, but has internet egress for a short-lived, object-scoped
-payment PUT. It is **not** a sandbox for arbitrary uploads.
+checkpoint and writes a real PostgreSQL dump to S3; each check MicroVM restores
+that dump and asks whether the saved cart survived. Every environment finishes
+and is terminated before the workflow opens Round 1. The four rounds then run
+inside the workflow as the pure functions in `model.py`; no MicroVM exists after
+Round 1 opens. PostgreSQL runs inside the disposable VM; there is no idle RDS
+instance. The image runs only trusted organiser code: it has no execution role,
+but has internet egress for a short-lived, object-scoped payment PUT. It is
+**not** a sandbox for arbitrary uploads. The Durable sequence and the DynamoDB
+items are in [architecture.md](../architecture.md#the-durable-game-and-its-items).
 
 Public routes: `GET /`, `/host` (the page only), `/round.js`, `/round.css`
 (cached for an hour, like the hero image), `/art/cloud-surge.jpg`, `/api/state`;
-`POST /api/join`, `/api/pick`, `/api/host/login`, `/api/host/logout`. Presenter
-routes (a valid cookie or the presenter key, otherwise 403): `GET /api/host/state`,
-`/api/host/qr.svg`; `POST /api/launch`, `/api/migrate`, `/api/compare`,
-`/api/reset`, and `/api/host/remove` (a JSON body of at most 2 KiB: the team id).
-Only presenter routes start compute. API responses are `no-store`; every response
-carries `Strict-Transport-Security`. The public URL and the origin check come only
-from the deployed `PUBLIC_HOST`, never from request headers; without it they fail
-closed. A stored passphrase shorter than 8 characters counts as unset (503).
+`POST /api/join` (`{name?}`), `/api/rename` (`{id, token, name}`), `/api/pick`
+(`{id, token, round, option}`), `/api/host/login`, `/api/host/logout`. A phone
+sends its `X-Team-Id` and `X-Team-Token` headers with `/api/state` to learn its
+own name and picks. Presenter routes, all under `/api/host/` (a valid cookie or
+the presenter key, otherwise 403): `GET /api/host/state`, `/api/host/qr.svg`;
+`POST /api/host/start`, `/api/host/close` (also needs `X-Rehearsal-Round: <round>`),
+`/api/host/reset` (these three take no body) and `/api/host/remove` (a JSON body
+of at most 2 KiB: the player id). Anything else is 404; the old
+`/api/launch`, `/api/migrate` and `/api/compare` routes exist only in the frozen
+deployments. Only presenter routes start compute. API responses are `no-store`;
+every response carries `Strict-Transport-Security`. The public URL and the origin
+check come only from the deployed `PUBLIC_HOST`, never from request headers;
+without it they fail closed. A stored passphrase shorter than 8 characters counts
+as unset (503).
 
-Close is one atomic write: it moves the phase from `launch` to `migrating` for this
-run and callback and copies the roster at that instant into the Durable callback.
-A pick that races it either committed first (it counts) or is refused ("round
-closed"); a retry of an unconfirmed callback re-sends the same frozen roster. The
-page and phones stop polling after `compared`, `expired` or `failed` (a phone
-reloads; the presenter page resumes on Reset), never overlap polls, and never retry
-a throttled poll.
+Refusals are 409 (not allowed now: a closed round, a locked name, a taken name,
+a full game, `autoscale` without a shared database) or 400 (not a valid name or
+option) or 403 (wrong player token).
+
+Close is one atomic write: it moves the phase from `open` to `closing` for this
+run, callback and round, and copies the roster at that instant into
+`frozen_data`, which the Durable callback carries. A pick that races it either
+committed first (it counts) or is refused ("That round is closed"); a Close for
+the wrong round or a stale callback is refused; a retry of an unconfirmed
+callback re-sends the same frozen roster. Every roster write (join, rename, pick,
+remove) is a conditional write that fails if the roster changed since it was
+read, so a room joining at once retries with a short jitter.
+
+Phones poll `/api/state` every 3 s plus 0–1 s of jitter, never overlap polls and
+never retry a throttled poll; after `final`, `expired` or `failed` the presenter
+polls every 15 s and phones every 30 s, so a Reset is still noticed. A results
+item never changes once written, so the Web Function caches it for good.
 
 ## Prerequisites
 
@@ -192,7 +207,7 @@ export BLACK_FRIDAY_AWS_PROFILE=<AWS CLI profile>
 aws sso login --profile "$BLACK_FRIDAY_AWS_PROFILE"
 ```
 
-Both deployments were built and first run in Oregon, then moved to Sydney on
+The first deployments were built and run in Oregon, then moved to Sydney on
 23 November 2026. Sydney is missing from the
 [Web Functions launch post](https://aws.amazon.com/about-aws/whats-new/2026/10/aws-lambda-web-functions/),
 but Web Functions run there, and
@@ -202,22 +217,33 @@ but Web Functions run there, and
 
 ```sh
 cd demo
-BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py deploy
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py deploy
 ```
 
 `deploy` checks that the credentials belong to `$BLACK_FRIDAY_AWS_ACCOUNT` in
 `ap-southeast-2` before making changes; `--keep-failed` preserves failed stack
-resources for diagnosis. It creates the stacks `BlackFridayRoundArtifacts` and
-`BlackFridayRound`, creates the presenter key in SSM once, then creates or
-updates the `black-friday-round` Web Function through the Lambda Web API.
+resources for diagnosis. It creates the stacks `BlackFridayFourRoundArtifacts`
+and `BlackFridayFourRound`, creates the presenter key in SSM once (it is shared
+with `round`), then creates or updates the `black-friday-four` Web Function
+through the Lambda Web API. The workflow package holds `workflow.py`, `model.py`
+and `rounds.json`; the worker is `evaluator.py`; the web package holds
+`game.mjs`, `host_auth.mjs`, `roster.mjs`, `rounds.json`, the pages and the art.
 CloudFormation's `AWS::Lambda::WebFunction` cannot create one any more: since
 November 2026 `CreateWebFunction` needs its first revision and endpoint in the
 same call. Web Function names are unique across all Regions in an account.
-`uv run aws/operate.py package <output>` builds the deployment archives without AWS.
+`uv run aws/operate.py package <output>` builds the deployment archives without
+AWS.
 
-The rehearsal (`BlackFridayRehearsal`, `BlackFridayRehearsalArtifacts`,
-`black-friday-arena`) is frozen: on this branch `deploy` refuses it. Deploy it
-from the tag, and present it from either:
+### The frozen deployments
+
+On this branch `deploy` refuses `round` and `rehearsal`. Deploy either from its
+tag with `git archive`, and present it from either checkout:
+
+```sh
+out=$(mktemp -d) && git archive round-fallback-2026-11-25 | tar -x -C "$out"
+cd "$out/demo" && BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py deploy
+BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py present    # http://127.0.0.1:8768/host
+```
 
 ```sh
 out=$(mktemp -d) && git archive rehearsal-fallback-2026-11-24b | tar -x -C "$out"
@@ -225,13 +251,21 @@ cd "$out/demo" && uv run aws/operate.py deploy
 uv run aws/operate.py present    # from any checkout: signs requests, http://127.0.0.1:8767/
 ```
 
+The one-round game's rules and runbook are in its own tag's copy of this file.
+
 ## Costs and caps
 
-- No provisioned EC2, RDS or NAT in either deployment.
-- Round: at most 10 teams, so 10 parallel judges; Event evaluator reserved
-  concurrency 10 (rehearsal: 4).
-- The round's public endpoint is rate-limited and accepts small JSON bodies;
-  the public can join and pick but never start a run or a MicroVM.
+- No provisioned EC2, RDS or NAT in any deployment.
+- fourround: at most five MicroVMs per game, all before Round 1 opens; Event
+  evaluator reserved concurrency 10 (rehearsal: 4). Everything after is
+  arithmetic in the workflow.
+- The public endpoint scales to at most 10 environments, 100 requests/s, 8
+  concurrent requests per environment, 15 s timeout, and accepts small JSON
+  bodies; the public can join, rename and pick but never start a run or a
+  MicroVM.
+- At most 100 audience players keep the arena item (the roster and its frozen
+  copy) and each results item small against DynamoDB's 400 KB item limit; the
+  go/no-go run checks the largest item.
 - MicroVM runs have a 120-second hard lifetime.
 - A Durable run has a 48-hour ceiling; each callback waits at most 23 hours.
 - Run artifacts and logs expire after seven days; deployment packages remain
@@ -242,19 +276,24 @@ uv run aws/operate.py present    # from any checkout: signs requests, http://127
 When no run should resume, stop the presenter, then, for one deployment:
 
 ```sh
-BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py destroy              # Web Function and its logs, then BlackFridayRound
-BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py destroy --artifacts  # also its artifact bucket (all versions) and stack
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy              # Web Function and its logs, then BlackFridayFourRound
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy --artifacts  # also its artifact bucket (all versions) and stack
 ```
 
-Use `BLACK_FRIDAY_DEPLOYMENT=rehearsal` (the default) for the rehearsal.
+Use `BLACK_FRIDAY_DEPLOYMENT=round` or `rehearsal` (the default) for the others.
 `destroy` deletes in the only safe order: the Web Function first, because
 CloudFormation does not own it, then the stacks. Without `--artifacts` it keeps
 the artifacts stack and its bucket, with the packages and run evidence. With it,
 the stack goes before the bucket it retains, then the bucket is found by name
 and emptied, so a re-run finishes an interrupted teardown. It never touches the
-other deployment. The round's presenter key and passphrase stay in SSM
-(`aws ssm delete-parameter --name /black-friday/round/presenter-passphrase` removes
-the passphrase; the sign-in then answers 503).
+other deployments. The presenter key and passphrase stay in SSM, shared by
+`round` and `fourround` (`aws ssm delete-parameter --name
+/black-friday/round/presenter-passphrase` removes the passphrase; the sign-in
+then answers 503).
 
-Managed Instances is not part of either deployment. See
+Managed Instances is not part of any deployment. See
 [On-demand vs Managed Instances](launch-wave.md#on-demand-vs-managed-instances).
+
+## Go/no-go measurements
+
+To be recorded after the go/no-go run.
