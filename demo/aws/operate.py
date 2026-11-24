@@ -269,33 +269,36 @@ def stack_exists(session, stack: str) -> bool:
     return True
 
 
+def artifact_buckets(session) -> list[str]:
+    """The retained artifact buckets, found by the name CloudFormation gave them."""
+    prefix = ARTIFACTS.lower() + '-artifacts-'
+    return [b['Name'] for b in session.client('s3').list_buckets()['Buckets'] if b['Name'].startswith(prefix)]
+
+
 def destroy(*, artifacts: bool = False) -> None:
     """Tear down in the one safe order. Re-runnable after a partial teardown.
 
     The Web Function is not in CloudFormation, so it goes first: deleting the
     stacks first would leave a function serving an arena whose run table and
-    workflow are gone. The artifact bucket and its stack go together or not at
-    all, so a bucket is never left without the stack that names it.
+    workflow are gone. The artifact stack goes before its bucket (which it
+    retains), so its bucket policy is never deleted against a missing bucket;
+    the bucket is then found by name, so a re-run finishes an interrupted one.
     """
     session = account_session()
     remove_web(session)
     if stack_exists(session, STACK):
         delete_stack(session, STACK)
-    if not stack_exists(session, ARTIFACTS):
-        return
-    bucket = stack_outputs(session, ARTIFACTS)['Bucket']
     if not artifacts:
-        print(f'Kept {ARTIFACTS} and bucket {bucket} (packages and run evidence); '
+        print(f'Kept {ARTIFACTS} and its bucket (packages and run evidence); '
               'destroy --artifacts deletes them', flush=True)
         return
-    s3 = session.resource('s3').Bucket(bucket)
-    try:
-        s3.object_versions.delete()
-        s3.delete()
-        print(f'Deleted bucket {bucket}', flush=True)
-    except s3.meta.client.exceptions.NoSuchBucket:
-        pass
-    delete_stack(session, ARTIFACTS)
+    if stack_exists(session, ARTIFACTS):
+        delete_stack(session, ARTIFACTS)
+    for name in artifact_buckets(session):
+        bucket = session.resource('s3').Bucket(name)
+        bucket.object_versions.delete()
+        bucket.delete()
+        print(f'Deleted bucket {name}', flush=True)
 
 
 def deploy(*, keep_failed: bool = False) -> None:

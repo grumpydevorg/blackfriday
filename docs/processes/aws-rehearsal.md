@@ -108,9 +108,9 @@ uv run aws/operate.py destroy --artifacts  # also the artifact bucket (all versi
 
 `destroy` deletes in the only safe order: the Web Function first, because
 CloudFormation does not own it, then the stacks. Without `--artifacts` it keeps
-`BlackFridayRehearsalArtifacts` and its bucket together, with the packages and
-run evidence; the bucket is never left without the stack that names it. It is
-safe to run again after an interrupted teardown.
+`BlackFridayRehearsalArtifacts` and its bucket, with the packages and run
+evidence. With it, the stack goes before the bucket it retains, then the bucket
+is found by name and emptied, so a re-run finishes an interrupted teardown.
 
 Managed Instances is not part of this stack. See
 [On-demand vs Managed Instances](launch-wave.md#on-demand-vs-managed-instances).
