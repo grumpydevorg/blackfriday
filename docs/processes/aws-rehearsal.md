@@ -99,13 +99,18 @@ execution, including real VM termination and S3 ledger checks.
 
 ## Teardown
 
-When no run should resume, stop the presenter, run `uv run aws/operate.py
-remove-web`, then delete `BlackFridayRehearsal` with CloudFormation in the same
-account and Region. The artifact bucket is
-retained on purpose; identify it from the `BlackFridayRehearsalArtifacts`
-stack's `Bucket` output before deleting that stack. Delete the retained bucket,
-including versions, only after deciding the packages and rehearsal evidence are
-no longer needed.
+When no run should resume, stop the presenter, then:
+
+```sh
+uv run aws/operate.py destroy              # Web Function and its logs, then BlackFridayRehearsal
+uv run aws/operate.py destroy --artifacts  # also the artifact bucket (all versions) and its stack
+```
+
+`destroy` deletes in the only safe order: the Web Function first, because
+CloudFormation does not own it, then the stacks. Without `--artifacts` it keeps
+`BlackFridayRehearsalArtifacts` and its bucket together, with the packages and
+run evidence; the bucket is never left without the stack that names it. It is
+safe to run again after an interrupted teardown.
 
 Managed Instances is not part of this stack. See
 [On-demand vs Managed Instances](launch-wave.md#on-demand-vs-managed-instances).

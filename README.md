@@ -36,9 +36,11 @@ need](docs/processes/running-outside-code.md) is written down.
 | [`docs/architecture.md`](docs/architecture.md) | Both sides of the infrastructure: what is built, what is proposed, how state is managed |
 | [`docs/design.md`](docs/design.md) | The full design specification |
 | [`docs/processes/`](docs/processes/) | How to run each part: locally, in AWS, Git submissions, MicroVMs |
-| [`talk/`](talk/) | Slides (`index.html`, opens offline) and speaker notes |
 | [`demo/`](demo/) | The shop, the referee, the simulators and the AWS templates |
 | [`assets/`](assets/) | Concept art (ChatGPT-generated, illustrative only) |
+
+The talk deck, with Arran Peterson's slides on each Lambda, is published at
+<https://aws-ug-2026-11-25.talk.grumpydev.org/talk/>.
 
 ## Try it
 

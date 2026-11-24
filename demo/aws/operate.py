@@ -23,6 +23,7 @@ import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.exceptions import (
+    ClientError,
     SSOTokenLoadError,
     TokenRetrievalError,
     UnauthorizedSSOTokenError,
@@ -224,8 +225,8 @@ def deploy_web(session, bucket: str, key: str) -> str:
     return 'https://' + wait_web(web, endpoint=True)['domainName']
 
 
-def remove_web() -> None:
-    session = account_session()
+def remove_web(session) -> None:
+    """Delete what deploy_web created: the endpoint, the function and its logs."""
     web = session.client('lambda-web')
     try:
         web.delete_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
@@ -235,13 +236,66 @@ def remove_web() -> None:
         try:
             web.delete_web_function(functionName=WEB_FUNCTION)
             print(f'Deleted Web Function {WEB_FUNCTION}', flush=True)
-            return
+            break
         except web.exceptions.ResourceNotFoundException:
             print('No Web Function to delete', flush=True)
-            return
+            break
         except web.exceptions.ConflictException:
             sleep(3)
-    raise TimeoutError('The Web Function endpoint is still deleting')
+    else:
+        raise TimeoutError('The Web Function endpoint is still deleting')
+    logs = session.client('logs')
+    prefix = f'/aws/lambda/web/{WEB_FUNCTION}'
+    for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=prefix):
+        for group in page['logGroups']:
+            logs.delete_log_group(logGroupName=group['logGroupName'])
+            print(f'Deleted log group {group["logGroupName"]}', flush=True)
+
+
+def delete_stack(session, stack: str) -> None:
+    cloudformation = session.client('cloudformation')
+    cloudformation.delete_stack(StackName=stack)
+    cloudformation.get_waiter('stack_delete_complete').wait(StackName=stack, WaiterConfig={'Delay': 10, 'MaxAttempts': 180})
+    print(f'Deleted stack {stack}', flush=True)
+
+
+def stack_exists(session, stack: str) -> bool:
+    try:
+        session.client('cloudformation').describe_stacks(StackName=stack)
+    except ClientError as error:
+        if error.response['Error']['Code'] == 'ValidationError' and 'does not exist' in str(error):
+            return False
+        raise
+    return True
+
+
+def destroy(*, artifacts: bool = False) -> None:
+    """Tear down in the one safe order. Re-runnable after a partial teardown.
+
+    The Web Function is not in CloudFormation, so it goes first: deleting the
+    stacks first would leave a function serving an arena whose run table and
+    workflow are gone. The artifact bucket and its stack go together or not at
+    all, so a bucket is never left without the stack that names it.
+    """
+    session = account_session()
+    remove_web(session)
+    if stack_exists(session, STACK):
+        delete_stack(session, STACK)
+    if not stack_exists(session, ARTIFACTS):
+        return
+    bucket = stack_outputs(session, ARTIFACTS)['Bucket']
+    if not artifacts:
+        print(f'Kept {ARTIFACTS} and bucket {bucket} (packages and run evidence); '
+              'destroy --artifacts deletes them', flush=True)
+        return
+    s3 = session.resource('s3').Bucket(bucket)
+    try:
+        s3.object_versions.delete()
+        s3.delete()
+        print(f'Deleted bucket {bucket}', flush=True)
+    except s3.meta.client.exceptions.NoSuchBucket:
+        pass
+    delete_stack(session, ARTIFACTS)
 
 
 def deploy(*, keep_failed: bool = False) -> None:
@@ -351,14 +405,16 @@ def main() -> None:
     deploy_command.add_argument('--keep-failed', action='store_true', help='Preserve failed stack resources for diagnosis')
     stage = commands.add_parser('present', help='Run the localhost IAM-signing proxy')
     stage.add_argument('--port', type=int, default=8767)
-    commands.add_parser('remove-web', help='Delete the arena Web Function (before deleting the stacks)')
+    teardown = commands.add_parser('destroy', help='Delete the Web Function, then the rehearsal stack')
+    teardown.add_argument('--artifacts', action='store_true',
+                          help='Also delete the artifact bucket (all versions) and its stack')
     args = parser.parse_args()
     if args.command == 'deploy':
         deploy(keep_failed=args.keep_failed)
     elif args.command == 'present':
         present(args.port)
-    elif args.command == 'remove-web':
-        remove_web()
+    elif args.command == 'destroy':
+        destroy(artifacts=args.artifacts)
     else:
         packages(args.output)
 
