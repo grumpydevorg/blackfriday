@@ -149,9 +149,11 @@ def test_without_a_configured_origin_the_cookie_path_and_the_public_url_fail_clo
 def test_player_routes_need_no_credentials_and_presenter_routes_do():
     javascript("""
       for (const [method, url] of [['GET', '/'], ['GET', '/host'], ['GET', '/round.js'], ['GET', '/api/state'],
-          ['POST', '/api/join'], ['POST', '/api/pick']]) assert.equal(routeKind(method, url), 'public', url);
-      for (const [method, url] of [['GET', '/api/host/state'], ['GET', '/api/host/qr.svg'], ['POST', '/api/launch'],
-          ['POST', '/api/migrate'], ['POST', '/api/compare'], ['POST', '/api/reset']]) assert.equal(routeKind(method, url), 'presenter', url);
+          ['POST', '/api/join'], ['POST', '/api/rename'], ['POST', '/api/pick']]) assert.equal(routeKind(method, url), 'public', url);
+      for (const [method, url] of [['GET', '/api/host/state'], ['GET', '/api/host/qr.svg'], ['POST', '/api/host/start'],
+          ['POST', '/api/host/close'], ['POST', '/api/host/reset'], ['POST', '/api/host/remove']]) assert.equal(routeKind(method, url), 'presenter', url);
+      // The one-round routes are gone: they are no longer presenter routes, and the Web Function 404s them.
+      for (const url of ['/api/launch', '/api/migrate', '/api/compare', '/api/reset']) assert.equal(routeKind('POST', url), 'public', url);
       assert.equal(routeKind('POST', '/api/host/login'), 'login');
       assert.equal(routeKind('POST', '/api/host/logout'), 'logout');
     """)

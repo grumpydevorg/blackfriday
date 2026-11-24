@@ -41,12 +41,18 @@ DEMO = AWS_DIR.parent
 ACCOUNT = os.environ.get('BLACK_FRIDAY_AWS_ACCOUNT', '')
 REGION = 'ap-southeast-2'
 PROFILE = os.environ.get('BLACK_FRIDAY_AWS_PROFILE') or None
+DEPLOYMENTS = {
+    # name: (stack, web function). The artifacts stack is always '<stack>Artifacts'.
+    'rehearsal': ('BlackFridayRehearsal', 'black-friday-arena'),
+    'round': ('BlackFridayRound', 'black-friday-round'),
+    'fourround': ('BlackFridayFourRound', 'black-friday-four'),
+}
 DEPLOYMENT = os.environ.get('BLACK_FRIDAY_DEPLOYMENT', 'rehearsal')
-if DEPLOYMENT not in ('rehearsal', 'round'):
-    raise SystemExit('BLACK_FRIDAY_DEPLOYMENT must be rehearsal or round')
-STACK = 'BlackFridayRehearsal' if DEPLOYMENT == 'rehearsal' else 'BlackFridayRound'
+if DEPLOYMENT not in DEPLOYMENTS:
+    raise SystemExit('BLACK_FRIDAY_DEPLOYMENT must be rehearsal, round or fourround')
+STACK, WEB_FUNCTION = DEPLOYMENTS[DEPLOYMENT]
 ARTIFACTS = STACK + 'Artifacts'
-WEB_FUNCTION = 'black-friday-arena' if DEPLOYMENT == 'rehearsal' else 'black-friday-round'
+# The round and the four-round game share the presenter's key and passphrase.
 PRESENTER_PARAMETER = '/black-friday/round/presenter-key'
 PASSPHRASE_PARAMETER = '/black-friday/round/presenter-passphrase'
 WEB_ENDPOINT = 'stage'
@@ -119,6 +125,29 @@ def python_dependencies(root: Path, *requirements: str) -> None:
     ], check=True)
 
 
+def package_definitions(root: Path) -> dict[str, tuple[dict[str, Path], dict[str, Path]]]:
+    """Each archive's files (archive name -> source) and directory trees (prefix -> root). No I/O."""
+    return {
+        'image': ({
+            'Dockerfile': AWS_DIR / 'Microvm.Dockerfile',
+            'aws/vm_runtime.py': AWS_DIR / 'vm_runtime.py',
+            **{name: DEMO / name for name in ('schema.sql', 'db.php', 'shop.php', 'migrate.php')},
+        }, {}),
+        'worker': ({'evaluator.py': AWS_DIR / 'evaluator.py'}, {'': root / 'sdk'}),
+        'workflow': ({
+            name: AWS_DIR / name for name in ('workflow.py', 'model.py', 'rounds.json')
+        }, {'': root / 'sdk'}),
+        'web': ({
+            'index.mjs': AWS_DIR / 'web.mjs',
+            **{name: AWS_DIR / name for name in (
+                'game.mjs', 'host_auth.mjs', 'roster.mjs', 'rounds.json',
+                'player.html', 'host.html', 'round.js', 'round.css',
+            )},
+            'art/cloud-surge.jpg': AWS_DIR / 'art' / 'cloud-surge.jpg',  # derived from assets/cloud-surge.png
+        }, {'node_modules/': root / 'web' / 'node_modules'}),
+    }
+
+
 def packages(out: Path) -> dict[str, tuple[str, Path]]:
     out.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix='black-friday-package-') as work:
@@ -129,30 +158,7 @@ def packages(out: Path) -> dict[str, tuple[str, Path]]:
         for name in ('package.json', 'package-lock.json'):
             (web / name).write_bytes((AWS_DIR / name).read_bytes())
         subprocess.run(['npm', 'ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], cwd=web, check=True)
-        definitions = {
-            'image': ({
-                'Dockerfile': AWS_DIR / 'Microvm.Dockerfile',
-                'aws/vm_runtime.py': AWS_DIR / 'vm_runtime.py',
-                **{name: DEMO / name for name in ('schema.sql', 'db.php', 'shop.php', 'migrate.php')},
-            }, {}),
-            'worker': ({
-                'evaluator.py': AWS_DIR / 'evaluator.py', 'scoring.py': AWS_DIR / 'scoring.py',
-                'options.json': AWS_DIR / 'options.json',
-                'virtual_rds.py': DEMO / 'virtual_rds.py', 'arena.py': DEMO / 'arena.py',
-            }, {'': root / 'sdk'}),
-            'workflow': ({
-                'workflow.py': AWS_DIR / 'workflow.py', 'scoring.py': AWS_DIR / 'scoring.py',
-                'options.json': AWS_DIR / 'options.json',
-            }, {'': root / 'sdk'}),
-            'web': ({
-                'index.mjs': AWS_DIR / 'web.mjs',
-                **{name: AWS_DIR / name for name in (
-                    'game.mjs', 'host_auth.mjs', 'roster.mjs', 'options.json',
-                    'player.html', 'host.html', 'round.js', 'round.css',
-                )},
-                'art/cloud-surge.jpg': AWS_DIR / 'art' / 'cloud-surge.jpg',  # derived from assets/cloud-surge.png
-            }, {'node_modules/': web / 'node_modules'}),
-        }
+        definitions = package_definitions(root)
         results = {}
         for kind, (files, trees) in definitions.items():
             path = out / f'{kind}.zip'
@@ -339,8 +345,8 @@ def destroy(*, artifacts: bool = False) -> None:
 
 def passphrase() -> None:
     """Set the presenter's own passphrase. It is read from a prompt or stdin and never printed."""
-    if DEPLOYMENT != 'round':
-        raise SystemExit('Only the round has a presenter passphrase (BLACK_FRIDAY_DEPLOYMENT=round)')
+    if DEPLOYMENT not in ('round', 'fourround'):
+        raise SystemExit('Only the round and the four-round game have a presenter passphrase (BLACK_FRIDAY_DEPLOYMENT=round or fourround)')
     if sys.stdin.isatty():
         value = getpass.getpass('Presenter passphrase (at least 8 characters): ')
         if value != getpass.getpass('Again: '):
@@ -371,9 +377,11 @@ def retain_web_logs(session) -> None:
 
 
 def deploy(*, keep_failed: bool = False) -> None:
-    session = account_session()
     if DEPLOYMENT == 'rehearsal':
-        raise SystemExit('The rehearsal is frozen. Deploy it from tag rehearsal-fallback-2026-11-24b; use BLACK_FRIDAY_DEPLOYMENT=round for the audience round.')
+        raise SystemExit('The rehearsal is frozen. Deploy it from tag rehearsal-fallback-2026-11-24b; use BLACK_FRIDAY_DEPLOYMENT=fourround for the four-round game.')
+    if DEPLOYMENT == 'round':
+        raise SystemExit('The one-round game is frozen. Deploy it from tag round-fallback-2026-11-25 via git archive; use BLACK_FRIDAY_DEPLOYMENT=fourround for the four-round game.')
+    session = account_session()
     ssm = session.client('ssm')
     try:
         ssm.get_parameter(Name=PRESENTER_PARAMETER)
@@ -433,9 +441,12 @@ def present(port: int, tailnet: bool = False) -> None:
     )['Parameter']['Value']
     local_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
     allowed_get = {'/', '/api/state', '/art/cloud-surge.png', '/art/cloud-surge.jpg', '/host', '/api/host/state', '/api/host/qr.svg', '/round.js', '/round.css'}
-    allowed_post = {f'/api/{action}' for action in ('launch', 'migrate', 'compare', 'reset')}
-    # Round only: these two carry a small JSON body (a team id; an empty object) and are no
-    # longer bodyless. The rehearsal's old code has neither route.
+    # The four-round game's presenter actions all live under /api/host/ (host_auth's rule). Start, Close and Reset
+    # are bodyless; remove and logout carry a small JSON body. The older deployments keep their own routes.
+    four = DEPLOYMENT == 'fourround'
+    allowed_post = {f'/api/host/{action}' for action in ('start', 'close', 'reset')} if four else {
+        f'/api/{action}' for action in ('launch', 'migrate', 'compare', 'reset')
+    }
     with_body = {'/api/host/remove', '/api/host/logout'} if credentials is None else set()
     allowed_post |= with_body
     http = build_opener(NoRedirect)
@@ -474,7 +485,7 @@ def present(port: int, tailnet: bool = False) -> None:
             headers = {'X-Amz-Content-SHA256': sha256(body).hexdigest()}
             if body:
                 headers['Content-Type'] = 'application/json'
-            for name in ('X-Rehearsal-Action', 'X-Rehearsal-Run'):
+            for name in ('X-Rehearsal-Action', 'X-Rehearsal-Run', 'X-Rehearsal-Round'):
                 if value := self.headers.get(name):
                     headers[name] = value
             url = endpoint + self.path
@@ -555,7 +566,7 @@ def main() -> None:
     deploy_command = commands.add_parser('deploy', help='Deploy the private rehearsal into your AWS account')
     deploy_command.add_argument('--keep-failed', action='store_true', help='Preserve failed stack resources for diagnosis')
     stage = commands.add_parser('present', help='Proxy to the selected deployment (IAM rehearsal, keyed round)')
-    stage.add_argument('--port', type=int, default=8767 if DEPLOYMENT == 'rehearsal' else 8768)
+    stage.add_argument('--port', type=int, default={'rehearsal': 8767, 'round': 8768, 'fourround': 8770}[DEPLOYMENT])
     stage.add_argument('--tailnet', action='store_true',
                        help="Also publish the presenter page on this Mac's tailnet name, for its owner only")
     commands.add_parser('passphrase', help="Set the round's presenter passphrase (prompt, or stdin when piped)")

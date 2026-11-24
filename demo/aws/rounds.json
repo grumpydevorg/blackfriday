@@ -29,7 +29,7 @@
       "options": [
         {"id": "stay", "label": "Stay on the server's disk", "blurb": "No migration. You can't add servers later.", "cost_text": "free", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"},
         {"id": "careful", "label": "Careful migration", "blurb": "Copy every table to a shared PostgreSQL database.", "cost_text": "$$", "risk": 0, "dice_text": "", "requires": null, "evidence": "real"},
-        {"id": "fast", "label": "Fast migration", "blurb": "Skip the carts table. Cheap and quick.", "cost_text": "$", "risk": 30, "dice_text": "Under 30: saved carts are lost", "requires": null, "evidence": "real"}
+        {"id": "fast", "label": "Fast migration", "blurb": "Skip the carts table. Cheap and quick.", "cost_text": "$", "risk": 38, "dice_text": "Under 38: saved carts are lost", "requires": null, "evidence": "real"}
       ]
     },
     {
@@ -38,8 +38,8 @@
       "market": {"text": "Black Friday spike", "unit": "×", "min": 8, "max": 15},
       "options": [
         {"id": "ride", "label": "Ride it out", "blurb": "Keep the servers you have.", "cost_text": "free", "risk": 0, "dice_text": "", "requires": null, "evidence": "modelled"},
-        {"id": "autoscale", "label": "Autoscale", "blurb": "Add servers as traffic grows. Cost grows with it.", "cost_text": "$$–$$$", "risk": 20, "dice_text": "Under 20: scaled too late, slow for the first hours", "requires": {"round": "growth", "options": ["careful", "fast"], "reason": "Needs a shared database from Round 2"}, "evidence": "modelled"},
-        {"id": "queue", "label": "Queue checkouts", "blurb": "Never fails, but confirmations are slower.", "cost_text": "$", "risk": 10, "dice_text": "Under 10: retries charged some customers twice", "requires": null, "evidence": "modelled"}
+        {"id": "autoscale", "label": "Autoscale", "blurb": "Add servers as traffic grows. Cost grows with it.", "cost_text": "$$–$$$", "risk": 35, "dice_text": "Under 35: scaled too late, slow for the first hours", "requires": {"round": "growth", "options": ["careful", "fast"], "reason": "Needs a shared database from Round 2"}, "evidence": "modelled"},
+        {"id": "queue", "label": "Queue checkouts", "blurb": "Never fails, but confirmations are slower.", "cost_text": "$", "risk": 21, "dice_text": "Under 21: retries charged some customers twice", "requires": null, "evidence": "modelled"}
       ]
     },
     {
@@ -53,5 +53,70 @@
       ]
     }
   ],
-  "model": {}
+  "model": {
+    "margin_cents": 1000,
+    "weeks": {
+      "launch": 4,
+      "growth": 4,
+      "blackfriday": 2,
+      "christmas": 3
+    },
+    "arrivals": {
+      "launch": 40,
+      "growth": 56,
+      "blackfriday": 2,
+      "christmas": 53
+    },
+    "slow_pct": 14,
+    "return_pct": {
+      "fast": 75,
+      "slow": 50,
+      "failed": 20,
+      "lost": 5
+    },
+    "servers": {
+      "small": {
+        "cap": 60,
+        "cost": 31500
+      },
+      "medium": {
+        "cap": 80,
+        "cost": 42000
+      },
+      "large": {
+        "cap": 104,
+        "cost": 48013
+      }
+    },
+    "disk_ceiling": 89,
+    "database": {
+      "stay": {
+        "migration": 0,
+        "week": 0
+      },
+      "careful": {
+        "migration": 14089,
+        "week": 2290
+      },
+      "fast": {
+        "migration": 3840,
+        "week": 186
+      }
+    },
+    "blackfriday": {
+      "scale_unit_week": 451,
+      "late_pct": 60,
+      "queue_week": 1185,
+      "queue_unit": 362,
+      "double_pct": 36,
+      "refund_cents": 3600
+    },
+    "christmas": {
+      "down_cap": 90,
+      "commit_cap": 103,
+      "commit_unit_week": 539,
+      "history_lost_pct": 40
+    },
+    "shared_pct": 120
+  }
 }

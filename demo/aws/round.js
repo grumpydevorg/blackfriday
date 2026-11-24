@@ -1,35 +1,69 @@
 'use strict';
+// One script for both pages: the phone (player.html) and the presenter (host.html, <body data-host>).
+// No inline script or style anywhere (CSP), so every element is built here with textContent.
 const $ = id => document.getElementById(id);
 const host = document.body.dataset.host === 'true';
-const money = cents => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(cents / 100);
-const titles = { ready: 'The Growth round is open', launching: '1 · Launch is running', launch: 'Launch saved · pick your path', migrating: '2 · Every team is deploying', migrated: 'Every deployment is healthy', comparing: '3 · The shoppers are returning', compared: 'The scores are in', expired: 'The round expired', failed: 'The round could not finish' };
-const messages = { ready: 'Join now and pick one option. Rick starts the shop.', launching: 'A real MicroVM sells a mug, saves Maya’s cart, then terminates.', launch: 'The checkpoint is saved. Joining and picking stay open until Close.', migrating: 'Picks are frozen and each team’s risk is rolled once. Every team migrates the same checkpoint in its own MicroVM.', migrated: 'The databases are healthy and the old order exists. Which migrations held on Black Friday?', comparing: 'Fresh MicroVMs check the carts. Event judges replay the Black Friday wave on each team’s shop.', compared: 'Profit wins, not most servers. Real migration checks; modelled capacity, costs and next-week sales.' };
-const optionOf = id => (current?.options ?? []).find(option => option.id === id);
-const optionLabel = id => optionOf(id)?.label ?? id;
-const whole = cents => `$${cents / 100}`;
-const optionLine = option => `${option.blurb}${option.extra_cost_cents ? `, +${whole(option.extra_cost_cents)}` : ''} · breaks ${option.risk}%`;
-let identity;
-try { identity = JSON.parse(localStorage.getItem('black-friday-team')); } catch { identity = null; }
-let current, initializedPick = false, pending = false;
-let timer, inflight = false, again = false, epoch = 0;
-const make = (tag, text, cls = '') => { const node = document.createElement(tag); node.textContent = text; node.className = cls; return node; };
-async function api(path, input, action = false) {
-  const headers = {};
+const STORAGE_KEY = 'black-friday-player';
+const NAME_LIMIT = 20;
+const money = cents => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(cents / 100);
+const make = (tag, text = '', cls = '') => { const node = document.createElement(tag); node.textContent = text; node.className = cls; return node; };
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+let identity = null;
+if (!host) { try { identity = JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch { identity = null; } }
+let current, pending = false;
+let timer, inflight = false, again = false, epoch = 0, pollFailed = false, renameDirty = false;
+
+const roundOf = (state, id) => (state?.rounds ?? []).find(round => round.id === id);
+const optionOf = (state, roundId, optionId) => roundOf(state, roundId)?.options.find(option => option.id === optionId);
+const optionLabel = (state, roundId, optionId) => optionOf(state, roundId, optionId)?.label ?? optionId;
+const unit = (market, n) => `${n}${market.unit}`;
+const marketRange = round => `${round.market.text}: somewhere between ${unit(round.market, round.market.min)} and ${unit(round.market, round.market.max)}`;
+const marketDraw = (round, n) => `${round.market.text}: ${unit(round.market, n)}`;
+const phaseTitles = {
+  ready: 'Waiting for the game to start', starting: 'Setting up the shop', closing: 'Round closed',
+  final: 'Final results', expired: 'The game expired', failed: 'The game could not finish',
+};
+const phoneMessages = {
+  ready: 'Join now. Rick starts the game when the room is ready.',
+  starting: 'Real MicroVMs are launching the shop and trying both migrations. Round 1 opens in a moment.',
+  open: 'Pick one before Rick closes the round. Tap another to change it.',
+  closing: 'Rolling the dice and scoring every shop…',
+  final: 'That is all four rounds.',
+  expired: 'Rick did not close the round in time. Ask him to reset.',
+  failed: 'Something broke on the server side. Ask Rick to reset.',
+};
+const hostMessages = {
+  ready: 'Players can join. Press Start when the room is ready.',
+  starting: 'Real launch and migrations are running. Round 1 opens when they finish.',
+  open: 'Players are picking. Close the round when the room has chosen.',
+  closing: 'Scoring the round…',
+  final: 'Four rounds done. Reset for a fresh game.',
+  expired: 'The close callback expired. Reset to start again.',
+  failed: 'The workflow failed. Reset to start again.',
+};
+const optionStates = (state, round, picks) => (round?.options ?? []).map(option => {
+  const need = option.requires;
+  const unmet = need && !need.options.includes(picks[need.round]);
+  return { option, reason: unmet ? need.reason : '' };
+});
+
+async function api(path, { body, action = false, headers: extra = {}, retry = false } = {}) {
+  const headers = { ...extra };
   if (identity) { headers['X-Team-Id'] = identity.id; headers['X-Team-Token'] = identity.token; }
   const options = { headers, cache: 'no-store' };
-  const post = input !== undefined || action;
-  if (post) {
+  if (body !== undefined || action) {
     options.method = 'POST';
-    if (action) { headers['X-Rehearsal-Action'] = '1'; headers['X-Rehearsal-Run'] = current.action_token; }
-    if (input !== undefined) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(input); }
+    if (action) { headers['X-Rehearsal-Action'] = '1'; headers['X-Rehearsal-Run'] = current?.action_token ?? ''; }
+    if (body !== undefined) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(body); }
   }
-  let response;
-  // The endpoint answers 429 (an HTML page) while it adds environments. Retry a join or a pick,
+  // The endpoint answers 429 (an HTML page) while it adds environments. Retry a join, rename or pick,
   // never a poll: the next tick is the retry, and a room of phones must not amplify a throttle.
-  const retries = post && !action ? 4 : 1;
+  const attempts = retry ? 4 : 1;
+  let response;
   for (let attempt = 1; ; attempt++) {
     response = await fetch(`/api/${path}`, options);
-    if (response.status !== 429 || attempt === retries) break;
+    if (response.status !== 429 || attempt === attempts) break;
     await new Promise(resolve => setTimeout(resolve, 300 * attempt + Math.random() * 300));
   }
   const data = (response.headers.get('content-type') ?? '').includes('json') ? await response.json() : {};
@@ -40,99 +74,262 @@ async function api(path, input, action = false) {
   }
   return data;
 }
-// One line per team so ten of them fit a projector screen; the working is in the tooltip and on the viewer's own result.
-function score(row) {
-  const line = make('article', '', `row ${row.broke ? 'broke' : 'held'}${row.id === identity?.id ? ' own' : ''}`);
+
+function badge(source) {
+  const text = source === 'real' ? 'real' : source === 'recorded' ? 'recorded' : 'modelled';
+  const pill = make('span', text, `pill ${text}`);
+  pill.title = { real: 'Measured in a real MicroVM tonight', recorded: 'A real MicroVM step failed, so a recorded result was used', modelled: 'Simulated by the model, not measured' }[text];
+  return pill;
+}
+
+// One ranked line. The working is in the tooltip; the outcome line says what happened and what the dice said.
+function boardRow(state, results, row, own) {
+  const line = make('article', '', `row ${row.hit ? 'hit' : 'ok'}${own ? ' own' : ''}`);
   const name = make('span', row.name, 'name');
   if (row.bot) name.append(' ', make('span', 'bot', 'pill'));
   else if (row.house) name.append(' ', make('span', 'house', 'pill'));
-  const extra = row.architecture.extra_cost_cents ? ` · +${whole(row.architecture.extra_cost_cents)}` : '';
+  const pick = make('span', optionLabel(state, results.round, row.option), 'pick');
+  pick.append(' ', badge(row.evidence));
+  const dice = row.risk > 0 ? ` (rolled ${row.roll}, risk ${row.risk})` : '';
   line.append(
-    make('span', `#${row.rank}`, 'rank'), name,
-    make('span', `${optionLabel(row.option)} · ${row.risk}%${extra}`, 'pick'),
-    make('span', row.broke ? `Broke on Black Friday (rolled ${row.roll}, under ${row.risk})` : `Held (rolled ${row.roll})`,
-      row.broke ? 'outcome red' : 'outcome green'),
+    make('span', `#${row.rank}`, 'rank'), name, pick,
+    make('span', `${row.event}${dice}`, row.hit ? 'outcome red' : 'outcome green'),
     make('span', money(row.cumulative_cents), 'money'),
   );
-  line.title = `${row.broke ? 'The wave was lost: 0 verified sales' : `The wave: ${row.architecture.verified_sales} verified sales`}, shop cost ${money(row.architecture.cost_cents)} · Launch $9 + shop ${money(row.architecture.profit_cents)} + Maya ${money(row.maya_sales * 1000)} − migration ${money(row.migration_cost_cents)}`;
+  line.title = `Sales ${row.sales}, slow ${row.slow}, failed ${row.failed} · cost ${money(row.cost_cents)}${row.refund_cents ? `, refunds ${money(row.refund_cents)}` : ''} · profit ${money(row.profit_cents)} · total ${money(row.cumulative_cents)}`;
   return line;
 }
-let optionsKey = '';
-// Three big buttons; the saved one is highlighted. Rebuilt only when something changed, so a tap is never lost to a poll.
-function renderOptions(state, team) {
-  const chosen = team.picked ? team.option : '';
-  const key = JSON.stringify([state.options, chosen]);
-  if (key === optionsKey) return;
-  optionsKey = key;
-  $('options').replaceChildren(...state.options.map(option => {
-    const button = make('button', '', chosen === option.id ? 'option selected' : 'option');
+function renderBoard(state, ownId) {
+  const results = state.results;
+  $('scoreboard').hidden = !results?.board;
+  if (!results?.board) return;
+  const { rows, total, more } = results.board;
+  const nodes = [];
+  rows.forEach((row, index) => {
+    if (index === 10) nodes.push(make('p', '⋯', 'gap'));
+    nodes.push(boardRow(state, results, row, row.id === ownId));
+  });
+  $('scores').replaceChildren(...nodes);
+  $('board-title').textContent = `After ${roundOf(state, results.round)?.title ?? 'the last round'}`;
+  if (!host) $('board-sub').textContent = `Top 10, and you. ${plural(total, 'player')}. Ties share a rank.`;
+  $('more').textContent = more > 0 ? `+${more} more ${more === 1 ? 'player' : 'players'}` : '';
+}
+
+let roundKey = '';
+// The option list. Buttons on the phone (three big targets), a static summary on the presenter.
+function renderPhoneOptions(state, round, me, interactive) {
+  const picks = me?.picks ?? {};
+  const rows = optionStates(state, round, picks);
+  const key = JSON.stringify([round.id, interactive, picks[round.id], rows.map(item => item.reason)]);
+  if (key === roundKey) return;
+  roundKey = key;
+  $('options').replaceChildren(...rows.map(({ option, reason }) => {
+    const chosen = picks[round.id] === option.id;
+    const button = make('button', '', `option${chosen ? ' selected' : ''}${reason ? ' unmet' : ''}${interactive ? '' : ' locked'}`);
     button.type = 'button';
     button.dataset.option = option.id;
-    button.setAttribute('aria-pressed', String(chosen === option.id));
-    button.append(make('span', option.label, 'option-label'), make('span', optionLine(option), 'option-line'));
+    button.disabled = Boolean(reason) || !interactive;
+    button.setAttribute('aria-pressed', String(chosen));
+    const head = make('span', '', 'option-head');
+    head.append(make('span', option.label, 'option-label'), make('span', option.cost_text, 'pill cost'));
+    if (option.evidence === 'real') head.append(badge('real'));
+    button.append(head, make('span', option.blurb, 'option-blurb'));
+    if (option.dice_text) button.append(make('span', `Dice: ${option.dice_text}`, 'option-dice'));
+    if (reason) button.append(make('span', reason, 'option-reason'));
     return button;
   }));
 }
-function render(state) {
-  current = state;
-  if (!host && identity && identity.run_id !== state.id) {
-    identity = null; initializedPick = false; localStorage.removeItem('black-friday-team');
-  } else if (!host && identity && !state.me) {
-    identity = null; initializedPick = false; localStorage.removeItem('black-friday-team');
-    $('error').textContent = 'Your team was removed. You can join again.';
+function renderHostOptions(round) {
+  $('round-options').replaceChildren(...round.options.map(option => {
+    const card = make('article', '', 'host-option');
+    const head = make('p', '', 'option-head');
+    head.append(make('span', option.label, 'option-label'), make('span', option.cost_text, 'pill cost'));
+    if (option.evidence === 'real') head.append(badge('real'));
+    card.append(head, make('p', option.blurb, 'option-blurb'));
+    if (option.dice_text) card.append(make('p', `Dice: ${option.dice_text}`, 'option-dice'));
+    if (option.requires) card.append(make('p', option.requires.reason, 'option-reason'));
+    return card;
+  }));
+}
+
+function renderPhone(state) {
+  // A new run or a removed player ends the old identity; a Reset starts every phone from zero.
+  if (identity && identity.run_id !== state.id) { identity = null; localStorage.removeItem(STORAGE_KEY); }
+  else if (identity && !state.me) {
+    identity = null; localStorage.removeItem(STORAGE_KEY);
+    $('error').textContent = 'You were removed from the game. You can join again if joining is open.';
   }
-  $('headline').textContent = titles[state.phase] || state.phase;
-  $('progress').textContent = state.message || messages[state.phase] || '';
-  const step = ['ready', 'launching'].includes(state.phase) ? 'launch' : ['launch', 'migrating'].includes(state.phase) ? 'migrate' : 'compare';
-  for (const name of ['launch', 'migrate', 'compare']) $(`stage-${name}`).classList.toggle('active', name === step);
-  $('capacity').textContent = `${state.audience_count} team${state.audience_count === 1 ? '' : 's'} joined · ${state.open ? 'joining and picks open' : 'round closed'}`;
-  $('teams').replaceChildren(...state.teams.map(team => {
-    const row = make('li', `${team.name}${team.house ? ' · house' : ''}${team.picked ? ' ✓' : ''}${!state.open && team.option ? ` · ${optionLabel(team.option)}` : ''}`, 'team');
-    if (host && state.open && !team.house) {
+  const me = state.me;
+  const open = state.phase === 'open' && Boolean(roundOf(state, state.round));
+  const round = open || state.phase === 'closing' ? roundOf(state, state.round) : ['ready', 'starting'].includes(state.phase) ? state.rounds[0] : null;
+  const canPick = open && (Boolean(me) || state.joinable);
+  $('headline').textContent = open ? `Round ${state.round_number} is open` : state.phase === 'closing' && round ? `Round ${state.round_number} closed` : phaseTitles[state.phase] ?? state.phase;
+  const spectator = !me && !state.joinable && ['open', 'closing'].includes(state.phase);
+  $('progress').textContent = state.message || (spectator ? 'Joining has closed. Watch the board with everyone else.' : phoneMessages[state.phase] ?? '');
+
+  $('join-section').hidden = Boolean(me) || !state.joinable;
+  $('me-section').hidden = !me;
+  if (me) {
+    $('your-name').textContent = me.name;
+    $('rename').hidden = !state.renamable;
+    $('rename-note').hidden = !state.renamable;
+    if (!renameDirty) $('rename-name').value = me.name;
+  }
+
+  $('round-section').hidden = !round;
+  if (round) {
+    $('round-weeks').textContent = `${round.weeks} · ${state.round_number > 0 ? `Round ${state.round_number} of ${state.rounds.length}` : 'Coming up'}`;
+    $('round-title').textContent = round.title;
+    $('round-forecast').textContent = round.forecast;
+    $('round-market').textContent = marketRange(round);
+    renderPhoneOptions(state, round, me, canPick);
+    const pick = me?.picks?.[round.id];
+    $('saved').textContent = !canPick ? '' : pick
+      ? `Saved: ${optionLabel(state, round.id, pick)}. Tap another to change it until Rick closes the round.`
+      : `${me ? 'No pick yet.' : 'Tap an option to join and pick in one go.'} If you skip, you get “${round.options[0].label}”.`;
+    $('round-hint').textContent = open ? 'Prices and sales are modelled, not real AWS charges.' : state.phase === 'closing' ? 'Your pick is frozen.' : 'Round 1 opens when Rick starts the game.';
+  } else roundKey = '';
+
+  const mine = state.results?.mine;
+  const results = state.results;
+  $('result-section').hidden = !mine;
+  if (mine) {
+    const resultRound = roundOf(state, results.round);
+    const stat = (label, value, cls = '') => { const tile = make('div', '', `stat ${cls}`); tile.append(make('span', label, 'k'), make('span', value, 'v')); return tile; };
+    const stats = make('div', '', 'stats');
+    stats.append(
+      stat('Sales', String(mine.sales)), stat('Slow', String(mine.slow)), stat('Failed', String(mine.failed)),
+      stat('Cost', money(mine.cost_cents)), stat('Profit', money(mine.profit_cents), mine.profit_cents < 0 ? 'neg' : 'pos'), stat('Total', money(mine.cumulative_cents), 'total'),
+    );
+    const head = make('p', '', 'option-head');
+    head.append(make('span', optionLabel(state, results.round, mine.option), 'option-label'), badge(mine.evidence));
+    const nodes = [make('p', `${resultRound?.weeks ?? ''} · result`, 'kicker'), make('h2', `${resultRound?.title ?? 'Last round'}: #${mine.rank} of ${results.board.total}`), head, make('p', mine.event, `event ${mine.hit ? 'red' : 'green'}`)];
+    if (mine.risk > 0) nodes.push(make('p', `Dice: rolled ${mine.roll} against a risk of ${mine.risk}. ${mine.hit ? 'It hit.' : 'You were safe.'}`, 'dice'));
+    if (resultRound) nodes.push(make('p', marketDraw(resultRound, results.market), 'market'));
+    nodes.push(stats);
+    if (mine.refund_cents) nodes.push(make('p', `Includes ${money(mine.refund_cents)} in refunds.`, 'hint'));
+    $('result-section').replaceChildren(...nodes);
+  }
+
+  const final = state.phase === 'final';
+  $('final-section').hidden = !final;
+  if (final) {
+    $('final-section').replaceChildren(
+      make('p', 'Final standing', 'kicker'),
+      make('h2', mine ? `You finished #${mine.rank} of ${results.board.total}` : me ? 'You joined too late to score' : 'The game is over'),
+      make('p', mine ? `${me.name} made ${money(mine.cumulative_cents)} in total. Most profit wins.` : 'Thanks for playing.', 'big'),
+    );
+  }
+  renderBoard(state, me?.id);
+}
+
+function renderStages(state) {
+  const nodes = state.rounds.map((round, index) => {
+    const number = index + 1;
+    const done = state.phase === 'final' || number < state.round_number;
+    const active = number === state.round_number && state.phase !== 'final';
+    return make('li', `${number} · ${round.title.replace(/^Round \d+ · /, '')}`, `${active ? 'active' : ''}${done ? ' done' : ''}`.trim());
+  });
+  $('stages').replaceChildren(...nodes);
+}
+function renderEvidence(state) {
+  const evidence = state.evidence;
+  $('evidence-section').hidden = !evidence;
+  if (!evidence) return;
+  const cards = [['launch', 'Launch'], ['careful', 'Careful (preserve)'], ['fast', 'Fast (omit)']].map(([key, title]) => {
+    const data = evidence[key] ?? {};
+    const card = make('article', '', 'evidence-card');
+    const head = make('p', '', 'option-head');
+    head.append(make('span', title, 'option-label'), badge(data.source ?? 'real'));
+    const list = make('dl');
+    for (const [name, value] of Object.entries(data)) {
+      if (name === 'source' || value === null || typeof value === 'object') continue;
+      list.append(make('dt', name.replaceAll('_', ' ')), make('dd', typeof value === 'boolean' ? (value ? 'yes' : 'no') : String(value)));
+    }
+    card.append(head, list);
+    return card;
+  });
+  $('evidence').replaceChildren(...cards);
+}
+function renderHost(state) {
+  const phase = state.phase;
+  const live = ['open', 'closing'].includes(phase);
+  const round = live ? roundOf(state, state.round) : ['ready', 'starting'].includes(phase) ? state.rounds[0] : null;
+  renderStages(state);
+  $('headline').textContent = live && round ? `${round.title}${phase === 'closing' ? ' · closing' : ''}` : phaseTitles[phase] ?? phase;
+  $('progress').textContent = state.message || hostMessages[phase] || '';
+
+  $('round-section').hidden = !round;
+  if (round) {
+    $('round-weeks').textContent = `${round.weeks}${live ? '' : ' · coming up'}`;
+    $('round-title').textContent = round.title;
+    $('round-forecast').textContent = round.forecast;
+    $('round-market').textContent = marketRange(round);
+    renderHostOptions(round);
+  }
+
+  const results = state.results;
+  const resultRound = roundOf(state, results?.round);
+  $('results-section').hidden = !results;
+  if (results) {
+    $('results-title').textContent = `Results · ${resultRound?.title ?? results.round}`;
+    $('market-draw').textContent = resultRound ? marketDraw(resultRound, results.market) : `Market: ${results.market}`;
+    const options = results.summary?.options ?? {};
+    const head = make('div', '', 'summary-row head');
+    head.append(make('span', 'Option'), make('span', 'Players', 'n'), make('span', 'Mean profit', 'n'), make('span', 'Best profit', 'n'));
+    const lines = (resultRound?.options ?? []).filter(option => options[option.id]).map(option => {
+      const data = options[option.id];
+      const line = make('div', '', 'summary-row');
+      line.append(make('span', option.label, 'name'), make('span', String(data.players), 'n'), make('span', money(data.mean_profit_cents), 'n money'), make('span', money(data.best_profit_cents), 'n money'));
+      return line;
+    });
+    $('option-summary').replaceChildren(head, ...lines);
+  }
+  renderBoard(state);
+  renderEvidence(state);
+
+  const players = state.players ?? [];
+  const audience = players.filter(player => !player.house && !player.bot);
+  const picked = audience.filter(player => player.picked).length;
+  $('capacity').textContent = `${state.player_count} of ${state.player_cap} players${phase === 'open' ? ` · ${picked} of ${audience.length} picked` : ''}${state.joinable ? ' · joining open' : ' · joining closed'}`;
+  $('teams').replaceChildren(...players.map(player => {
+    const row = make('li', '', 'team');
+    const name = make('span', player.name, 'name');
+    if (player.bot) name.append(' ', make('span', 'bot', 'pill'));
+    else if (player.house) name.append(' ', make('span', 'house', 'pill'));
+    row.append(name);
+    if (phase === 'open' && player.picked) row.append(make('span', '✓', 'tick'));
+    if (state.joinable && !player.house && !player.bot) {
       const button = make('button', 'Remove', 'secondary small');
       button.type = 'button';
-      button.addEventListener('click', () => removeTeam(team));
+      button.addEventListener('click', () => act(() => api('host/remove', { body: { id: player.id }, action: true })));
       row.append(button);
     }
     return row;
   }));
-  const finished = state.phase === 'compared';
-  $('scoreboard').hidden = !finished;
-  if (finished) {
-    $('scores').replaceChildren(...state.board.rows.map(score));
-    $('more').textContent = state.board.more > 0 ? `+${state.board.more} more team${state.board.more === 1 ? '' : 's'}` : '';
-  }
-  if (host) {
-    for (const [name, phase] of [['launch', 'ready'], ['migrate', 'launch'], ['compare', 'migrated']]) {
-      $(name).disabled = pending || (state.phase !== phase && state.retry_action !== name);
-    }
-    $('reset').hidden = !['ready', 'compared', 'expired', 'failed'].includes(state.phase);
-    $('execution').textContent = state.execution_arn || 'Not started';
-    $('checkpoint').hidden = !state.checkpoint; $('checkpoint').textContent = state.checkpoint ? `Launch checkpoint ${state.checkpoint} · VM ${state.launch_vm_id} · ${state.launch_vm_state}` : '';
-    $('public-url').textContent = state.public_url ?? 'PUBLIC_HOST is not configured'; $('public-url').href = state.public_url ?? '#';
-    $('logout').hidden = state.auth_mode === 'key'; // the helper adds its own key; there is no cookie to clear
-    return;
-  }
-  const team = state.me;
-  $('join-section').hidden = Boolean(team) || !state.open;
-  $('pick-section').hidden = !team || !state.open;
-  $('waiting').hidden = finished || (!team && state.open);
-  $('waiting-title').textContent = state.open ? 'Waiting for the round to close' : 'Watching the judges';
-  $('waiting-detail').textContent = team ? `${team.name}: ${team.picked ? `you picked ${optionLabel(team.option)}` : 'using Lift & shift until you pick'}. ${state.open ? 'You can change it above until Close.' : 'Your pick is frozen.'}` : 'The round is closed. Watch the results with everyone else.';
-  if (team) {
-    $('your-team').textContent = team.name;
-    renderOptions(state, team);
-  }
-  const own = finished && state.board.rows.find(row => row.id === identity?.id);
-  $('own-result').hidden = !own;
-  if (own) $('own-result').replaceChildren(make('h2', `Your result · #${own.rank}`), make('p', `${own.name} · ${own.broke ? `broke on Black Friday (rolled ${own.roll}, under ${own.risk})` : `held (rolled ${own.roll})`} · ${money(own.cumulative_cents)} profit`), make('p', `${own.broke ? 'The wave was lost: 0 verified sales' : `The wave: ${own.architecture.verified_sales} verified sales`}, shop cost ${money(own.architecture.cost_cents)}. Launch $9 + shop ${money(own.architecture.profit_cents)} + Maya ${money(own.maya_sales * 1000)} − migration ${money(own.migration_cost_cents)}.`, 'hint'));
+
+  const number = state.round_number;
+  $('start').disabled = pending || phase !== 'ready';
+  $('close').textContent = state.retry_action === 'close' && number > 0 ? `Retry close round ${number}` : live && number > 0 ? `Close round ${number}` : 'Close round';
+  $('close').disabled = pending || (phase !== 'open' && state.retry_action !== 'close');
+  $('reset').disabled = pending;
+  $('execution').textContent = state.execution_arn || 'Not started';
+  $('public-url').textContent = state.public_url ?? 'PUBLIC_HOST is not configured';
+  $('public-url').href = state.public_url ?? '#';
+  $('logout').hidden = state.auth_mode === 'key'; // the helper adds its own key; there is no cookie to clear
+}
+
+function render(state) {
+  current = state;
+  if (host) renderHost(state); else renderPhone(state);
 }
 function signedOut() {
   $('panel').hidden = true;
   $('signin').hidden = false;
 }
-const stopped = () => ['compared', 'expired', 'failed'].includes(current?.phase);
+const stopped = () => ['final', 'expired', 'failed'].includes(current?.phase);
 // One poll at a time. A result that began before an action finished is discarded and fetched again.
+// A 429 is not retried: the next tick is the retry.
 async function refresh() {
   clearTimeout(timer);
   if (inflight || pending) { again = true; return; }
@@ -144,6 +341,7 @@ async function refresh() {
     if (started !== epoch) again = true;
     else {
       render(state);
+      if (pollFailed) { $('error').textContent = ''; pollFailed = false; }
       if (host) {
         $('signin').hidden = true;
         $('panel').hidden = false;
@@ -152,53 +350,71 @@ async function refresh() {
     }
   } catch (error) {
     if (host && error.status === 403) { signedOut(); keepPolling = false; }
-    else if (error.status !== 429) $('error').textContent = error.message;
+    else if (error.status !== 429) { $('error').textContent = error.message; pollFailed = true; }
   } finally { inflight = false; }
   if (again) { again = false; return refresh(); }
-  // After a round ends, keep a slow check (presenter 15 s, players 30 s) so a Reset
-  // from another device shows up, and check at once when the tab comes back.
-  if (keepPolling) timer = setTimeout(refresh, !stopped() ? 2000 : host ? 15000 : 30000);
+  // 3 s plus 0–1 s of jitter; after the game ends a slow check (presenter 15 s, phones 30 s) still
+  // notices a Reset from another device. A tab coming back refreshes at once.
+  if (keepPolling) timer = setTimeout(refresh, (!stopped() ? 3000 : host ? 15000 : 30000) + Math.random() * 1000);
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 async function act(work, errorBox = 'error') {
   if (pending) return;
   pending = true; $(errorBox).textContent = '';
+  if (host && current) renderHost(current);
   try { await work(); } catch (error) { $(errorBox).textContent = error.message; }
   finally { pending = false; epoch += 1; again = false; await refresh(); }
 }
-async function removeTeam(team) {
-  await act(() => api('host/remove', { id: team.id }, true));
-}
+// The server counts code points, not UTF-16 units: 20 emoji are a legal name, so maxlength would cut it at 10.
+const limitName = event => {
+  const letters = [...event.target.value];
+  if (letters.length > NAME_LIMIT) event.target.value = letters.slice(0, NAME_LIMIT).join('');
+};
+
 if (host) {
   $('login').addEventListener('submit', async event => {
     event.preventDefault();
-    await act(async () => { await api('host/login', { passphrase: $('passphrase').value }); $('passphrase').value = ''; }, 'login-error');
+    await act(async () => { await api('host/login', { body: { passphrase: $('passphrase').value } }); $('passphrase').value = ''; }, 'login-error');
   });
   $('logout').addEventListener('click', async () => {
-    try { await api('host/logout', {}, true); } catch (error) { $('error').textContent = error.message; }
+    try { await api('host/logout', { body: {}, action: true }); } catch (error) { $('error').textContent = error.message; }
     $('qr').removeAttribute('src');
     clearTimeout(timer);
     signedOut();
   });
-  for (const action of ['launch', 'migrate', 'compare', 'reset']) $(action).addEventListener('click', async () => {
-    $(action).disabled = true;
-    await act(async () => { render(await api(action, undefined, true)); });
+  $('start').addEventListener('click', () => act(() => api('host/start', { action: true })));
+  $('close').addEventListener('click', () => act(() => api('host/close', { action: true, headers: { 'X-Rehearsal-Round': current.round } })));
+  $('reset').addEventListener('click', () => {
+    if (!['ready', 'final'].includes(current?.phase) && !confirm('Reset the game? Every player and score is thrown away.')) return;
+    return act(() => api('host/reset', { action: true }));
   });
 } else {
+  const join = async () => {
+    const name = $('team-name').value.trim();
+    const joined = await api('join', { body: name ? { name } : {}, retry: true });
+    identity = { id: joined.id, token: joined.token, run_id: joined.run_id };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(identity));
+  };
+  $('team-name').addEventListener('input', limitName);
+  $('rename-name').addEventListener('input', event => { limitName(event); renameDirty = true; });
   $('join').addEventListener('submit', async event => {
     event.preventDefault();
+    await act(join);
+  });
+  $('rename').addEventListener('submit', async event => {
+    event.preventDefault();
     await act(async () => {
-      identity = await api('join', { name: $('team-name').value });
-      localStorage.setItem('black-friday-team', JSON.stringify(identity));
-      initializedPick = false;
+      await api('rename', { body: { id: identity.id, token: identity.token, name: $('rename-name').value }, retry: true });
+      renameDirty = false;
     });
   });
   $('options').addEventListener('click', async event => {
     const button = event.target.closest('button[data-option]');
-    if (!button || !identity) return;
+    if (!button || button.disabled || !current?.round) return;
+    const round = current.round;
     await act(async () => {
-      await api('pick', { id: identity.id, token: identity.token, option: button.dataset.option });
-      $('saved').textContent = `Saved: ${optionLabel(button.dataset.option)}. Waiting for the round to close.`;
+      if (!identity) await join();
+      await api('pick', { body: { id: identity.id, token: identity.token, round, option: button.dataset.option }, retry: true });
     });
   });
 }

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Private code and rehearsal checkpoints for BLACK FRIDAY.
+Description: Private code packages and run evidence for BLACK FRIDAY.
 Parameters:
   WebFunctionName: {Type: String, Default: black-friday-round}
 Resources:

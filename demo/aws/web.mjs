@@ -11,9 +11,12 @@ import {
   SendDurableExecutionCallbackSuccessCommand,
 } from '@aws-sdk/client-lambda';
 import { SSMClient, GetParametersCommand } from '@aws-sdk/client-ssm';
-import { RequestError, MAX_TEAMS, OPTIONS, board, houses, join, ownTeam, pick, remove, publicOptions, publicTeams, frozen, open } from './game.mjs';
+import {
+  PLAYER_CAP, ROUND_IDS, RequestError, board, closePayload, hostPlayers, join, joinable, me, pick, publicRounds, remove,
+  rename, renamable,
+} from './game.mjs';
 import { presenterAuth, routeKind, MAX_FAILURES, WINDOW_MS } from './host_auth.mjs';
-import { s, n, writeRoster, closeRound } from './roster.mjs';
+import { s, n, writeRoster, closeRound, retryClose, releaseClose } from './roster.mjs';
 import QRCode from 'qrcode';
 
 const { RUN_TABLE: table, WORKFLOW_ARN: workflow } = process.env;
@@ -24,8 +27,7 @@ const key = { pk: { S: 'arena' } };
 const startWindow = 90_000;
 const callbackLease = 20_000;
 const id = () => randomUUID().replaceAll('-', '');
-const terminal = new Set(['compared', 'expired', 'failed']);
-const callbacks = { migrate: ['launch', 'migrating'], compare: ['migrated', 'comparing'] };
+const terminal = new Set(['final', 'expired', 'failed']);
 const immutable = { 'Cache-Control': 'public, max-age=3600' };
 const staticFiles = new Map([
   ['/', ['text/html; charset=utf-8', readFileSync(new URL('./player.html', import.meta.url))]],
@@ -74,16 +76,18 @@ async function loadSecrets() {
 const auth = presenterAuth({
   load: loadSecrets, throttle, origin: process.env.PUBLIC_HOST && `https://${process.env.PUBLIC_HOST}`,
 });
-const fresh = () => ({ phase: s('ready'), run_id: s(id()), teams_data: s(JSON.stringify(houses())) });
-const teamsOf = row => JSON.parse(row.teams_data.S);
+// The house and the bots are not on the roster: the workflow adds them when it plans the launch round.
+const fresh = () => ({ phase: s('ready'), run_id: s(id()), teams_data: s('[]') });
+// Every phone poll reads the roster; parse it once per distinct value.
+let parsedPlayers = { raw: undefined, value: [] };
+function playersOf(row) {
+  if (parsedPlayers.raw !== row.teams_data.S) parsedPlayers = { raw: row.teams_data.S, value: JSON.parse(row.teams_data.S) };
+  return parsedPlayers.value;
+}
 async function initialized() {
   let row = await stored();
   if (!row) {
     await replace(fresh(), 'attribute_not_exists(pk)');
-    row = await stored();
-  } else if (row.phase.S === 'ready' && teamsOf(row).some(team => !(team.option in OPTIONS))) {
-    // A roster saved by an older build (releases and architectures, not options): start it afresh.
-    await replace(fresh(), 'run_id = :id AND phase = :ready', { ':id': row.run_id, ':ready': s('ready') });
     row = await stored();
   }
   return row;
@@ -139,15 +143,15 @@ function replace(item, condition, values) {
 function attachArn(run, arn) {
   return update('SET execution_arn = :arn',
     'run_id = :id AND phase = :starting AND attribute_not_exists(execution_arn)',
-    { ':arn': s(arn), ':id': run.run_id, ':starting': s('launching') });
+    { ':arn': s(arn), ':id': run.run_id, ':starting': s('starting') });
 }
 
 async function start(token, row) {
   if (row.phase.S !== 'ready' || token !== row.run_id.S) throw new ActionConflict();
   const run = row;
-  if (!await update('SET phase = :launching, workflow_arn = :workflow, start_deadline = :deadline',
+  if (!await update('SET phase = :starting, workflow_arn = :workflow, start_deadline = :deadline',
     'phase = :ready AND run_id = :id', {
-      ':launching': s('launching'), ':workflow': s(workflow), ':deadline': n(Date.now() + startWindow),
+      ':starting': s('starting'), ':workflow': s(workflow), ':deadline': n(Date.now() + startWindow),
       ':ready': s('ready'), ':id': row.run_id,
     })) throw new ActionConflict();
 
@@ -186,7 +190,7 @@ function durableStatus(arn) {
 }
 
 async function recoverStart(row) {
-  if (row?.phase.S !== 'launching' || row.execution_arn || Date.now() < Number(row.start_deadline.N)) return row;
+  if (row?.phase.S !== 'starting' || row.execution_arn || Date.now() < Number(row.start_deadline.N)) return row;
   // AWS refuses a name filter once a version is given, as a Qualifier or inside the ARN, so list
   // by the unqualified function: a run id is unique across versions.
   const arn = row.workflow_arn.S;
@@ -199,112 +203,81 @@ async function recoverStart(row) {
   } else {
     await update('SET phase = :expired REMOVE start_deadline',
       'phase = :starting AND run_id = :id AND attribute_not_exists(execution_arn)',
-      { ':expired': s('expired'), ':starting': s('launching'), ':id': row.run_id });
+      { ':expired': s('expired'), ':starting': s('starting'), ':id': row.run_id });
   }
   return stored();
 }
 
+/** The saved row plus what the Durable execution says: the phase everyone sees, a message and the host's retry. */
 async function describe(row) {
-  if (!row || row.phase.S === 'ready') {
-    return { mode: 'aws', phase: 'ready', id: row.run_id.S, action_token: row.run_id.S };
+  if (row.phase.S === 'ready') {
+    return { mode: 'aws', phase: 'ready', id: row.run_id.S, action_token: row.run_id.S, row };
   }
   const arn = row.execution_arn?.S;
   let phase = row.phase.S;
-  let status;
-  if (arn && (phase !== 'expired' || row.expired_action)) {
+  if (arn && !terminal.has(phase)) {
     const answer = await durableStatus(arn);
+    let status;
     if (!answer.missing) {
       status = answer.status;
-    } else {
-      // Immediately after Invoke, the execution may not be visible to Get yet.
-      // A terminal state already recorded by the workflow remains authoritative
-      // after execution history retention expires.
-      status = phase === 'compared' ? 'SUCCEEDED' : undefined;
-      if (phase === 'launching' && row.start_deadline && Date.now() >= Number(row.start_deadline.N)) {
-        await update('SET phase = :expired REMOVE start_deadline',
-          'phase = :launching AND run_id = :id AND execution_arn = :arn AND attribute_exists(start_deadline)',
-          { ':expired': s('expired'), ':launching': s('launching'), ':id': row.run_id, ':arn': row.execution_arn });
-        return describe(await stored());
-      }
+    } else if (phase === 'starting' && row.start_deadline && Date.now() >= Number(row.start_deadline.N)) {
+      // Immediately after Invoke, the execution may not be visible to Get yet; after the window it is lost.
+      await update('SET phase = :expired REMOVE start_deadline',
+        'phase = :starting AND run_id = :id AND execution_arn = :arn AND attribute_exists(start_deadline)',
+        { ':expired': s('expired'), ':starting': s('starting'), ':id': row.run_id, ':arn': row.execution_arn });
+      return describe(await stored());
     }
-    if (['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'STOPPED'].includes(status) && !terminal.has(phase)) {
+    if (['SUCCEEDED', 'FAILED', 'TIMED_OUT', 'STOPPED'].includes(status)) {
       // Get can observe completion after we read the pre-terminal DynamoDB row.
       const latest = await stored();
       if (latest.run_id.S !== row.run_id.S) return describe(latest);
       row = latest;
       phase = row.phase.S;
     }
-    if (phase === 'expired' && ['RUNNING', 'PAUSING', 'PAUSED'].includes(status)) {
-      phase = row.expired_action.S === 'migrate' ? 'migrating' : 'comparing';
-    } else if (phase !== 'expired') {
+    if (!terminal.has(phase)) {
       if (status === 'TIMED_OUT') phase = 'expired';
-      else if (['FAILED', 'STOPPED', 'DELETING'].includes(status)) phase = 'failed';
-      else if (phase === 'compared' && status !== 'SUCCEEDED') phase = 'comparing';
-      else if (phase !== 'compared' && status === 'SUCCEEDED') phase = 'failed';
+      else if (['FAILED', 'STOPPED', 'DELETING', 'SUCCEEDED'].includes(status)) phase = 'failed';
     }
   }
-  const result = { mode: 'aws', id: row.run_id.S, phase, action_token: row.run_id.S, execution_arn: arn };
+  // `row` is the item this answer was built from (re-read above when the execution finished), so a view never mixes rows.
+  const result = { mode: 'aws', id: row.run_id.S, phase, action_token: row.run_id.S, execution_arn: arn, row };
   if (phase === 'expired') {
-    result.message = row.expired_action
-      ? `The ${row.expired_action.S === 'migrate' ? 'deployment decision' : 'shopper reveal'} expired before it could continue.`
-      : row.phase.S === 'expired' ? 'AWS did not start the reserved execution in time.' : 'The Durable execution exceeded its deadline.';
+    result.message = row.phase.S === 'expired' && !arn ? 'AWS did not start the reserved execution in time.'
+      : row.round ? 'The round expired before it could continue.' : 'The Durable execution exceeded its deadline.';
   } else if (phase === 'failed') {
-    result.message = 'The Durable execution did not complete the rehearsal. Use its ARN to inspect it in Lambda.';
+    result.message = 'The Durable execution did not complete the game. Use its ARN to inspect it in Lambda.';
   }
-  if (row.launch_data) {
-    result.launch = JSON.parse(row.launch_data.S);
-    result.checkpoint = row.checkpoint.S;
-    result.launch_vm_id = row.launch_vm_id.S;
-    result.launch_vm_state = row.launch_vm_state.S;
-  }
-  if (phase === 'compared') {
-    result.outcomes = JSON.parse(row.outcomes_data.S);  // trimmed to a board by view(); never sent whole
-    result.return_draw = 42;
-  }
-  if (row.callback_id && Number(row.lease_until?.N) <= Date.now()) {
-    if (phase === 'migrating') result.retry_action = 'migrate';
-    if (phase === 'comparing') result.retry_action = 'compare';
-  }
+  if (phase === 'closing' && row.callback_id && Number(row.lease_until?.N) <= Date.now()) result.retry_action = 'close';
   return result;
 }
 
-async function resume(action, token, row, state) {
-  const [waiting, busy] = callbacks[action];
-  if (token !== state.id || (state.phase !== waiting && state.retry_action !== action)) throw new ActionConflict();
+/**
+ * Close the open round: ONE conditional write moves open -> closing for this run, callback and round
+ * and copies the roster into frozen_data. A pick that raced it either committed first (it is in
+ * frozen_data) or fails its own condition. Then the Durable callback carries that frozen roster.
+ */
+async function close(token, round, row, state) {
+  if (token !== state.id || !ROUND_IDS.includes(round) || round !== row.round?.S) throw new ActionConflict();
   const now = Date.now();
   const lease = n(now + callbackLease);
-  const values = { ':id': row.run_id, ':callback': row.callback_id, ':busy': s(busy), ':lease': lease };
   let claimed;
-  if (state.phase !== waiting) {
-    // Retry of a callback AWS never confirmed: the roster was frozen by the first claim.
-    claimed = await claim('SET phase = :busy, lease_until = :lease',
-      'run_id = :id AND callback_id = :callback AND phase = :busy AND lease_until <= :now', { ...values, ':now': n(now) });
-  } else if (action === 'migrate') {
-    // One write ends joining and picking and copies the roster at that instant. A pick that
-    // raced it either committed before (it is in frozen_data) or fails its own condition.
-    claimed = await closeRound(rosterStore, row, lease);
-  } else {
-    claimed = await claim('SET phase = :busy, lease_until = :lease',
-      'run_id = :id AND callback_id = :callback AND phase = :waiting', { ...values, ':waiting': s(waiting) });
-  }
+  if (state.phase === 'open') claimed = await closeRound(rosterStore, row, round, lease);
+  else if (state.retry_action === 'close') claimed = await retryClose(rosterStore, row, round, lease, now);
   if (!claimed) throw new ActionConflict();
   try {
     await lambda.send(new SendDurableExecutionCallbackSuccessCommand({
       CallbackId: row.callback_id.S,
-      Result: Buffer.from(JSON.stringify({
-        action, ...(action === 'migrate' ? { teams: frozen(JSON.parse(claimed.frozen_data.S)) } : {}),
-      })),
+      Result: Buffer.from(JSON.stringify(closePayload(round, JSON.parse(claimed.frozen_data.S)))),
     }), { abortSignal: AbortSignal.timeout(10_000) });
   } catch (error) {
     // AWS uses the same exception for expiration and an already-consumed token.
     // In either case the workflow, not the Web request, decides what is next.
     if (error.name !== 'CallbackTimeoutException') {
-      console.error('Rehearsal callback could not be confirmed', state.id, action, error.name);
+      console.error('Rehearsal callback could not be confirmed', state.id, round, error.name);
       return;
     }
   }
-  await update('REMOVE lease_until',
-    'run_id = :id AND callback_id = :callback AND phase = :busy AND lease_until = :lease', values);
+  await releaseClose(rosterStore, row, lease);
 }
 
 function send(response, code, type, body, extra = {}) {
@@ -343,54 +316,98 @@ async function body(request) {
   } catch { throw new RequestError(400, 'JSON object required'); }
 }
 
-async function view(row, headers, hostView = false, mode) {
-  const result = await describe(row);
-  const teams = teamsOf(row);
-  result.open = open(result.phase);
-  result.audience_count = teams.filter(team => !team.house).length;
-  result.max_audience_teams = MAX_TEAMS;
-  result.options = publicOptions();
-  // Once the shoppers have been through, the board is all anyone needs: not the roster.
-  result.teams = result.outcomes ? [] : publicTeams(teams, result.phase);
-  if (!hostView) result.me = ownTeam(teams, headers['x-team-id'], headers['x-team-token']);
-  if (result.outcomes) {
-    result.board = board(result.outcomes, result.me?.id);
-    delete result.outcomes;
+const rounds = publicRounds();
+// A results item is immutable per (run, round): read it once per environment and share the answer, even
+// between phones that ask at the same instant. A missing item is not cached; the workflow publishes it
+// before it opens the next round, so this only happens on a race.
+const resultsCache = new Map();
+function loadResults(runId, round) {
+  const cacheKey = `results#${runId}#${round}`;
+  if (!resultsCache.has(cacheKey)) {
+    if (resultsCache.size >= 16) resultsCache.clear();
+    const promise = db.send(new GetItemCommand({ TableName: table, Key: { pk: s(cacheKey) }, ConsistentRead: true }))
+      .then(({ Item }) => {
+        if (!Item) resultsCache.delete(cacheKey);
+        return Item && JSON.parse(Item.data.S);
+      }, error => { resultsCache.delete(cacheKey); throw error; });
+    resultsCache.set(cacheKey, promise);
   }
+  return resultsCache.get(cacheKey);
+}
+async function resultsFor(row, ownId) {
+  const round = row.results_round?.S;
+  const data = round && await loadResults(row.run_id.S, round);
+  if (!data) return null;
+  return {
+    round: data.round, market: data.market, summary: data.summary, board: board(data.rows, ownId),
+    mine: ownId ? data.rows.find(value => value.id === ownId) ?? null : null,
+  };
+}
+let evidenceMemo = { raw: undefined, value: null };
+function evidenceOf(row) {
+  if (!row.launch_data || !row.evidence_data) return null;
+  const raw = `${row.launch_data.S}|${row.evidence_data.S}`;
+  if (evidenceMemo.raw !== raw) {
+    evidenceMemo = { raw, value: { launch: JSON.parse(row.launch_data.S), ...JSON.parse(row.evidence_data.S) } };
+  }
+  return evidenceMemo.value;
+}
+
+async function view(row, headers, hostView = false, mode) {
+  const state = await describe(row);
+  row = state.row;
+  const players = playersOf(row);
+  const { phase } = state;
+  const round = ['open', 'closing'].includes(phase) ? row.round?.S ?? null : phase === 'final' ? ROUND_IDS.at(-1) : null;
+  const own = hostView ? null : me(players, headers['x-team-id'], headers['x-team-token']);
+  const result = {
+    mode: 'aws', id: state.id, phase, round, round_number: round ? ROUND_IDS.indexOf(round) + 1 : 0, rounds,
+    joinable: joinable(phase, round), renamable: renamable(phase, round), player_count: players.length,
+    player_cap: PLAYER_CAP, me: own, results: phase === 'ready' ? null : await resultsFor(row, own?.id),
+    evidence: evidenceOf(row), message: state.message ?? '',
+  };
   if (hostView) {
     // Never derived from request headers: unset PUBLIC_HOST means no URL, no QR code.
+    result.players = hostPlayers(players, phase === 'open' ? round : null);
     result.public_url = process.env.PUBLIC_HOST ? `https://${process.env.PUBLIC_HOST}` : null;
     result.auth_mode = mode;
-  } else {
-    delete result.execution_arn;
-    delete result.action_token;
+    result.execution_arn = state.execution_arn;
+    result.action_token = state.action_token;
+    if (state.retry_action) result.retry_action = state.retry_action;
   }
   return result;
 }
 
-async function changeTeam(input, action) {
-  for (let attempt = 0; attempt < 30; attempt++) {
+async function changeRoster(action, input, token) {
+  for (let attempt = 0; attempt < 60; attempt++) {
     // A room joining at once rewrites the one roster item: losers re-read and retry after a short jitter.
-    if (attempt) await new Promise(resolve => setTimeout(resolve, randomInt(10, 60)));
-    const row = await initialized(), teams = teamsOf(row);
-    let next = teams, reply;
+    if (attempt) await new Promise(resolve => setTimeout(resolve, randomInt(10, 40 + attempt * 10)));
+    const row = await initialized(), players = playersOf(row);
+    const phase = row.phase.S, round = row.round?.S;
+    let next, reply;
     if (action === 'join') {
-      const { team, token } = join(teams, row.phase.S, input.name);
-      next = [...teams, team];
-      reply = { id: team.id, token, run_id: row.run_id.S };
+      const { player, token: secret } = join(players, phase, round, input.name);
+      next = [...players, player];
+      reply = { id: player.id, token: secret, run_id: row.run_id.S, name: player.name };
+    } else if (action === 'rename') {
+      const player = rename(players, phase, round, input);
+      next = players.map(value => (value.id === player.id ? player : value));
+      reply = { name: player.name };
     } else if (action === 'pick') {
-      const team = pick(teams, row.phase.S, input);
-      next = teams.map(value => (value.id === team.id ? team : value));
+      const player = pick(players, phase, round, input);
+      next = players.map(value => (value.id === player.id ? player : value));
       reply = { saved: true };
     } else {
-      if (input.run !== row.run_id.S) throw new ActionConflict();
-      next = remove(teams, row.phase.S, input.id);
+      if (token !== row.run_id.S) throw new ActionConflict();
+      next = remove(players, phase, input.id);
       reply = { removed: true };
     }
     if (await writeRoster(rosterStore, row, next)) return reply;
   }
   throw new ActionConflict();
 }
+
+const hostActions = new Set(['start', 'close', 'reset']);
 
 async function route(request, response) {
   const { url, method, headers } = request;
@@ -413,29 +430,25 @@ async function route(request, response) {
   if (method === 'GET' && ['/api/state', '/api/host/state'].includes(url)) {
     return json(response, 200, await view(await recoverStart(await initialized()), headers, presenterRoute, mode));
   }
+  if (method === 'POST' && ['/api/join', '/api/rename', '/api/pick'].includes(url)) {
+    return json(response, 200, await changeRoster(url.slice(5), await body(request)));
+  }
   if (method === 'POST' && url === '/api/host/remove') {
     const input = await body(request);
-    return json(response, 200, await changeTeam({ id: input.id, run: headers['x-rehearsal-run'] }, 'remove'));
+    return json(response, 200, await changeRoster('remove', input, headers['x-rehearsal-run']));
   }
-  if (method === 'POST' && ['/api/join', '/api/pick'].includes(url)) {
-    return json(response, 200, await changeTeam(await body(request), url.slice(5)));
-  }
-  const action = url?.match(/^\/api\/(launch|migrate|compare|reset)$/)?.[1];
-  if (method !== 'POST' || !action) return json(response, 404, { error: 'Not found' });
+  const action = method === 'POST' && url.startsWith('/api/host/') ? url.slice('/api/host/'.length) : undefined;
+  if (!hostActions.has(action)) return json(response, 404, { error: 'Not found' });
   if (Number(headers['content-length'] ?? 0) > 0 || headers['transfer-encoding']) throw new RequestError(413, 'Presenter actions have no body');
   const token = headers['x-rehearsal-run'];
   const row = await initialized();
-  if (action === 'launch') {
+  if (action === 'start') {
     await start(token, row);
+  } else if (action === 'reset') {
+    // Force: any phase, as long as the presenter's token names this run.
+    if (token !== row.run_id.S || !await replace(fresh(), 'run_id = :id', { ':id': row.run_id })) throw new ActionConflict();
   } else {
-    const state = await describe(row);
-    if (action === 'reset') {
-      if (token !== state.id || (!terminal.has(state.phase) && state.phase !== 'ready')) throw new ActionConflict();
-      if (!await replace(fresh(), 'run_id = :id AND phase = :phase',
-        { ':id': row.run_id, ':phase': row.phase })) throw new ActionConflict();
-    } else {
-      await resume(action, token, row, state);
-    }
+    await close(token, headers['x-rehearsal-round'], row, await describe(row));
   }
   return json(response, 200, await view(await stored(), headers, true, mode));
 }

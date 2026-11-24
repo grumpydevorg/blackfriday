@@ -16,14 +16,12 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-import scoring
-
 MAX_ARTIFACT = 1024 * 1024
 VM_LIFESPAN = 120
 PRICE = 2500
-MARGIN = scoring.MARGIN
-LAUNCH_COST = scoring.LAUNCH_COST
-RETURN_DRAW = scoring.RETURN_DRAW
+# The two real growth migrations: option id -> migration kind. `careful` copies every table
+# (carts survive); `fast` omits carts. The schema and ledger ids reuse the option id.
+OPTIONS = {'careful': 'preserve', 'fast': 'omit'}
 HEX32 = re.compile(r'[0-9a-f]{32}')
 AWS_CONFIG = Config(connect_timeout=3, read_timeout=6, retries={'total_max_attempts': 2})
 
@@ -218,8 +216,8 @@ class Shop:
 
 @dataclass(frozen=True)
 class Rehearsal:
-    """One stage. After Close a stage is judged once per option in use, never once per team:
-    `team` is the option id ('lift', 'scale' or 'refactor'), which doubles as the schema and ledger id."""
+    """One stage: the Launch shop, or a growth migration of one option ('careful' or 'fast') and its check.
+    `team` is the option id, which doubles as the schema and ledger id; `kind` is its migration kind."""
 
     id: str
     action: str
@@ -230,16 +228,13 @@ class Rehearsal:
     def parse(cls, event: dict) -> 'Rehearsal':
         if not isinstance(event, dict):
             raise TypeError('Event must be an object')
-        run_id, action = event.get('id'), event.get('action')
-        team, kind = event.get('team'), event.get('kind')
+        run_id, action, option = event.get('id'), event.get('action'), event.get('option')
         if not isinstance(run_id, str) or not HEX32.fullmatch(run_id):
             raise ValueError('Invalid run id')
         if action == 'launch' and set(event) == {'id', 'action'}:
             return cls(run_id, action, '', '')
-        if action in ('migrate', 'compare') and set(event) == {'id', 'action', 'team', 'kind'} and (
-            team in scoring.OPTIONS and kind == scoring.KIND
-        ):
-            return cls(run_id, action, team, kind)
+        if action in ('migrate', 'compare') and set(event) == {'id', 'action', 'option'} and option in OPTIONS:
+            return cls(run_id, action, option, OPTIONS[option])
         raise ValueError('Invalid action, option or unexpected event field')
 
     @property
@@ -325,54 +320,45 @@ class Rehearsal:
         return {'checkpoint': digest, 'launch': {
             'checkout_statuses': [lost.status, retry.status], 'charges_before_retry': charged,
             'charges': self.observe_charge(store, 'launch'), 'verified_sales': 1, 'cart_status': cart.status,
-            'order_status': order.status, 'profit_cents': MARGIN - LAUNCH_COST,
+            'order_status': order.status,
         }}
 
-    def capacity(self) -> dict:
-        """Score this option on the Virtual RDS wave. Pure Python: no MicroVM involved."""
-        from virtual_rds import Plan, run_round
-
-        architecture = scoring.OPTIONS[self.team]['architecture']
-        plan = Plan(architecture['storage'], architecture['replicas'], architecture['cache'])
-        result, _ = run_round(plan, RETURN_DRAW)
-        return {
-            'storage': plan.storage, 'replicas': plan.replicas, 'cache': plan.cached,
-            'verified_sales': result['verified_sales'], 'wave_verified_sales': result['wave_verified_sales'],
-            'wave_storage_rejections': result['wave_storage_rejections'],
-            'cost_cents': result['modeled_cost_cents'], 'profit_cents': result['profit_cents'],
-        }
-
-    def growth(self, store: Store, shop: Shop, capacity: dict | None) -> dict:
+    def growth(self, store: Store, shop: Shop) -> dict:
         health = shop.check('/health')
         history = self.verify_order(store, shop, 'launch')
         if health.json().get('database') != 'pgsql':
             raise RuntimeError('Growth did not use PostgreSQL')
-        branch = {
-            'kind': self.kind, 'schema': f'bf_{self.id}_{self.team}', 'database': 'pgsql',
-            'health_status': health.status, 'history_status': history.status,
-        }
         if self.action == 'migrate':
             artifact = shop.check('/control/artifact').body
             digest = sha256(artifact).hexdigest()
             store.put_once(self.artifact_key(self.step, digest, 'branch.dump'), artifact, 'application/octet-stream')
-            return {**branch, 'dump': digest}
+            return {
+                'option': self.team, 'kind': self.kind, 'schema': f'bf_{self.id}_{self.team}', 'database': 'pgsql',
+                'health_status': health.status, 'history_status': history.status, 'dump': digest,
+            }
 
-        # Every option really migrates every table, so Maya's cart survives in every shop.
-        cart = shop.check('/cart/cart-saved')
-        checkout = shop.checkout('growth-mug', 'cart-saved')
-        self.verify_order(store, shop, self.team)
-        if checkout.elapsed is None:
-            raise RuntimeError('Missing checkout timing evidence')
-        probability = scoring.return_probability(checkout.elapsed)
+        # `preserve` migrated the carts, so Maya checks out; `omit` did not, so her cart is gone. That
+        # missing cart is the expected result of omit, not an error, and nothing is sold or charged.
+        preserve = self.kind == 'preserve'
+        cart = shop.check('/cart/cart-saved', 200 if preserve else 404)
+        checkout = shop.checkout('growth-mug', 'cart-saved') if preserve else None
+        if checkout is not None:
+            self.verify_order(store, shop, self.team)
+            if checkout.elapsed is None:
+                raise RuntimeError('Missing checkout timing evidence')
+            sold = 1
+        else:
+            shop.check('/orders/order-growth-mug', 404)
+            sold = 0
         charges = self.observe_charge(store, self.team)
-        if charges != 1:
+        if charges != sold:
             raise RuntimeError('Growth ledger does not agree with verified sales')
-        maya = scoring.maya_sales(1, probability)
-        # No team's roll is known here: the workflow applies each team's own break on top.
-        return {**branch, 'cart_status': cart.status, 'checkout_status': checkout.status,
-                'checkout_ms': checkout.elapsed, 'charges': charges, 'verified_sales': 1,
-                'return_probability': probability, 'returns_next_week': RETURN_DRAW < probability,
-                'maya_sales': maya, 'architecture': capacity}
+        return {
+            'option': self.team, 'kind': self.kind, 'cart_status': cart.status, 'cart_kept': cart.status == 200,
+            'checkout_status': checkout.status if checkout else None,
+            'checkout_ms': checkout.elapsed if checkout else None, 'charges': charges, 'verified_sales': sold,
+            'health_status': health.status, 'history_status': history.status,
+        }
 
 
 def handler(event: dict, context) -> dict:
@@ -384,9 +370,8 @@ def handler(event: dict, context) -> dict:
     key = stage.result_key(stage.step)
     candidate = store.get(key)
     if candidate is None:
-        architecture = stage.capacity() if stage.action == 'compare' else None
         data = stage.setup(store, fleet, work_deadline)
-        if stage.action in ('launch', 'compare'):
+        if stage.action == 'launch' or (stage.action == 'compare' and stage.kind == 'preserve'):
             phase = stage.team or stage.action
             data.update(store.payment_capability(stage.ledger_key(phase), stage.receipt(phase)))
         request_budget(work_deadline, 1)
@@ -395,7 +380,7 @@ def handler(event: dict, context) -> dict:
         try:
             shop = fleet.connect(vm, work_deadline)
             shop.check('/control/setup', body=data, timeout=35)
-            result = stage.launch(store, shop) if stage.action == 'launch' else stage.growth(store, shop, architecture)
+            result = stage.launch(store, shop) if stage.action == 'launch' else stage.growth(store, shop)
             # Persist the evaluated candidate before termination. A retry can finish
             # cleanup and return it without doing a new checkout or a new migration.
             store.put_once(key, json.dumps({**result, 'vm_id': vm_id}).encode(), 'application/json')

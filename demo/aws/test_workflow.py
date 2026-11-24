@@ -1,28 +1,67 @@
 """Run the Durable handler against a fake context that checkpoints steps, as the real SDK does."""
 
-import functools
+import importlib.util
 import json
 import sys
 import types
 from pathlib import Path
 
 import pytest
+from botocore.exceptions import ClientError
 
-import scoring
-
-sys.path.insert(0, str(Path(__file__).parent))
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
 
 RUN = 'a' * 32
+ROUND_IDS = ['launch', 'growth', 'blackfriday', 'christmas']
+RECORDED = json.loads((HERE / 'rounds.json').read_text())['recorded_evidence']
 
 
-def team(name, option, house=False):
-    return {'id': name.lower().replace(' ', ''), 'name': name, 'house': house, 'option': option}
+def stub_model():
+    """Just enough model to test the workflow's mechanics: it draws once per player and echoes its inputs."""
+    module = types.ModuleType('model')
+    module.ROUND_IDS = ROUND_IDS
+    module.calls = []
+
+    def validate_players(value):
+        if not isinstance(value, list):
+            raise ValueError('players must be a list')
+        seen, rows = set(), []
+        for row in value:
+            if isinstance(row, dict) and isinstance(row.get('id'), str) and row['id'] not in seen:
+                seen.add(row['id'])
+                rows.append({'id': row['id'], 'name': str(row.get('name') or 'Player'), 'house': bool(row.get('house')),
+                             'option': row.get('option') or 'default'})
+        return rows
+
+    def plan(round_id, players, previous, randbelow):
+        module.calls.append(('plan', round_id, previous and previous['round']))
+        return {'round': round_id, 'market': randbelow(100),
+                'players': players, 'draws': {p['id']: {'roll': randbelow(100), 'noise': randbelow(21) - 10}
+                                              for p in players}}
+
+    def score(round_id, plan, previous, evidence):
+        module.calls.append(('score', round_id, evidence))
+        rows = [{'id': p['id'], 'name': p['name'], 'rank': index + 1, 'option': p['option'],
+                 'roll': plan['draws'][p['id']]['roll']} for index, p in enumerate(plan['players'])]
+        return {'round': round_id, 'market': plan['market'], 'states': {}, 'baseline': {}, 'bots': [],
+                'rows': rows, 'summary': {'market': plan['market'], 'options': {}}}
+
+    module.validate_players, module.plan, module.score = validate_players, plan, score
+    return module
 
 
-HOUSES = [team('House A', 'lift', True), team('House B', 'refactor', True)]
+def real_model():
+    path = HERE / 'model.py'
+    if not path.exists():
+        pytest.skip('model.py has not landed')
+    spec = importlib.util.spec_from_file_location('model', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def stub_sdk(monkeypatch):
+def load_workflow(monkeypatch, model_module):
     sdk = types.ModuleType('aws_durable_execution_sdk_python')
     sdk.CallbackTimeoutError = type('CallbackTimeoutError', (Exception,), {})
     sdk.DurableContext = object
@@ -32,6 +71,7 @@ def stub_sdk(monkeypatch):
     config.Duration = types.SimpleNamespace(from_hours=lambda hours: hours)
     monkeypatch.setitem(sys.modules, 'aws_durable_execution_sdk_python', sdk)
     monkeypatch.setitem(sys.modules, 'aws_durable_execution_sdk_python.config', config)
+    monkeypatch.setitem(sys.modules, 'model', model_module)
     monkeypatch.setenv('RUN_TABLE', 'table')
     monkeypatch.setenv('EVALUATOR_ARN', 'arn:evaluator:1')
     monkeypatch.setenv('AWS_DEFAULT_REGION', 'ap-southeast-2')
@@ -43,179 +83,329 @@ def stub_sdk(monkeypatch):
     return workflow
 
 
-@functools.cache
-def option_result(option):
-    from evaluator import Rehearsal
+def player(name, option='default', house=False):
+    return {'id': name.lower().replace(' ', ''), 'name': name, 'house': house, 'option': option, 'picks': {}}
 
-    capacity = Rehearsal.parse({'id': RUN, 'action': 'compare', 'team': option, 'kind': 'preserve'}).capacity()
-    return {'cart_status': 200, 'maya_sales': 2, 'returns_next_week': True, 'return_probability': 75,
-            'architecture': capacity}
+
+ROOM = [player('Ada Byron'), player('Grace Hopper'), player('House', house=True)]
+
+
+def compare_result(option, cart_kept):
+    return {'option': option, 'kind': 'preserve' if option == 'careful' else 'omit', 'cart_status': 200,
+            'cart_kept': cart_kept, 'checkout_status': 200, 'checkout_ms': 40, 'charges': 1, 'verified_sales': 1,
+            'health_status': 200, 'history_status': 200, 'vm_id': f'vm-{option}', 'vm_state': 'terminated'}
+
+
+class FakeDB:
+    """Records every UpdateItem; `fail` conditional-fails the arena writes whose phase matches."""
+
+    def __init__(self):
+        self.calls, self.fail_phase = [], None
+
+    def update_item(self, **kwargs):
+        self.calls.append(kwargs)
+        phase = kwargs['ExpressionAttributeValues'].get(':phase', {}).get('S')
+        if phase is not None and phase == self.fail_phase:
+            raise ClientError({'Error': {'Code': 'ConditionalCheckFailedException'}}, 'UpdateItem')
+
+    def arena(self):
+        return [call for call in self.calls if call['Key']['pk']['S'] == 'arena' and ':phase' in call['ExpressionAttributeValues']]
+
+    def results(self):
+        return {call['Key']['pk']['S']: json.loads(call['ExpressionAttributeValues'][':data']['S'])
+                for call in self.calls if call['Key']['pk']['S'].startswith('results#')}
+
+
+def values(call):
+    return {key: value['S'] for key, value in call['ExpressionAttributeValues'].items()}
 
 
 class FakeContext:
-    """Steps are checkpointed by name: a replay returns the recorded result and never calls the function."""
+    """Steps and invokes are checkpointed by name: a replay returns the recorded result and never calls the function."""
 
-    def __init__(self, checkpoints, roster):
-        self.checkpoints, self.roster = checkpoints, roster
-        self.events, self.step_calls, self.branch_names = [], [], []
+    def __init__(self, checkpoints, rooms, workflow, fail=(), launch_fails=False, db=None):
+        self.checkpoints, self.rooms, self.workflow = checkpoints, rooms, workflow
+        self.fail, self.launch_fails, self.db = set(fail), launch_fails, db
+        self.ops, self.invoked, self.step_calls = [], [], []
         self.execution_context = types.SimpleNamespace(durable_execution_arn='arn:durable')
 
+    def operation(self, kind, name):
+        self.ops.append((kind, name))
+
     def step(self, function, name):
+        self.operation('step', name)
         self.step_calls.append(name)
         if name not in self.checkpoints:
             self.checkpoints[name] = json.loads(json.dumps(function(None)))
         return self.checkpoints[name]
 
     def create_callback(self, name, config):
+        self.operation('callback', name)
         context = self
+        round_id = name.removeprefix('await-close-')
 
         class Callback:
             callback_id = f'cb-{name}'
 
             def result(self):
-                if name == 'await-migrate':
-                    return json.dumps({'action': 'migrate', 'teams': context.roster})
-                return json.dumps({'action': 'compare'})
+                room = context.rooms[round_id]
+                if isinstance(room, Exception):
+                    raise room
+                return room if isinstance(room, str) else json.dumps(
+                    {'action': 'close', 'round': round_id, 'players': room})
 
         return Callback()
 
     def invoke(self, function, event, name):
-        self.events.append(event)
-        self.branch_names.append(name)
+        self.operation('invoke', name)
+        self.invoked.append((event['action'], event.get('option'), len(self.db.arena()) if self.db else 0))
+        if name in self.checkpoints:
+            return self.checkpoints[name]
         if event['action'] == 'launch':
-            return {'vm_state': 'terminated', 'checkpoint': 'c' * 64, 'vm_id': 'vm-launch',
-                    'launch': {'profit_cents': 900}}
-        base = {'vm_state': 'terminated', 'vm_id': f'vm-{event["action"]}-{event["team"]}', 'kind': 'preserve',
-                'health_status': 200, 'history_status': 200}
-        return base if event['action'] == 'migrate' else {**base, **option_result(event['team'])}
+            if self.launch_fails:
+                raise RuntimeError('launch broke')
+            result = {'vm_state': 'terminated', 'checkpoint': 'c' * 64, 'vm_id': 'vm-launch',
+                      'launch': {'profit_cents': 900}}
+        else:
+            if (event['action'], event['option']) in self.fail:
+                raise RuntimeError('MicroVM broke')
+            base = {'vm_state': 'terminated', 'vm_id': f'vm-{name}'}
+            result = base if event['action'] == 'migrate' else compare_result(event['option'], event['option'] == 'careful')
+        self.checkpoints[name] = result
+        return result
 
     def parallel(self, functions, name):
-        self.branch_names.append(name)
+        self.operation('parallel', name)
         results = [function(self) for function in functions]
         return types.SimpleNamespace(throw_if_error=lambda: None, get_results=lambda: results)
 
 
-def run(workflow, monkeypatch, checkpoints, roster, rolls):
-    published = []
-    monkeypatch.setattr(workflow, 'publish', lambda run_id, arn, previous, phase, fields: published.append((phase, fields)))
+def rooms_for(room=ROOM):
+    return {round_id: room for round_id in ROUND_IDS}
+
+
+def run(workflow, monkeypatch, checkpoints=None, rooms=None, rolls=None, db=None, **options):
+    db = db or FakeDB()
+    monkeypatch.setattr(workflow, 'DB', db)
     monkeypatch.setattr(workflow, 'register', lambda *args: None)
-    draws = iter(rolls)
-    monkeypatch.setattr(workflow.secrets, 'randbelow', lambda bound: next(draws) % bound)
-    context = FakeContext(checkpoints, roster)
-    workflow.handler({'id': RUN}, context)
-    return context, published
+    draws = iter(rolls) if rolls is not None else None
+    if draws is not None:
+        monkeypatch.setattr(workflow.secrets, 'randbelow', lambda bound: next(draws) % bound)
+    context = FakeContext({} if checkpoints is None else checkpoints, rooms or rooms_for(), workflow, db=db, **options)
+    result = workflow.handler({'id': RUN}, context)
+    return context, db, result
 
 
-def scoreboard(published):
-    return json.loads(next(fields['outcomes_data'] for phase, fields in published if phase == 'compared'))
+@pytest.fixture
+def workflow(monkeypatch):
+    return load_workflow(monkeypatch, stub_model())
 
 
-def test_the_draws_are_one_checkpointed_step_and_a_replay_never_redraws(monkeypatch):
-    workflow = stub_sdk(monkeypatch)
-    roster = HOUSES + [team('Scalers', 'scale')]
-    checkpoints = {}
-    context, published = run(workflow, monkeypatch, checkpoints, roster, rolls=[4, 29, 9] + [50] * 20)
-    assert context.step_calls.count('migration-risk') == 1
-    plan = checkpoints['migration-risk']
-    # Three teams, so three bots; their options come first (draws 4, 29, 9 -> 1, 2, 0), then six rolls.
-    assert [t['name'] for t in plan['teams']] == ['House A', 'House B', 'Scalers', 'Bot Lambo', 'Bot Turbo', 'Bot Kevin']
-    assert len(plan['risks']) == 6
-    # The checkpoint records every draw; a replay with different dice reads it back and never draws.
-    again, replayed = run(workflow, monkeypatch, checkpoints, roster, rolls=[0] * 50)
-    assert checkpoints['migration-risk'] == plan
-    assert again.events == context.events
-    assert again.step_calls.count('migration-risk') == 1
+def test_every_operation_name_is_unique(workflow, monkeypatch):
+    context, _, _ = run(workflow, monkeypatch)
+    names = [name for _, name in context.ops]
+    assert len(names) == len(set(names))
+    assert {'register-execution', 'launch-shop', 'migrate-every-option', 'check-every-option',
+            'publish-final'} <= set(names)
+    for round_id in ROUND_IDS:
+        assert {f'await-close-{round_id}', f'publish-open-{round_id}', f'plan-{round_id}',
+                f'score-{round_id}', f'publish-results-{round_id}'} <= set(names)
 
 
-def test_one_migrate_and_one_compare_microvm_per_option_however_many_teams(monkeypatch):
-    workflow = stub_sdk(monkeypatch)
-    options = ['refactor'] * 20 + ['lift'] * 12 + ['scale'] * 8
-    roster = HOUSES + [team(f'Player {n}', option) for n, option in enumerate(options)]
-    context, published = run(workflow, monkeypatch, {}, roster, rolls=[37] * 400)
-    stages = [(e['action'], e['team']) for e in context.events if e['action'] != 'launch']
-    assert sorted(stages) == sorted((action, option) for action in ('migrate', 'compare') for option in ('lift', 'scale', 'refactor'))
-    assert all(set(e) == {'id', 'action', 'team', 'kind'} and e['kind'] == 'preserve' for e in context.events if e['action'] != 'launch')
-    assert 'migrate-lift' in context.branch_names and 'compare-refactor' in context.branch_names
-    assert len(set(context.branch_names)) == len(context.branch_names), 'durable step and branch names are unique'
-    rows = scoreboard(published)
-    assert len(rows) == 42 + 0 and {row['option'] for row in rows} == {'lift', 'scale', 'refactor'}
-
-
-def test_only_the_options_in_use_are_judged(monkeypatch):
-    workflow = stub_sdk(monkeypatch)
-    roster = [team('House A', 'lift', True), team('House B', 'lift', True)] + [team(f'Player {n}', 'lift') for n in range(5)]
-    context, _ = run(workflow, monkeypatch, {}, roster, rolls=[50] * 100)
-    assert sorted({e['team'] for e in context.events if e['action'] != 'launch'}) == ['lift']
-    assert len([e for e in context.events if e['action'] == 'compare']) == 1
-
-
-def test_each_team_keeps_its_own_roll_and_broke_is_roll_under_risk(monkeypatch):
-    workflow = stub_sdk(monkeypatch)
-    roster = [
-        team('House A', 'lift', True), team('House B', 'refactor', True),
-        team('Edge Five', 'lift'), team('Edge Thirty', 'refactor'), team('Under Ten', 'scale'), team('Over Ten', 'scale'),
+def test_all_real_evidence_is_gathered_before_round_one_and_never_after(workflow, monkeypatch):
+    context, db, _ = run(workflow, monkeypatch)
+    assert sorted((action, option) for action, option, _ in context.invoked) == [
+        ('compare', 'careful'), ('compare', 'fast'), ('launch', None), ('migrate', 'careful'), ('migrate', 'fast'),
     ]
-    # Six teams, no bots, so exactly six rolls: 5 is not under 5, 4 is; 30 is not under 30, 29 is; 9 is under 10, 10 is not.
-    context, published = run(workflow, monkeypatch, {}, roster, rolls=[5, 29, 5, 30, 9, 10])
-    rows = {row['id']: row for row in scoreboard(published)}
-    assert [(rows[i]['roll'], rows[i]['risk'], rows[i]['broke']) for i in ('housea', 'houseb', 'edgefive', 'edgethirty', 'underten', 'overten')] == [
-        (5, 5, False), (29, 30, True), (5, 5, False), (30, 30, False), (9, 10, True), (10, 10, False)]
-    # Teams on the same option share the real checks but not the outcome.
-    assert rows['underten']['cumulative_cents'] == -1800 and rows['overten']['cumulative_cents'] == 19200
-    assert rows['houseb']['cumulative_cents'] == 2500 and rows['edgethirty']['cumulative_cents'] == 23500
-    assert rows['housea']['cumulative_cents'] == rows['edgefive']['cumulative_cents'] == 14500
-    assert [row['rank'] for row in scoreboard(published)][:2] == [1, 2]
+    # No arena write has happened yet at the time of every invoke, so none came after the first open.
+    assert {published for _, _, published in context.invoked} == {0}
+    order = [name for _, name in context.ops]
+    assert max(order.index(name) for name in ('launch-shop', 'migrate-every-option', 'check-every-option')) < order.index('publish-open-launch')
+    assert not [kind for kind, name in context.ops[order.index('publish-open-launch'):] if kind in ('invoke', 'parallel')]
 
 
-def test_a_room_of_zero_gets_two_houses_and_four_bots_labelled_as_bots(monkeypatch):
-    workflow = stub_sdk(monkeypatch)
-    context, published = run(workflow, monkeypatch, {}, list(HOUSES), rolls=[7] * 20)
-    rows = scoreboard(published)
-    assert len(rows) == 6
-    assert sorted(row['name'] for row in rows if row['bot']) == sorted(scoring.BOTS[:4])
-    assert sorted(row['name'] for row in rows if not row['bot']) == ['House A', 'House B']
+def test_the_first_open_carries_launch_and_evidence_and_later_opens_carry_the_previous_results(workflow, monkeypatch):
+    _, db, _ = run(workflow, monkeypatch)
+    opens = [values(call) for call in db.arena() if values(call)[':phase'] == 'open']
+    assert [o[':round'] for o in opens] == ROUND_IDS
+    assert [o[':callback_id'] for o in opens] == [f'cb-await-close-{r}' for r in ROUND_IDS]
+    launch = json.loads(opens[0][':launch_data'])
+    assert launch == {'profit_cents': 900, 'source': 'real'}
+    evidence = json.loads(opens[0][':evidence_data'])
+    assert evidence['careful']['source'] == evidence['fast']['source'] == 'real'
+    assert evidence['careful']['cart_kept'] is True and evidence['fast']['cart_kept'] is False
+    assert ':launch_data' not in opens[1] and ':evidence_data' not in opens[1]
+    assert [o.get(':results_round') for o in opens] == [None, 'launch', 'growth', 'blackfriday']
+    first = next(call for call in db.arena() if values(call)[':phase'] == 'open')
+    assert values(first)[':old0'] == 'starting' and ':expround' not in values(first)
+    later = [call for call in db.arena() if values(call)[':phase'] == 'open'][1:]
+    assert [values(call)[':old0'] for call in later] == ['closing'] * 3
+    assert [values(call)[':expround'] for call in later] == ROUND_IDS[:3]
 
 
-def test_no_bots_when_six_or_more_teams_are_in(monkeypatch):
-    workflow = stub_sdk(monkeypatch)
-    roster = HOUSES + [team(f'Player {n}', 'scale') for n in range(4)]
-    _, published = run(workflow, monkeypatch, {}, roster, rolls=[50] * 20)
-    assert not any(row['bot'] for row in scoreboard(published))
-    assert len(scoreboard(published)) == 6
+def test_four_results_items_and_one_final(workflow, monkeypatch):
+    _, db, result = run(workflow, monkeypatch)
+    assert sorted(db.results()) == sorted(f'results#{RUN}#{r}' for r in ROUND_IDS)
+    for round_id in ROUND_IDS:
+        data = db.results()[f'results#{RUN}#{round_id}']
+        assert set(data) == {'round', 'market', 'summary', 'rows'} and data['round'] == round_id
+    item = next(call for call in db.calls if call['Key']['pk']['S'] == f'results#{RUN}#growth')
+    assert values(item)[':id'] == RUN and values(item)[':round'] == 'growth'
+    finals = [values(call) for call in db.arena() if values(call)[':phase'] == 'final']
+    assert len(finals) == 1
+    assert finals[0][':results_round'] == 'christmas' and finals[0][':expround'] == 'christmas'
+    assert result == {'id': RUN, 'execution_arn': 'arn:durable'}
+    # Each round's results are written before the next open announces them, and the final comes last.
+    kinds = [('results' if call['Key']['pk']['S'] != 'arena' else values(call)[':phase']) for call in db.calls]
+    assert kinds == ['open', 'results', 'open', 'results', 'open', 'results', 'open', 'results', 'final']
 
 
-def test_draw_risks_rolls_once_per_team_in_order_and_broke_is_roll_under_risk():
-    asked, rolls = [], iter([0, 4, 5, 9, 10, 29, 30, 99])
-    teams = [{'id': f't{n}', 'option': option} for n, option in enumerate(
-        ['lift', 'lift', 'lift', 'scale', 'scale', 'refactor', 'refactor', 'refactor'])]
-
-    def randbelow(bound):
-        asked.append(bound)
-        return next(rolls)
-
-    result = scoring.draw_risks(teams, randbelow)
-    assert asked == [100] * 8
-    assert [result[t['id']]['broke'] for t in teams] == [True, True, False, True, False, True, False, False]
-    assert [(r['roll'], r['risk']) for r in result.values()][:3] == [(0, 5), (4, 5), (5, 5)]
+def test_state_threads_through_the_rounds_and_score_gets_the_evidence(workflow, monkeypatch):
+    run(workflow, monkeypatch)
+    calls = workflow.model.calls
+    assert [c[:3] for c in calls if c[0] == 'plan'] == [
+        ('plan', 'launch', None), ('plan', 'growth', 'launch'), ('plan', 'blackfriday', 'growth'),
+        ('plan', 'christmas', 'blackfriday')]
+    evidence = [c[2] for c in calls if c[0] == 'score']
+    assert all(set(e) == {'careful', 'fast'} for e in evidence)
 
 
-def test_the_default_roll_source_is_secrets_randbelow_in_range():
-    teams = [{'id': 'a', 'option': 'lift'}]
-    for _ in range(200):
-        assert 0 <= scoring.draw_risks(teams)['a']['roll'] < 100
-    assert scoring.draw_risks.__defaults__[0].__module__ == 'secrets'
-    assert scoring.plan_round.__defaults__[0].__module__ == 'secrets'
+def test_a_failing_option_falls_back_alone(workflow, monkeypatch):
+    context, db, _ = run(workflow, monkeypatch, fail={('compare', 'fast')})
+    evidence = json.loads(values(db.arena()[0])[':evidence_data'])
+    assert evidence['careful']['source'] == 'real' and evidence['careful']['vm_id'] == 'vm-careful'
+    assert evidence['fast'] == {**RECORDED['fast'], 'source': 'recorded'}
+    # The failure did not stop the other option's check or the run.
+    assert ('compare', 'careful') in [(a, o) for a, o, _ in context.invoked]
+    assert len(db.results()) == 4
 
 
-@pytest.mark.parametrize('bad', [
-    [{'id': 'housea', 'name': 'House A', 'house': True, 'option': 'omit'}],
-    [{'id': 'housea', 'name': 'House A', 'house': True, 'release': 'A', 'kind': 'preserve', 'architecture': {}}],
-])
-def test_the_workflow_rejects_a_roster_that_is_not_in_the_option_shape(monkeypatch, bad):
-    workflow = stub_sdk(monkeypatch)
-    context = FakeContext({}, bad)
-    monkeypatch.setattr(workflow, 'publish', lambda *args: None)
-    monkeypatch.setattr(workflow, 'register', lambda *args: None)
+def test_a_failed_migration_skips_that_options_check_and_records_it(workflow, monkeypatch):
+    context, db, _ = run(workflow, monkeypatch, fail={('migrate', 'careful')})
+    evidence = json.loads(values(db.arena()[0])[':evidence_data'])
+    assert evidence['careful'] == {**RECORDED['careful'], 'source': 'recorded'}
+    assert evidence['fast']['source'] == 'real'
+    assert [(a, o) for a, o, _ in context.invoked if a == 'compare'] == [('compare', 'fast')]
+
+
+def test_every_option_failing_and_a_failing_launch_still_play_four_rounds(workflow, monkeypatch):
+    context, db, _ = run(workflow, monkeypatch, launch_fails=True, fail={('migrate', 'careful'), ('migrate', 'fast')})
+    first = values(db.arena()[0])
+    assert json.loads(first[':launch_data']) == {'source': 'recorded'}
+    evidence = json.loads(first[':evidence_data'])
+    assert {o['source'] for o in evidence.values()} == {'recorded'}
+    assert not [a for a, _, _ in context.invoked if a == 'compare']
+    assert len(db.results()) == 4
+
+
+def test_a_bad_compare_result_is_a_failure_of_that_option(workflow, monkeypatch):
+    original = FakeContext.invoke
+
+    def invoke(self, function, event, name):
+        result = original(self, function, event, name)
+        if event['action'] == 'compare' and event['option'] == 'careful':
+            return {**result, 'vm_state': 'running'}
+        return result
+
+    monkeypatch.setattr(FakeContext, 'invoke', invoke)
+    _, db, _ = run(workflow, monkeypatch)
+    evidence = json.loads(values(db.arena()[0])[':evidence_data'])
+    assert evidence['careful']['source'] == 'recorded' and evidence['fast']['source'] == 'real'
+
+
+def test_a_replay_with_different_dice_never_redraws(workflow, monkeypatch):
+    checkpoints = {}
+    run(workflow, monkeypatch, checkpoints, rolls=range(1000))
+    recorded = json.loads(json.dumps(checkpoints))
+    asked = []
+    monkeypatch.setattr(workflow.secrets, 'randbelow', lambda bound: asked.append(bound) or 0)
+    again = FakeContext(checkpoints, rooms_for(), workflow, db=FakeDB())
+    monkeypatch.setattr(workflow, 'DB', again.db)
+    workflow.handler({'id': RUN}, again)
+    assert asked == []
+    assert checkpoints == recorded
+    assert 'plan-launch' in again.step_calls
+
+
+def test_a_callback_for_another_round_is_rejected(workflow, monkeypatch):
+    rooms = rooms_for()
+    rooms['launch'] = json.dumps({'action': 'close', 'round': 'growth', 'players': ROOM})
+    with pytest.raises(ValueError, match='launch'):
+        run(workflow, monkeypatch, rooms=rooms)
+    rooms['launch'] = json.dumps({'action': 'migrate', 'players': ROOM})
     with pytest.raises(ValueError):
-        workflow.handler({'id': RUN}, context)
-    assert 'migration-risk' not in context.step_calls
+        run(workflow, monkeypatch, rooms=rooms)
+
+
+def test_a_garbage_player_row_does_not_stop_the_run(workflow, monkeypatch):
+    room = [*ROOM, 'not a row', None, {'name': 'No id'}, {'id': 7}, dict(ROOM[0])]
+    _, db, _ = run(workflow, monkeypatch, rooms=rooms_for(room))
+    assert len(db.results()) == 4
+    assert [row['id'] for row in db.results()[f'results#{RUN}#launch']['rows']] == [p['id'] for p in ROOM]
+
+
+def test_a_players_value_that_is_not_a_list_fails_the_round_not_the_roster(workflow, monkeypatch):
+    rooms = rooms_for()
+    rooms['launch'] = json.dumps({'action': 'close', 'round': 'launch', 'players': 'nope'})
+    with pytest.raises(ValueError):
+        run(workflow, monkeypatch, rooms=rooms)
+
+
+def test_an_expired_callback_publishes_expired_and_stops(workflow, monkeypatch):
+    rooms = rooms_for()
+    rooms['growth'] = workflow.CallbackTimeoutError('late')
+    db = FakeDB()
+    with pytest.raises(workflow.CallbackTimeoutError):
+        run(workflow, monkeypatch, rooms=rooms, db=db)
+    last = values(db.arena()[-1])
+    assert last[':phase'] == 'expired' and last[':expround'] == 'growth'
+    assert (last[':old0'], last[':old1']) == ('open', 'closing')
+    assert set(db.results()) == {f'results#{RUN}#launch'}
+
+
+def test_a_lost_conditional_write_is_not_an_error(workflow, monkeypatch):
+    db = FakeDB()
+    db.fail_phase = 'open'
+    _, db, _ = run(workflow, monkeypatch, db=db)
+    assert len(db.results()) == 4
+
+
+def test_other_dynamodb_errors_are_raised(workflow, monkeypatch):
+    class Broken(FakeDB):
+        def update_item(self, **kwargs):
+            raise ClientError({'Error': {'Code': 'ProvisionedThroughputExceededException'}}, 'UpdateItem')
+
+    monkeypatch.setattr(workflow, 'register', lambda *args: None)
+    monkeypatch.setattr(workflow, 'DB', Broken())
+    with pytest.raises(ClientError):
+        workflow.handler({'id': RUN}, FakeContext({}, rooms_for(), workflow))
+
+
+@pytest.mark.parametrize('bad', ['', 'A' * 32, 'a' * 31, None, 7])
+def test_the_run_id_must_be_32_lowercase_hex(workflow, bad):
+    with pytest.raises(ValueError, match='Invalid'):
+        workflow.handler({'id': bad}, FakeContext({}, {}, workflow))
+
+
+def test_the_real_model_plays_four_rounds_with_a_garbage_row(monkeypatch):
+    module = real_model()
+    flow = load_workflow(monkeypatch, module)
+    room = [{'id': 'ada1', 'name': 'Ada Byron', 'house': False, 'option': 'large', 'picks': {'launch': 'large'}},
+            {'id': 'grace1', 'name': 'Grace Hopper', 'house': False, 'option': 'nonsense', 'picks': {}},
+            {'id': 'house', 'name': 'House', 'house': True, 'picks': {}},
+            'garbage', None, {'id': 'Bad Id!', 'name': 'x'}, {'id': 'ada1', 'name': 'Duplicate'}]
+    rooms = {}
+    for round_id in ROUND_IDS:
+        options = [o['id'] for r in module.ROUNDS if r['id'] == round_id for o in r['options']]
+        rooms[round_id] = [{**row, 'option': options[-1]} if isinstance(row, dict) and row.get('id') == 'ada1' else row
+                           for row in room]
+    context, db, _ = run(flow, monkeypatch, rooms=rooms, fail={('compare', 'fast')})
+    results = db.results()
+    assert sorted(results) == sorted(f'results#{RUN}#{r}' for r in ROUND_IDS)
+    for round_id in ROUND_IDS:
+        rows = results[f'results#{RUN}#{round_id}']['rows']
+        assert len(rows) >= module.MIN_PLAYERS and [r['rank'] for r in rows][0] == 1
+        assert len({row['id'] for row in rows}) == len(rows)
+    names = [name for _, name in context.ops]
+    assert len(names) == len(set(names))
+    assert len([call for call in db.arena() if values(call)[':phase'] == 'final']) == 1

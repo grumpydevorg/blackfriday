@@ -1,16 +1,18 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLACK FRIDAY · Presenter</title><link rel="stylesheet" href="/round.css"><script src="/round.js" defer></script></head>
 <body data-host="true"><main>
-<header class="hero"><p class="kicker">Presenter controls · AWS User Group Adelaide</p><h1>BLACK FRIDAY</h1><p>One checkpoint. Every team. Real Lambda.</p></header>
-<section id="signin" class="panel" hidden><h2>Presenter sign-in</h2><p class="muted">Only the presenter can start the round. Players never see this.</p><form id="login"><label>Passphrase<input id="passphrase" type="password" autocomplete="current-password" required></label><button>Sign in</button></form><p id="login-error" class="red" role="status"></p></section>
-<div id="panel" hidden><div class="host-grid"><section>
-<ol class="timeline"><li id="stage-launch">1 · Launch</li><li id="stage-migrate">2 · Deploy</li><li id="stage-compare">3 · Shoppers return</li></ol>
+<header class="hero"><p class="kicker">Presenter controls · AWS User Group Adelaide</p><h1>BLACK FRIDAY</h1><p>Four rounds. Every phone is a shop.</p></header>
+<section id="signin" class="panel" hidden><h2>Presenter sign-in</h2><p class="muted">Only the presenter can run the game. Players never see this.</p><form id="login"><label>Passphrase<input id="passphrase" type="password" autocomplete="current-password" required></label><button>Sign in</button></form><p id="login-error" class="red" role="status"></p></section>
+<div id="panel" hidden><div class="host-grid"><section class="host-main">
+<ol id="stages" class="timeline"></ol>
 <h2 id="headline">Connecting to the arena…</h2><p id="progress" class="muted"></p><p id="error" role="status"></p>
-<div class="controls"><button id="launch" type="button">1 · Open round / Run Launch</button><button id="migrate" type="button">2 · Close round and deploy every release</button><button id="compare" type="button">3 · Send the shoppers back</button></div>
-<button id="reset" class="secondary" type="button" hidden>Reset to a fresh open round</button>
-<p class="execution">Durable execution <code id="execution">Not started</code></p><p id="checkpoint" class="hint" hidden></p>
-</section><aside class="panel join-card"><h2>Scan. Join. Pick.</h2><img id="qr" alt="QR code to the public player page" width="150" height="150"><p><a id="public-url" href="#"></a></p><p>Everyone in the room, plus House A and House B.<br>Phones need no AWS credentials.</p></aside></div>
-<section id="scoreboard" hidden><h2>Profit after the AWS bill</h2><p class="muted">Modelled dollars. Top 10. Ties share a rank.</p><div id="scores" class="scores"></div><p id="more" class="muted"></p><p class="hint">Profit = $9 Launch + the shop's profit on the Black Friday wave (nothing sold if the migration broke, so just its cost) + $10 × Maya's sales − $2 migration. One shared retention draw: 42.</p></section>
-<section class="panel"><h2>Live teams</h2><p id="capacity" class="muted"></p><ul id="teams"></ul></section>
+<div class="controls"><button id="start" type="button">Start</button><button id="close" type="button">Close round</button><button id="reset" class="secondary" type="button">Reset</button></div>
+<section id="round-section" class="panel"><p id="round-weeks" class="kicker"></p><h2 id="round-title"></h2><p id="round-forecast"></p><p id="round-market" class="market"></p><div id="round-options" class="host-options"></div></section>
+<section id="results-section" class="panel" hidden><h2 id="results-title"></h2><p id="market-draw" class="market"></p><div id="option-summary" class="summary"></div></section>
+<section id="scoreboard" hidden><h2 id="board-title">Board</h2><div id="scores" class="scores"></div><p id="more" class="muted"></p></section>
+<section id="evidence-section" class="panel" hidden><h2>Evidence</h2><div id="evidence" class="evidence"></div></section>
+<p class="execution">Durable execution <code id="execution">Not started</code></p>
+</section><aside class="host-side"><section class="panel join-card"><h2>Scan. Join. Play.</h2><img id="qr" alt="QR code to the public player page" width="200" height="200"><p><a id="public-url" href="#"></a></p></section>
+<section class="panel"><h2>Players</h2><p id="capacity" class="muted"></p><ul id="teams"></ul></section></aside></div>
 <button id="logout" class="secondary" type="button">Sign out</button></div>
 </main></body></html>
