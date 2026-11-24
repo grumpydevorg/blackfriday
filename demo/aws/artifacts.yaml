@@ -1,5 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Private code and rehearsal checkpoints for BLACK FRIDAY.
+Parameters:
+  WebFunctionName: {Type: String, Default: black-friday-round}
 Resources:
   Artifacts:
     Type: AWS::S3::Bucket
@@ -49,7 +51,7 @@ Resources:
             Resource: !Sub '${Artifacts.Arn}/packages/web/*'
             Condition:
               ArnLike:
-                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:web-function/black-friday-arena/revision/*'
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:web-function/${WebFunctionName}/revision/*'
           - Sid: TransportSecurity
             Effect: Deny
             Principal: '*'

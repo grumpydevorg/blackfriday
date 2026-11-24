@@ -28,6 +28,7 @@ READY_HOOK = '/aws/lambda-microvms/runtime/v1/ready'
 MAX_ARTIFACT = 1024 * 1024
 PAYMENT_URL = 'http://127.0.0.1:8082/payments'
 Hex32 = re.compile(r'[0-9a-f]{32}')
+Team = re.compile(r'[a-z0-9]{3,16}')
 
 
 class BadRequest(ValueError):
@@ -147,19 +148,23 @@ class Runtime:
         if self.action:
             raise BadRequest('VM already configured')
         run_id, action, kind = data.get('id'), data.get('action'), data.get('kind')
+        team = data.get('team')
         if not isinstance(run_id, str) or not Hex32.fullmatch(run_id):
             raise BadRequest('Invalid run id')
         if action == 'launch':
             if set(data) != {'id', 'action', 'pay_url', 'receipt'}:
                 raise BadRequest('Invalid Launch configuration')
-        elif action in ('migrate', 'compare') and kind in ('preserve', 'omit'):
-            fields = {'id', 'action', 'kind', 'input'}
+        elif (
+            action in ('migrate', 'compare') and kind in ('preserve', 'omit')
+            and isinstance(team, str) and Team.fullmatch(team)
+        ):
+            fields = {'id', 'action', 'team', 'kind', 'input'}
             if action == 'compare' and kind == 'preserve':
                 fields |= {'pay_url', 'receipt'}
             if set(data) != fields:
                 raise BadRequest('Invalid Growth configuration')
         else:
-            raise BadRequest('Invalid action or migration kind')
+            raise BadRequest('Invalid action, team or migration kind')
 
         artifact = b''
         if action != 'launch':
@@ -171,7 +176,7 @@ class Runtime:
             receipt = data['receipt']
             if not isinstance(receipt, str) or not Hex32.fullmatch(receipt):
                 raise BadRequest('Invalid payment receipt')
-            scope = f'{run_id}:{kind or action}'
+            scope = f'{run_id}:{team or action}'
             self.env['PAYMENT_SCOPE'] = scope
             self.payment = Payment(scope, action == 'launch', ledger_url(data['pay_url']), receipt)
         # Setup is single-use, even if a local subprocess fails partway through.
@@ -183,7 +188,7 @@ class Runtime:
                 db.executescript((APP / 'schema.sql').read_text())
                 db.execute('INSERT INTO customers VALUES (?, ?)', ('maya', 'Maya'))
         else:
-            self.schema = f'bf_{run_id}_{kind}'
+            self.schema = f'bf_{run_id}_{team}'
             self.env['SHOP_SCHEMA'] = self.schema
             cluster = str(STATE / 'postgres')
             self.run([PG / 'initdb', '-D', cluster, '-A', 'trust', '-U', 'demo', '--locale=C'])

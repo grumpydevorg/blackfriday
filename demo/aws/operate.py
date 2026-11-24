@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,9 +37,13 @@ DEMO = AWS_DIR.parent
 ACCOUNT = os.environ.get('BLACK_FRIDAY_AWS_ACCOUNT', '')
 REGION = 'ap-southeast-2'
 PROFILE = os.environ.get('BLACK_FRIDAY_AWS_PROFILE') or None
-ARTIFACTS = 'BlackFridayRehearsalArtifacts'
-STACK = 'BlackFridayRehearsal'
-WEB_FUNCTION = 'black-friday-arena'  # names are unique across all Regions in an account
+DEPLOYMENT = os.environ.get('BLACK_FRIDAY_DEPLOYMENT', 'rehearsal')
+if DEPLOYMENT not in ('rehearsal', 'round'):
+    raise SystemExit('BLACK_FRIDAY_DEPLOYMENT must be rehearsal or round')
+STACK = 'BlackFridayRehearsal' if DEPLOYMENT == 'rehearsal' else 'BlackFridayRound'
+ARTIFACTS = STACK + 'Artifacts'
+WEB_FUNCTION = 'black-friday-arena' if DEPLOYMENT == 'rehearsal' else 'black-friday-round'
+PRESENTER_PARAMETER = '/black-friday/round/presenter-key'
 WEB_ENDPOINT = 'stage'
 LOGGER = logging.getLogger(__name__)
 
@@ -123,10 +128,16 @@ def packages(out: Path) -> dict[str, tuple[str, Path]]:
                 'aws/vm_runtime.py': AWS_DIR / 'vm_runtime.py',
                 **{name: DEMO / name for name in ('schema.sql', 'db.php', 'shop.php', 'migrate.php')},
             }, {}),
-            'worker': ({'evaluator.py': AWS_DIR / 'evaluator.py'}, {'': root / 'sdk'}),
-            'workflow': ({'workflow.py': AWS_DIR / 'workflow.py'}, {'': root / 'sdk'}),
+            'worker': ({
+                'evaluator.py': AWS_DIR / 'evaluator.py', 'scoring.py': AWS_DIR / 'scoring.py',
+                'virtual_rds.py': DEMO / 'virtual_rds.py', 'arena.py': DEMO / 'arena.py',
+            }, {'': root / 'sdk'}),
+            'workflow': ({
+                'workflow.py': AWS_DIR / 'workflow.py', 'scoring.py': AWS_DIR / 'scoring.py',
+            }, {'': root / 'sdk'}),
             'web': ({
-                'index.mjs': AWS_DIR / 'web.mjs', 'index.html': DEMO / 'index.html',
+                'index.mjs': AWS_DIR / 'web.mjs',
+                **{name: AWS_DIR / name for name in ('game.mjs', 'player.html', 'host.html', 'round.js', 'round.css')},
                 'art/cloud-surge.png': DEMO.parent / 'assets' / 'cloud-surge.png',
             }, {'node_modules/': web / 'node_modules'}),
         }
@@ -194,6 +205,7 @@ def deploy_web(session, bucket: str, key: str) -> str:
         'environmentVariables': {
             'AWS_LAMBDA_NODEJS_ENTRYPOINT': 'index.mjs',
             'RUN_TABLE': outputs['RunTable'], 'WORKFLOW_ARN': outputs['WorkflowVersion'],
+            'PRESENTER_PARAMETER': PRESENTER_PARAMETER,
         },
     }
     web = session.client('lambda-web')
@@ -204,7 +216,7 @@ def deploy_web(session, bucket: str, key: str) -> str:
             functionName=WEB_FUNCTION, tags={'project': 'black-friday-demo'},
             revisionConfig={'buildConfig': build, 'serviceConfig': service},
             endpointConfig={
-                'endpointName': WEB_ENDPOINT, 'endpointType': 'HomeRegion', 'authType': 'IamAuth',
+                'endpointName': WEB_ENDPOINT, 'endpointType': 'HomeRegion', 'authType': 'ApplicationManaged',
                 'autoDeploymentMode': 'Disabled', 'scalingConfig': {'maxEnvironments': 2},
                 'throttleConfig': {'rateLimit': 100},
             },
@@ -303,10 +315,20 @@ def destroy(*, artifacts: bool = False) -> None:
 
 def deploy(*, keep_failed: bool = False) -> None:
     session = account_session()
+    if DEPLOYMENT == 'rehearsal':
+        raise SystemExit('The rehearsal is frozen. Deploy it from tag rehearsal-fallback-2026-11-24; use BLACK_FRIDAY_DEPLOYMENT=round for the audience round.')
+    ssm = session.client('ssm')
+    try:
+        ssm.get_parameter(Name=PRESENTER_PARAMETER)
+    except ssm.exceptions.ParameterNotFound:
+        try:
+            ssm.put_parameter(Name=PRESENTER_PARAMETER, Value=secrets.token_hex(32), Type='SecureString', Overwrite=False)
+        except ssm.exceptions.ParameterAlreadyExists:
+            pass
     base_version = available_base_version(session)
     with TemporaryDirectory(prefix='black-friday-deploy-') as work:
         artifacts = packages(Path(work))
-        cloudformation_deploy('artifacts.yaml', ARTIFACTS)
+        cloudformation_deploy('artifacts.yaml', ARTIFACTS, WebFunctionName=WEB_FUNCTION)
         bucket = stack_outputs(session, ARTIFACTS)['Bucket']
         s3 = session.client('s3')
         for key, path in artifacts.values():
@@ -314,7 +336,8 @@ def deploy(*, keep_failed: bool = False) -> None:
         release = sha256((base_version + ''.join(key for key, _ in artifacts.values())).encode()).hexdigest()
         cloudformation_deploy(
             'rehearsal.yaml', STACK, keep_failed=keep_failed, ArtifactBucket=bucket,
-            BaseImageVersion=base_version, ReleaseId=release,
+            BaseImageVersion=base_version, ReleaseId=release, Prefix=WEB_FUNCTION,
+            PresenterParameter=PRESENTER_PARAMETER,
             **{f'{kind.title()}Key': key for kind, (key, _) in artifacts.items() if kind != 'web'},
         )
     url = deploy_web(session, bucket, artifacts['web'][0])
@@ -336,9 +359,12 @@ def present(port: int) -> None:
     endpoint = stage_url(session)
     if not re.fullmatch(rf'https://[a-z0-9.-]+\.lambda-web\.{re.escape(REGION)}\.on\.aws', endpoint):
         raise RuntimeError('Unexpected Web Function stage endpoint')
-    credentials = session.get_credentials()
+    credentials = session.get_credentials() if DEPLOYMENT == 'rehearsal' else None
+    presenter_key = None if credentials else session.client('ssm').get_parameter(
+        Name=PRESENTER_PARAMETER, WithDecryption=True,
+    )['Parameter']['Value']
     allowed_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
-    allowed_get = {'/', '/api/state', '/art/cloud-surge.png'}
+    allowed_get = {'/', '/api/state', '/art/cloud-surge.png', '/host', '/api/host/state', '/api/host/qr.svg', '/round.js', '/round.css'}
     allowed_post = {f'/api/{action}' for action in ('launch', 'migrate', 'compare', 'reset')}
     http = build_opener(NoRedirect)
 
@@ -368,7 +394,11 @@ def present(port: int) -> None:
             url = endpoint + self.path
             try:
                 req = AWSRequest(method=self.command, url=url, headers=headers, data=body)
-                SigV4Auth(credentials.get_frozen_credentials(), 'lambda', REGION).add_auth(req)
+                if credentials:
+                    SigV4Auth(credentials.get_frozen_credentials(), 'lambda', REGION).add_auth(req)
+                else:
+                    req.headers['X-Presenter-Key'] = presenter_key
+                    req.headers['X-Public-Url'] = endpoint
                 try:
                     result = http.open(Request(url, headers=dict(req.headers), method=self.command), timeout=20)
                 except HTTPError as error:
@@ -377,6 +407,9 @@ def present(port: int) -> None:
                     data = result.read()
                     status = result.status
                     media_type = result.headers.get('Content-Type', 'application/octet-stream')
+                    security_headers = {name: result.headers[name] for name in (
+                        'Content-Security-Policy', 'X-Content-Type-Options', 'Referrer-Policy',
+                    ) if name in result.headers}
             except (URLError, OSError, RuntimeError) as error:
                 LOGGER.error('Stage request failed: %s', type(error).__name__)
                 self.send_error(502, 'AWS stage unavailable; check your SSO login')
@@ -385,6 +418,8 @@ def present(port: int) -> None:
             self.send_header('Content-Type', media_type)
             self.send_header('Content-Length', str(len(data)))
             self.send_header('Cache-Control', 'no-store')
+            for name, value in security_headers.items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
 
@@ -392,7 +427,8 @@ def present(port: int) -> None:
         do_POST = forward
 
     with ThreadingHTTPServer(('127.0.0.1', port), Proxy) as server:
-        print(f'Open http://127.0.0.1:{port}/ · the arena is served by {endpoint}', flush=True)
+        path = '/' if DEPLOYMENT == 'rehearsal' else '/host'
+        print(f'Open http://127.0.0.1:{port}{path} · the arena is served by {endpoint}', flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -406,9 +442,9 @@ def main() -> None:
     package.add_argument('output', type=Path)
     deploy_command = commands.add_parser('deploy', help='Deploy the private rehearsal into your AWS account')
     deploy_command.add_argument('--keep-failed', action='store_true', help='Preserve failed stack resources for diagnosis')
-    stage = commands.add_parser('present', help='Run the localhost IAM-signing proxy')
-    stage.add_argument('--port', type=int, default=8767)
-    teardown = commands.add_parser('destroy', help='Delete the Web Function, then the rehearsal stack')
+    stage = commands.add_parser('present', help='Proxy to the selected deployment (IAM rehearsal, keyed round)')
+    stage.add_argument('--port', type=int, default=8767 if DEPLOYMENT == 'rehearsal' else 8768)
+    teardown = commands.add_parser('destroy', help='Delete only the selected deployment')
     teardown.add_argument('--artifacts', action='store_true',
                           help='Also delete the artifact bucket (all versions) and its stack')
     args = parser.parse_args()

@@ -23,10 +23,12 @@ where the five kinds of Lambda come in:
 
 ## Status
 
-This is a working prototype, not a hosted tournament. What has been run, and
-with what limits, is recorded in [`docs/game.md`](docs/game.md#what-exists-today-and-what-is-proposed).
-No outside or audience code has been run; [what that would
-need](docs/processes/running-outside-code.md) is written down.
+This is a working prototype, not a hosted tournament. One Growth round can be
+played live in AWS: audience teams join on their phones and pick a release and
+an architecture, and Lambda judges every team in parallel. What has been run,
+and with what limits, is recorded in [`docs/game.md`](docs/game.md#what-exists-today-and-what-is-proposed).
+Players only pick; no outside or audience code has been run, and [what that
+would need](docs/processes/running-outside-code.md) is written down.
 
 ## What is here
 
@@ -59,7 +61,7 @@ cd demo
 uv run --no-project --with pytest --with boto3==1.44.9 --with pydantic==2.13.4 pytest -q
 ```
 
-The local arena (Docker), the AWS rehearsal and the Lambda fan-out are in
+The local arena (Docker), the AWS round and rehearsal, and the Lambda fan-out are in
 [`docs/processes/`](docs/processes/). The AWS scripts only run against the
 account named in `BLACK_FRIDAY_AWS_ACCOUNT`, in Sydney (`ap-southeast-2`), and
 delete what they create; read the process before running one.

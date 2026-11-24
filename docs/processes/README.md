@@ -7,7 +7,7 @@ a file says otherwise; code is in [`demo/`](../../demo/). Background:
 | Runbook | What it covers | Needs AWS |
 |:--|:--|:--|
 | [local-play.md](local-play.md) | The local two-migration demo and the Virtual RDS scoring round | No |
-| [aws-rehearsal.md](aws-rehearsal.md) | Build, run and tear down the Sydney rehearsal | Yes |
+| [aws-rehearsal.md](aws-rehearsal.md) | Run the audience Growth round and the frozen rehearsal in Sydney; tear them down | Yes |
 | [launch-wave.md](launch-wave.md) | Fan out one game-release wave across Event Lambda workers | Yes |
 | [git-submissions.md](git-submissions.md) | Submit a release with Git; run the intake receiver | No |
 | [microvm-submission.md](microvm-submission.md) | Run one reviewed frozen commit in a MicroVM; stock AWS Emulator proofs | Yes |

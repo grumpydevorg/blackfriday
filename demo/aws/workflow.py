@@ -13,12 +13,12 @@ from aws_durable_execution_sdk_python import (
 )
 from aws_durable_execution_sdk_python.config import CallbackConfig, Duration
 from botocore.exceptions import ClientError
+from scoring import rank, total_profit, validate_teams
 
 DB = boto3.client('dynamodb')
 TABLE = os.environ['RUN_TABLE']
 EVALUATOR = os.environ['EVALUATOR_ARN']
 KEY = {'pk': {'S': 'arena'}}
-KINDS = ('preserve', 'omit')
 CALLBACK = CallbackConfig(timeout=Duration.from_hours(23))
 
 
@@ -74,32 +74,23 @@ def publish(
             raise
 
 
-def evaluate_forks(context: DurableContext, run_id: str, action: str) -> list[dict[str, Any]]:
-    def fork(kind: str):
+def evaluate_forks(context: DurableContext, run_id: str, action: str, teams: list[dict]) -> list[dict[str, Any]]:
+    def fork(team: dict):
         def run(child: DurableContext) -> dict[str, Any]:
-            result = child.invoke(
-                EVALUATOR, {'id': run_id, 'action': action, 'kind': kind}, name=f'{action}-{kind}',
-            )
-            return {**result, 'kind': kind}
+            event = {'id': run_id, 'action': action, 'team': team['id'], 'kind': team['kind']}
+            if action == 'compare':
+                event['architecture'] = team['architecture']
+            return {**child.invoke(EVALUATOR, event, name=f'{action}-{team["id"]}'), 'id': team['id']}
 
         return run
 
-    result = context.parallel([fork(kind) for kind in KINDS], name=f'{action}-both-forks')
+    result = context.parallel([fork(team) for team in teams], name=f'{action}-every-team')
     result.throw_if_error()
-    by_kind = {branch['kind']: branch for branch in result.get_results()}
-    return [by_kind[kind] for kind in KINDS]
+    by_team = {branch['id']: branch for branch in result.get_results()}
+    return [by_team[team['id']] for team in teams]
 
 
-def wait_for_action(
-    context: DurableContext,
-    run_id: str,
-    arn: str,
-    previous: str,
-    phase: str,
-    busy: str,
-    action: str,
-    fields: dict[str, str],
-) -> None:
+def wait_for_action(context, run_id, arn, previous, phase, busy, action, fields) -> dict:
     callback = context.create_callback(name=f'await-{action}', config=CALLBACK)
     context.step(
         lambda _: publish(run_id, arn, (previous,), phase, {**fields, 'callback_id': callback.callback_id}),
@@ -113,8 +104,11 @@ def wait_for_action(
             name=f'expire-{action}',
         )
         raise
-    if value != action:
+    if isinstance(value, (str, bytes, bytearray)):
+        value = json.loads(value)
+    if not isinstance(value, dict) or value.get('action') != action:
         raise ValueError(f'Unexpected result for {action} callback')
+    return value
 
 
 @durable_execution
@@ -124,33 +118,31 @@ def handler(event: dict[str, Any], context: DurableContext) -> dict[str, str]:
         raise ValueError('Invalid rehearsal ID')
     arn = context.execution_context.durable_execution_arn
     context.step(lambda _: register(run_id, arn), name='register-execution')
-
     launch = context.invoke(EVALUATOR, {'id': run_id, 'action': 'launch'}, name='launch-shop')
     if launch['vm_state'] != 'terminated':
         raise RuntimeError('The Launch MicroVM was not observed terminated')
-    wait_for_action(context, run_id, arn, 'launching', 'launch', 'migrating', 'migrate', {
+    # Close carries a snapshot of every pick inside the durable callback.
+    closed = wait_for_action(context, run_id, arn, 'launching', 'launch', 'migrating', 'migrate', {
         'checkpoint': launch['checkpoint'],
         'launch_data': json.dumps(launch['launch']),
         'launch_vm_id': launch['vm_id'],
         'launch_vm_state': launch['vm_state'],
     })
-
-    migrations = evaluate_forks(context, run_id, 'migrate')
+    teams = validate_teams(closed.get('teams'))
+    migrations = evaluate_forks(context, run_id, 'migrate', teams)
     wait_for_action(context, run_id, arn, 'migrating', 'migrated', 'comparing', 'compare', {
         'migrations_data': json.dumps(migrations),
     })
-
-    outcomes = evaluate_forks(context, run_id, 'compare')
-    branches = []
-    for migration, outcome in zip(migrations, outcomes, strict=True):
-        branches.append({
-            **migration,
-            **outcome,
-            'cost_cents': 200,
-            'cumulative_cents': launch['launch']['profit_cents'] + outcome['profit_cents'],
+    outcomes = evaluate_forks(context, run_id, 'compare', teams)
+    results = []
+    for team, migration, outcome in zip(teams, migrations, outcomes, strict=True):
+        results.append({
+            **migration, **outcome,
+            'id': team['id'], 'name': team['name'], 'house': team['house'], 'release': team['release'],
+            'cumulative_cents': total_profit(outcome['profit_cents']),
         })
     context.step(
-        lambda _: publish(run_id, arn, ('comparing',), 'compared', {'outcomes_data': json.dumps(branches)}),
+        lambda _: publish(run_id, arn, ('comparing',), 'compared', {'outcomes_data': json.dumps(rank(results))}),
         name='publish-comparison',
     )
     return {'id': run_id, 'execution_arn': arn}

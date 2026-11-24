@@ -17,7 +17,7 @@ function postgres(): PDO
 
 function schemaName(string $name): string
 {
-    if (!preg_match('/\Abf_[0-9a-f]{32}_(preserve|omit)\z/', $name)) {
+    if (!preg_match('/\Abf_[0-9a-f]{32}_[a-z0-9]{3,16}\z/', $name)) {
         throw new InvalidArgumentException('Invalid rehearsal schema');
     }
     return $name;

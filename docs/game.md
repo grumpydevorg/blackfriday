@@ -63,10 +63,42 @@ after a slow one, 20% after a failure, 5% after lost history.
 | MicroVMs | Run team shop code separately from the judge |
 | Managed Instances | Alternative capacity for the same trusted judges when work is steady (described only, not measured) |
 
+## The Growth round: built and run
+
+One cycle of the game, for an audience: up to eight teams join on their phones
+and play one Growth week from the same Launch shop, alongside two house teams.
+Players **pick** a reviewed release and an architecture; nobody uploads code.
+
+| Pick | Options | Modelled cost |
+|:--|:--|:--|
+| Release | **A** migrates every table; **B** migrates customers, products and orders only (faster, drops carts) | A $2, B $1 |
+| Storage | instance-local, small shared, large shared | $0, $1, $4 |
+| Replicas | 1 or 2 | $1 each |
+| Cache | on or off | free |
+
+Team profit, in cents:
+
+```
+900                                   Launch: one verified sale ($10) − $1 Launch cost, same for every team
++ architecture profit                 virtual_rds.py: $10 × verified sales − storage − replicas, same customer trace (seed 42)
++ 1000 × Maya's sales                 her checkout now (only if her cart survived), plus one next-week sale
+                                      if the shared draw (42) is below her return chance: 75% fast, 50% slow, 5% without her cart
+− migration cost                      A 200, B 100
+```
+
+Release A is $1 dearer and keeps Maya's $20. Instance-local storage loses its
+orders when the shop is replaced, so it sells nothing; a cache or large storage
+beats the house teams, which play small storage, one replica, no cache. The
+runbook is [AWS round and rehearsal](processes/aws-rehearsal.md).
+
 ## What exists today, and what is proposed
 
 Exists and has been run:
 
+- The Growth round (above) in Sydney: a public player page and a keyed
+  presenter page on one Web Function, a version-pinned Durable round, one Event
+  judgement and one disposable roleless MicroVM per team. Players pick; only
+  organiser code runs.
 - An AWS rehearsal (Oregon, then Sydney since 23 Nov 2026): Web arena,
   version-pinned Durable workflow, Event evaluator, disposable roleless
   MicroVMs. From one Launch checkpoint, two Growth migrations both passed
@@ -79,7 +111,7 @@ Exists and has been run:
   workers 22.61 s (6.5×), identical scores. One observation, not a benchmark.
 - A local Virtual RDS scoring round and a local virtual AWS simulator.
 
-Proposed, not built: the four-round scored tournament, a hosted contestant
+Proposed, not built: the four-round scored tournament with switchers, a hosted contestant
 runner, running untrusted code (needs a separate AWS account, isolated
 build/run MicroVMs, externally enforced egress controls and independent
 scoring). Managed Instances is **not measured**: the attempted pool

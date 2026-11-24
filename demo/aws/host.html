@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLACK FRIDAY · Presenter</title><link rel="stylesheet" href="/round.css"><script src="/round.js" defer></script></head>
+<body data-host="true"><main>
+<header class="hero"><p class="kicker">Presenter controls · AWS User Group Adelaide</p><h1>BLACK FRIDAY</h1><p>One checkpoint. Every team. Real Lambda.</p></header>
+<div class="host-grid"><section>
+<ol class="timeline"><li id="stage-launch">1 · Launch</li><li id="stage-migrate">2 · Deploy</li><li id="stage-compare">3 · Shoppers return</li></ol>
+<h2 id="headline">Connecting to the arena…</h2><p id="progress" class="muted"></p><p id="error" role="status"></p>
+<div class="controls"><button id="launch" type="button">1 · Open round / Run Launch</button><button id="migrate" type="button">2 · Close round and deploy every release</button><button id="compare" type="button">3 · Send the shoppers back</button></div>
+<button id="reset" class="secondary" type="button" hidden>Reset to a fresh open round</button>
+<p class="muted">The round is open immediately after reset. Teams without a saved pick use Release A, small shared storage, one replica, no cache.</p>
+<p class="execution">Durable execution <code id="execution">Not started</code></p><p id="checkpoint" class="hint"></p>
+</section><aside class="panel join-card"><h2>Scan. Join. Pick.</h2><img id="qr" src="/api/host/qr.svg" alt="QR code to the public player page" width="260" height="260"><p><a id="public-url" href="#"></a></p><p>Eight audience teams + House A and House B.<br>Phones need no AWS credentials.</p></aside></div>
+<section id="scoreboard" hidden><h2>Profit after the AWS bill</h2><p class="muted">Modelled dollars. Ties share a rank.</p><div id="scores" class="scores"></div><p class="hint">Profit = $9 Launch + architecture-wave profit + $10 × Maya's sales − migration. One shared retention draw: 42.</p></section>
+<section class="panel"><h2>Live teams</h2><p id="capacity" class="muted"></p><ul id="teams"></ul></section>
+</main></body></html>

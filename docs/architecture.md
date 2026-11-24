@@ -46,27 +46,34 @@ The constraints make the game fair (everyone gets the same tiny cloud), safe
 
 ## Our side today: built and run
 
-Everything runs in Sydney (`ap-southeast-2`) on Lambda, S3 and DynamoDB; it was
-built and measured in Oregon (`us-west-2`) first. There is no real EC2, RDS,
+Everything runs in Sydney (`ap-southeast-2`) on Lambda, S3, DynamoDB and SSM; it
+was built and measured in Oregon (`us-west-2`) first. There is no real EC2, RDS,
 load balancer, VPC or NAT gateway.
+
+Two deployments with the same shape and no shared resources (selected by
+`BLACK_FRIDAY_DEPLOYMENT`): the **round**, a public game for an audience, and the
+**rehearsal**, its frozen IAM-only predecessor kept as a fallback (tag
+`rehearsal-fallback-2026-11-24`). The round:
 
 ```mermaid
 flowchart LR
-  P["Presenter laptop<br/>operate.py present<br/>(localhost, signs requests)"] -->|"AWS-signed HTTPS"| W
-  W["Web Function<br/>black-friday-arena<br/>(created by operate.py)"]
-  subgraph R["Stack BlackFridayRehearsal"]
-    D["Durable Function<br/>workflow"]
-    E["Event Function<br/>black-friday-evaluator"]
-    M["MicroVM image<br/>black-friday-shop"]
-    T[("DynamoDB<br/>Runs table")]
+  Ph["Players' phones<br/>(join, pick, scoreboard)"] -->|"public HTTPS"| W
+  P["Presenter laptop<br/>operate.py present<br/>(localhost, adds the presenter key)"] -->|"HTTPS + key"| W
+  W["Web Function<br/>black-friday-round<br/>(created by operate.py)"]
+  K[("SSM<br/>presenter key")] -.- W
+  subgraph R["Stack BlackFridayRound"]
+    D["Durable Function<br/>black-friday-round-workflow"]
+    E["Event Function<br/>black-friday-round-evaluator"]
+    M["MicroVM image<br/>black-friday-round-shop"]
+    T[("DynamoDB<br/>round state and teams")]
   end
-  subgraph A["Stack BlackFridayRehearsalArtifacts"]
+  subgraph A["Stack BlackFridayRoundArtifacts"]
     S3[("S3 bucket<br/>packages · checkpoints · receipts")]
   end
   W --> T
-  W -->|"start / continue"| D
-  D -->|"one job per stage"| E
-  E -->|"run_microvm, 120 s"| V["MicroVM<br/>shop + database"]
+  W -->|"start / continue (presenter only)"| D
+  D -->|"Launch, then one job per team"| E
+  E -->|"run_microvm, 120 s"| V["MicroVM per team<br/>shop + database"]
   M -.image.- V
   E <--> S3
   V -->|"one receipt upload"| S3
@@ -74,12 +81,16 @@ flowchart LR
 
 | Resource | Kind | Job | Limits |
 |:--|:--|:--|:--|
-| `black-friday-arena` ([`operate.py`](../demo/aws/operate.py)) | Web Function, Node.js 24 | Arena page and API | AWS-signed requests only; at most 2 environments, 100 requests/s, 15 s timeout |
-| Workflow | Durable Function | Launch → pause for the presenter → Growth migrations; saves progress at each step | 48 h execution, 7-day history |
-| `black-friday-evaluator` | Event Function | Starts MicroVMs, drives the shop, checks orders and payments, saves results | 512 MB, 300 s, at most 4 at once |
-| `black-friday-shop` | MicroVM image | PHP shop with SQLite or PostgreSQL 17 | ARM64, 1 GiB; each VM at most 120 s, no role |
-| Runs | DynamoDB, on demand | Arena run state | |
+| `black-friday-round` ([`operate.py`](../demo/aws/operate.py), [`web.mjs`](../demo/aws/web.mjs)) | Web Function, Node.js 24 | Player page, presenter page, API | Public endpoint (`ApplicationManaged`); presenter actions need the SSM key; 2 KiB bodies; at most 2 environments, 100 requests/s, 15 s timeout |
+| `black-friday-round-workflow` ([`workflow.py`](../demo/aws/workflow.py)) | Durable Function | Launch → wait for Close → one migration per team → wait → one shopper check per team → scoreboard | 48 h execution, 23 h callbacks, 7-day history |
+| `black-friday-round-evaluator` ([`evaluator.py`](../demo/aws/evaluator.py)) | Event Function | Starts MicroVMs, drives the shop, checks orders and payments, scores the architecture, saves results | 512 MB, 300 s, at most 10 at once |
+| `black-friday-round-shop` | MicroVM image | PHP shop with SQLite or PostgreSQL 17 | ARM64, 1 GiB; each VM at most 120 s, no role |
+| Round table | DynamoDB, on demand | Round state, teams and picks | At most 8 audience teams + 2 house teams |
 | Artifacts ([`artifacts.yaml`](../demo/aws/artifacts.yaml)) | S3, versioned | Code packages, checkpoints between stages, payment receipts | Objects expire after 7 days; old versions after 1 day |
+
+The rehearsal is the same shape with names `BlackFridayRehearsal`,
+`black-friday-arena`, `black-friday-evaluator` (at most 4 at once) and an
+IAM-only endpoint that `present` signs with SigV4.
 
 The launch-wave proof ([`launch-wave.yaml`](../demo/aws/launch-wave.yaml))
 creates a temporary stack with its own Durable Function and Event judges (512 MB,
@@ -174,14 +185,25 @@ trusted Python test shop uses it today.
 
 ## The arena
 
-**Today (built and run):** a presenter control page, [`demo/index.html`](../demo/index.html),
-served by the Web Function ([`web.mjs`](../demo/aws/web.mjs)). Three steps,
-Launch → Deploy → Shopper returns, each a click that resumes the paused Durable
-workflow. API: `GET /api/state`, `POST /api/launch|migrate|compare|reset`, each
-POST bound to the current run so a double-click cannot advance it twice. The same
-page runs locally from [`arena.py`](../demo/arena.py).
+**Today (built and run):** one Web Function ([`web.mjs`](../demo/aws/web.mjs),
+rules in [`game.mjs`](../demo/aws/game.mjs)) serves two pages.
 
-**Proposed:** teams, registration and a public leaderboard.
+- **Player page** ([`player.html`](../demo/aws/player.html), public): join a
+  team, pick a release and an architecture, watch the round, see the scoreboard.
+  A team token kept on the phone guards its pick. Other teams' picks are hidden
+  until the round closes.
+- **Presenter page** ([`host.html`](../demo/aws/host.html), key required): QR and
+  public URL, team list, execution ARN, three buttons, Open/Launch → Close and
+  deploy every release → Send the shoppers back, each resuming the paused Durable
+  round. Each action is bound to the current run, so a double-click cannot
+  advance it twice. Only these actions start compute.
+
+Routes and rules: [AWS round and rehearsal](processes/aws-rehearsal.md#what-runs).
+The frozen rehearsal serves the older single presenter page,
+[`demo/index.html`](../demo/index.html), which also runs locally from
+[`arena.py`](../demo/arena.py).
+
+**Proposed:** Git-registered teams, submissions and a multi-round leaderboard.
 
 ```mermaid
 sequenceDiagram
@@ -214,9 +236,8 @@ sequenceDiagram
 4. **Leaderboard:** public, read-only: profit per round and in total, verified
    sales, lost carts, duplicate charges, and each team's drawn architecture.
 
-To check first: whether a Web Function endpoint can be public for webhooks and
-the leaderboard. The rehearsal endpoint uses IAM auth. If not, a small Event
-Function with a public function URL can receive the webhook.
+A Web Function endpoint can be public (`ApplicationManaged`, used by the round),
+so the webhook and leaderboard need no separate function.
 
 ## What teams submit: proposed
 

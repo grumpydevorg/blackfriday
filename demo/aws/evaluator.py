@@ -16,13 +16,14 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+import scoring
+
 MAX_ARTIFACT = 1024 * 1024
 VM_LIFESPAN = 120
 PRICE = 2500
-MARGIN = 1000
-LAUNCH_COST = 100
-GROWTH_COST = 200
-RETURN_DRAW = 42
+MARGIN = scoring.MARGIN
+LAUNCH_COST = scoring.LAUNCH_COST
+RETURN_DRAW = scoring.RETURN_DRAW
 HEX32 = re.compile(r'[0-9a-f]{32}')
 AWS_CONFIG = Config(connect_timeout=3, read_timeout=6, retries={'total_max_attempts': 2})
 
@@ -219,20 +220,29 @@ class Shop:
 class Rehearsal:
     id: str
     action: str
+    team: str
     kind: str
+    architecture: dict | None = None
 
     @classmethod
     def parse(cls, event: dict) -> 'Rehearsal':
         if not isinstance(event, dict):
             raise TypeError('Event must be an object')
-        run_id, action, kind = event.get('id'), event.get('action'), event.get('kind')
+        run_id, action = event.get('id'), event.get('action')
+        team, kind = event.get('team'), event.get('kind')
         if not isinstance(run_id, str) or not HEX32.fullmatch(run_id):
             raise ValueError('Invalid run id')
         if action == 'launch' and set(event) == {'id', 'action'}:
-            return cls(run_id, action, '')
-        if action in ('migrate', 'compare') and kind in ('preserve', 'omit') and set(event) == {'id', 'action', 'kind'}:
-            return cls(run_id, action, kind)
-        raise ValueError('Invalid action, migration kind or unexpected event field')
+            return cls(run_id, action, '', '')
+        team_ok = isinstance(team, str) and scoring.TEAM_ID.fullmatch(team) is not None and kind in scoring.KINDS
+        if team_ok and action == 'migrate' and set(event) == {'id', 'action', 'team', 'kind'}:
+            return cls(run_id, action, team, kind)
+        if (
+            team_ok and action == 'compare' and set(event) == {'id', 'action', 'team', 'kind', 'architecture'}
+            and scoring.valid_architecture(event['architecture'])
+        ):
+            return cls(run_id, action, team, kind, event['architecture'])
+        raise ValueError('Invalid action, team, migration kind or unexpected event field')
 
     @property
     def root(self) -> str:
@@ -240,7 +250,7 @@ class Rehearsal:
 
     @property
     def step(self) -> str:
-        return f'{self.action}-{self.kind}' if self.kind else self.action
+        return f'{self.action}-{self.team}' if self.team else self.action
 
     def result_key(self, step: str) -> str:
         return f'{self.root}/{step}/result.json'
@@ -277,11 +287,12 @@ class Rehearsal:
 
     def setup(self, store: Store, fleet: Fleet, deadline: float) -> dict:
         data = {'id': self.id, 'action': self.action}
-        if self.kind:
+        if self.team:
+            data['team'] = self.team
             data['kind'] = self.kind
             step, field, filename = (
                 ('launch', 'checkpoint', 'checkpoint.sqlite') if self.action == 'migrate'
-                else (f'migrate-{self.kind}', 'dump', 'branch.dump')
+                else (f'migrate-{self.team}', 'dump', 'branch.dump')
             )
             prior = json.loads(store.require(self.result_key(step)))
             fleet.finish(prior['vm_id'], deadline)
@@ -319,13 +330,26 @@ class Rehearsal:
             'order_status': order.status, 'profit_cents': MARGIN - LAUNCH_COST,
         }}
 
-    def growth(self, store: Store, shop: Shop) -> dict:
+    def capacity(self) -> dict:
+        """Score this team's architecture on the Virtual RDS wave. Pure Python: no MicroVM involved."""
+        from virtual_rds import Plan, run_round
+
+        plan = Plan(self.architecture['storage'], self.architecture['replicas'], self.architecture['cache'])
+        result, _ = run_round(plan, RETURN_DRAW)
+        return {
+            'storage': plan.storage, 'replicas': plan.replicas, 'cache': plan.cached,
+            'verified_sales': result['verified_sales'], 'wave_verified_sales': result['wave_verified_sales'],
+            'wave_storage_rejections': result['wave_storage_rejections'],
+            'cost_cents': result['modeled_cost_cents'], 'profit_cents': result['profit_cents'],
+        }
+
+    def growth(self, store: Store, shop: Shop, architecture: dict | None) -> dict:
         health = shop.check('/health')
         history = self.verify_order(store, shop, 'launch')
         if health.json().get('database') != 'pgsql':
             raise RuntimeError('Growth did not use PostgreSQL')
         branch = {
-            'kind': self.kind, 'schema': f'bf_{self.id}_{self.kind}', 'database': 'pgsql',
+            'kind': self.kind, 'schema': f'bf_{self.id}_{self.team}', 'database': 'pgsql',
             'health_status': health.status, 'history_status': history.status,
         }
         if self.action == 'migrate':
@@ -338,23 +362,24 @@ class Rehearsal:
         cart = shop.check('/cart/cart-saved', 200 if preserve else 404)
         checkout = shop.checkout('growth-mug', 'cart-saved') if preserve else None
         if checkout is not None:
-            self.verify_order(store, shop, self.kind)
+            self.verify_order(store, shop, self.team)
             if checkout.elapsed is None:
                 raise RuntimeError('Missing checkout timing evidence')
-            probability = 75 if checkout.elapsed <= 2000 else 50
             sold = 1
         else:
             shop.check('/orders/order-growth-mug', 404)
-            probability = 5
             sold = 0
-        charges = self.observe_charge(store, self.kind)
+        probability = scoring.return_probability(self.kind, checkout.elapsed if checkout else None)
+        charges = self.observe_charge(store, self.team)
         if charges != sold:
             raise RuntimeError('Growth ledger does not agree with verified sales')
-        profit = MARGIN * sold - GROWTH_COST
+        maya = scoring.maya_sales(sold, probability)
         return {**branch, 'cart_status': cart.status, 'checkout_status': checkout.status if checkout else None,
                 'checkout_ms': checkout.elapsed if checkout else None, 'charges': charges, 'verified_sales': sold,
                 'return_probability': probability, 'returns_next_week': RETURN_DRAW < probability,
-                'cost_cents': GROWTH_COST, 'profit_cents': profit}
+                'maya_sales': maya, 'architecture': architecture,
+                'migration_cost_cents': scoring.KINDS[self.kind],
+                'profit_cents': scoring.growth_profit(architecture['profit_cents'], maya, self.kind)}
 
 
 def handler(event: dict, context) -> dict:
@@ -366,9 +391,10 @@ def handler(event: dict, context) -> dict:
     key = stage.result_key(stage.step)
     candidate = store.get(key)
     if candidate is None:
+        architecture = stage.capacity() if stage.action == 'compare' else None
         data = stage.setup(store, fleet, work_deadline)
         if stage.action == 'launch' or (stage.action == 'compare' and stage.kind == 'preserve'):
-            phase = stage.kind or stage.action
+            phase = stage.team or stage.action
             data.update(store.payment_capability(stage.ledger_key(phase), stage.receipt(phase)))
         request_budget(work_deadline, 1)
         vm = fleet.run(f'{stage.id}-{stage.step}')
@@ -376,7 +402,7 @@ def handler(event: dict, context) -> dict:
         try:
             shop = fleet.connect(vm, work_deadline)
             shop.check('/control/setup', body=data, timeout=35)
-            result = stage.launch(store, shop) if stage.action == 'launch' else stage.growth(store, shop)
+            result = stage.launch(store, shop) if stage.action == 'launch' else stage.growth(store, shop, architecture)
             # Persist the evaluated candidate before termination. A retry can finish
             # cleanup and return it without doing a new checkout or a new migration.
             store.put_once(key, json.dumps({**result, 'vm_id': vm_id}).encode(), 'application/json')

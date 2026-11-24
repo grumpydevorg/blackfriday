@@ -9,6 +9,9 @@ import {
   ListDurableExecutionsByFunctionCommand,
   SendDurableExecutionCallbackSuccessCommand,
 } from '@aws-sdk/client-lambda';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { RequestError, presenter, houses, join, pick, frozen, publicTeams, open } from './game.mjs';
+import QRCode from 'qrcode';
 
 const { RUN_TABLE: table, WORKFLOW_ARN: workflow } = process.env;
 if (!table || !/:\d+$/.test(workflow ?? '')) throw new Error('Set RUN_TABLE and a numbered WORKFLOW_ARN');
@@ -23,9 +26,29 @@ const n = value => ({ N: String(value) });
 const terminal = new Set(['compared', 'expired', 'failed']);
 const callbacks = { migrate: ['launch', 'migrating'], compare: ['migrated', 'comparing'] };
 const staticFiles = new Map([
-  ['/', ['text/html; charset=utf-8', readFileSync(new URL('./index.html', import.meta.url))]],
+  ['/', ['text/html; charset=utf-8', readFileSync(new URL('./player.html', import.meta.url))]],
+  ['/host', ['text/html; charset=utf-8', readFileSync(new URL('./host.html', import.meta.url))]],
+  ['/round.js', ['text/javascript; charset=utf-8', readFileSync(new URL('./round.js', import.meta.url))]],
+  ['/round.css', ['text/css; charset=utf-8', readFileSync(new URL('./round.css', import.meta.url))]],
   ['/art/cloud-surge.png', ['image/png', readFileSync(new URL('./art/cloud-surge.png', import.meta.url))]],
 ]);
+let secret;
+async function authorize(headers) {
+  if (!headers['x-presenter-key']) throw new RequestError(403, 'Presenter key required');
+  secret ??= new SSMClient({}).send(new GetParameterCommand({ Name: process.env.PRESENTER_PARAMETER, WithDecryption: true }))
+    .then(result => result.Parameter.Value).catch(error => { secret = undefined; throw error; });
+  presenter(headers['x-presenter-key'], await secret);
+}
+const fresh = () => ({ phase: s('ready'), run_id: s(id()), teams_data: s(JSON.stringify(houses())) });
+const teamsOf = row => JSON.parse(row.teams_data.S);
+async function initialized() {
+  let row = await stored();
+  if (!row) {
+    await replace(fresh(), 'attribute_not_exists(pk)');
+    row = await stored();
+  }
+  return row;
+}
 
 class ActionConflict extends Error {
   constructor() { super('This action no longer matches the saved rehearsal.'); }
@@ -67,15 +90,13 @@ function attachArn(run, arn) {
 }
 
 async function start(token, row) {
-  if ((row && row.phase.S !== 'ready') || token !== (row?.run_id.S ?? 'initial')) throw new ActionConflict();
-  const run = {
-    run_id: s(id()), phase: s('launching'), workflow_arn: s(workflow),
-    start_deadline: n(Date.now() + startWindow),
-  };
-  const reserved = row
-    ? await replace(run, 'phase = :ready AND run_id = :id', { ':ready': s('ready'), ':id': row.run_id })
-    : await replace(run, 'attribute_not_exists(pk)');
-  if (!reserved) throw new ActionConflict();
+  if (row.phase.S !== 'ready' || token !== row.run_id.S) throw new ActionConflict();
+  const run = row;
+  if (!await update('SET phase = :launching, workflow_arn = :workflow, start_deadline = :deadline',
+    'phase = :ready AND run_id = :id', {
+      ':launching': s('launching'), ':workflow': s(workflow), ':deadline': n(Date.now() + startWindow),
+      ':ready': s('ready'), ':id': row.run_id,
+    })) throw new ActionConflict();
 
   // Reserve before invoking. Both this response and the first workflow step can
   // record the ARN; neither can overwrite a later stage or a different run.
@@ -113,7 +134,7 @@ async function recoverStart(row) {
 
 async function describe(row) {
   if (!row || row.phase.S === 'ready') {
-    return { mode: 'aws', phase: 'ready', action_token: row?.run_id.S ?? 'initial' };
+    return { mode: 'aws', phase: 'ready', id: row.run_id.S, action_token: row.run_id.S };
   }
   const arn = row.execution_arn?.S;
   let phase = row.phase.S;
@@ -191,13 +212,15 @@ async function resume(action, token, row, state) {
   const values = { ':id': row.run_id, ':callback': row.callback_id, ':busy': s(busy), ':lease': lease };
   const claim = state.phase === waiting
     ? await update('SET phase = :busy, lease_until = :lease',
-      'run_id = :id AND callback_id = :callback AND phase = :waiting', { ...values, ':waiting': s(waiting) })
+      'run_id = :id AND callback_id = :callback AND phase = :waiting AND teams_data = :teams',
+      { ...values, ':waiting': s(waiting), ':teams': row.teams_data })
     : await update('SET phase = :busy, lease_until = :lease',
       'run_id = :id AND callback_id = :callback AND phase = :busy AND lease_until <= :now', { ...values, ':now': n(now) });
   if (!claim) throw new ActionConflict();
   try {
     await lambda.send(new SendDurableExecutionCallbackSuccessCommand({
-      CallbackId: row.callback_id.S, Result: Buffer.from(action),
+      CallbackId: row.callback_id.S,
+      Result: Buffer.from(JSON.stringify({ action, ...(action === 'migrate' ? { teams: frozen(teamsOf(row)) } : {}) })),
     }), { abortSignal: AbortSignal.timeout(10_000) });
   } catch (error) {
     // AWS uses the same exception for expiration and an already-consumed token.
@@ -212,7 +235,10 @@ async function resume(action, token, row, state) {
 }
 
 function send(response, code, type, body) {
-  response.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store' });
+  response.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  });
   response.end(body);
 }
 
@@ -220,31 +246,93 @@ function json(response, code, body) {
   send(response, code, 'application/json; charset=utf-8', JSON.stringify(body));
 }
 
+async function body(request) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > 2048) throw new RequestError(413, 'Request body limit is 2 KiB');
+    chunks.push(chunk);
+  }
+  try {
+    const value = JSON.parse(Buffer.concat(chunks).toString());
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error();
+    return value;
+  } catch { throw new RequestError(400, 'JSON object required'); }
+}
+
+async function view(row, headers, hostView = false) {
+  const result = await describe(row);
+  result.open = open(result.phase);
+  result.teams = publicTeams(teamsOf(row), result.phase, headers['x-team-id'], headers['x-team-token']);
+  result.max_audience_teams = 8;
+  result.audience_count = result.teams.filter(team => !team.house).length;
+  result.public_url = process.env.PUBLIC_URL;
+  if (hostView) result.public_url = headers['x-public-url'] ?? `https://${headers.host}`;
+  else {
+    delete result.execution_arn;
+    delete result.action_token;
+  }
+  return result;
+}
+
+async function changeTeam(request, action) {
+  const input = await body(request);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await initialized(), teams = teamsOf(row);
+    let reply;
+    if (action === 'join') {
+      const { team, token } = join(teams, row.phase.S, input.name);
+      teams.push(team);
+      reply = { id: team.id, token, run_id: row.run_id.S };
+    } else {
+      const team = pick(teams, row.phase.S, input);
+      teams[teams.findIndex(value => value.id === team.id)] = team;
+      reply = { saved: true };
+    }
+    if (await update('SET teams_data = :next',
+      'run_id = :id AND phase IN (:ready, :launching, :launch) AND teams_data = :before', {
+        ':next': s(JSON.stringify(teams)), ':id': row.run_id, ':before': row.teams_data,
+        ':ready': s('ready'), ':launching': s('launching'), ':launch': s('launch'),
+      })) return reply;
+  }
+  throw new ActionConflict();
+}
+
 async function route(request, response) {
   const { url, method, headers } = request;
+  const hostRoute = url === '/host' || url.startsWith('/api/host/') || /^\/api\/(launch|migrate|compare|reset)$/.test(url);
+  if (hostRoute) await authorize(headers);
+  if (method === 'GET' && url === '/api/host/qr.svg') {
+    const publicUrl = headers['x-public-url'] ?? `https://${headers.host}`;
+    return send(response, 200, 'image/svg+xml', await QRCode.toString(publicUrl, { type: 'svg', margin: 4 }));
+  }
   if (method === 'GET' && staticFiles.has(url)) return send(response, 200, ...staticFiles.get(url));
-  if (method === 'GET' && url === '/api/state') {
-    return json(response, 200, await describe(await recoverStart(await stored())));
+  if (method === 'GET' && ['/api/state', '/api/host/state'].includes(url)) {
+    return json(response, 200, await view(await recoverStart(await initialized()), headers, hostRoute));
+  }
+  if (method === 'POST' && ['/api/join', '/api/pick'].includes(url)) {
+    return json(response, 200, await changeTeam(request, url.slice(5)));
   }
   const action = url?.match(/^\/api\/(launch|migrate|compare|reset)$/)?.[1];
   if (method !== 'POST' || !action) return json(response, 404, { error: 'Not found' });
-  if (headers['x-rehearsal-action'] !== '1') return json(response, 403, { error: 'Use the rehearsal page to run an action.' });
-
+  if (headers['x-rehearsal-action'] !== '1') throw new RequestError(403, 'Use the presenter page');
+  if (Number(headers['content-length'] ?? 0) > 0 || headers['transfer-encoding']) throw new RequestError(413, 'Presenter actions have no body');
   const token = headers['x-rehearsal-run'];
-  const row = await stored();
+  const row = await initialized();
   if (action === 'launch') {
     await start(token, row);
   } else {
     const state = await describe(row);
     if (action === 'reset') {
-      if (token !== state.id || !terminal.has(state.phase)) throw new ActionConflict();
-      if (!await replace({ phase: s('ready'), run_id: s(id()) },
-        'run_id = :id AND phase = :phase', { ':id': row.run_id, ':phase': row.phase })) throw new ActionConflict();
+      if (token !== state.id || (!terminal.has(state.phase) && state.phase !== 'ready')) throw new ActionConflict();
+      if (!await replace(fresh(), 'run_id = :id AND phase = :phase',
+        { ':id': row.run_id, ':phase': row.phase })) throw new ActionConflict();
     } else {
       await resume(action, token, row, state);
     }
   }
-  return json(response, 200, await describe(await stored()));
+  return json(response, 200, await view(await stored(), headers, true));
 }
 
 const endpoint = process.env.AWS_LAMBDA_HTTP_ENDPOINT ?? 'localhost:3000';
@@ -257,6 +345,7 @@ if (!host || separator < 1 || !Number.isInteger(port) || port < 1 || port > 6553
 createServer((request, response) => {
   route(request, response).catch(error => {
     if (error instanceof ActionConflict) return json(response, 409, { error: error.message });
+    if (error instanceof RequestError) return json(response, error.status, { error: error.message });
     console.error('Arena request failed', request.headers['lambda-web-request-id'], error.name);
     return json(response, 503, { error: 'AWS could not confirm the saved stage. Refresh the rehearsal state.' });
   });

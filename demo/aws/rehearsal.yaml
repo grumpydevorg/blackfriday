@@ -1,6 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: BLACK FRIDAY AWS rehearsal (two real PHP migrations from one durable checkpoint).
 Parameters:
+  Prefix: {Type: String, Default: black-friday-round}
+  PresenterParameter: {Type: String, Default: /black-friday/round/presenter-key}
   ArtifactBucket: {Type: String}
   ImageKey: {Type: String}
   BaseImageVersion: {Type: String}
@@ -21,7 +23,7 @@ Resources:
   ImageLogs:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /aws/lambda-microvms/black-friday-shop
+      LogGroupName: !Sub '/aws/lambda-microvms/${Prefix}-shop'
       RetentionInDays: 7
   ImageBuildRole:
     Type: AWS::IAM::Role
@@ -46,7 +48,7 @@ Resources:
   ShopImage:
     Type: AWS::Lambda::MicrovmImage
     Properties:
-      Name: black-friday-shop
+      Name: !Sub '${Prefix}-shop'
       BaseImageArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:aws:microvm-image:al2023-1'
       BaseImageVersion: !Ref BaseImageVersion
       Description: Trusted PHP and PostgreSQL rehearsal runtime
@@ -66,7 +68,7 @@ Resources:
       Tags: [{Key: project, Value: black-friday-demo}]
   WorkerLogs:
     Type: AWS::Logs::LogGroup
-    Properties: {LogGroupName: /aws/lambda/black-friday-evaluator, RetentionInDays: 7}
+    Properties: {LogGroupName: !Sub '/aws/lambda/${Prefix}-evaluator', RetentionInDays: 7}
   WorkerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -99,7 +101,7 @@ Resources:
   Evaluator:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: black-friday-evaluator
+      FunctionName: !Sub '${Prefix}-evaluator'
       Architectures: [arm64]
       Runtime: python3.13
       Handler: evaluator.handler
@@ -114,7 +116,7 @@ Resources:
           RELEASE_ID: !Ref ReleaseId
       MemorySize: 512
       Timeout: 300
-      ReservedConcurrentExecutions: 4
+      ReservedConcurrentExecutions: 10
       Tags: [{Key: project, Value: black-friday-demo}]
   EvaluatorVersion:
     Type: AWS::Lambda::Version
@@ -122,7 +124,7 @@ Resources:
     Properties: {FunctionName: !Ref Evaluator, Description: !Ref ReleaseId}
   WorkflowLogs:
     Type: AWS::Logs::LogGroup
-    Properties: {LogGroupName: /aws/lambda/black-friday-workflow, RetentionInDays: 7}
+    Properties: {LogGroupName: !Sub '/aws/lambda/${Prefix}-workflow', RetentionInDays: 7}
   WorkflowRole:
     Type: AWS::IAM::Role
     Properties:
@@ -139,7 +141,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: [lambda:CheckpointDurableExecution, lambda:GetDurableExecutionState]
-                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:black-friday-workflow:*'
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${Prefix}-workflow:*'
               - Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource: !Sub '${Evaluator.Arn}:*'
@@ -152,7 +154,7 @@ Resources:
   Workflow:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: black-friday-workflow
+      FunctionName: !Sub '${Prefix}-workflow'
       Architectures: [arm64]
       Runtime: python3.13
       Handler: workflow.handler
@@ -199,6 +201,9 @@ Resources:
               - Effect: Allow
                 Action: [lambda:GetDurableExecution, lambda:SendDurableExecutionCallbackSuccess]
                 Resource: !Sub '${Workflow.Arn}:*/durable-execution/*'
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PresenterParameter}'
 Outputs:
   WebRole: {Value: !GetAtt WebRole.Arn}
   RunTable: {Value: !Ref Runs}

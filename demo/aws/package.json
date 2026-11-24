@@ -6,6 +6,8 @@
   "engines": {"node": ">=24"},
   "dependencies": {
     "@aws-sdk/client-dynamodb": "3.1175.0",
-    "@aws-sdk/client-lambda": "3.1175.0"
+    "@aws-sdk/client-lambda": "3.1175.0",
+    "@aws-sdk/client-ssm": "3.1175.0",
+    "qrcode": "1.5.4"
   }
 }
