@@ -58,11 +58,12 @@ request. The key never reaches a browser.
 `--tailnet` also publishes the presenter page at
 `https://<this Mac's MagicDNS name>:8443/host`, so the presenter can drive the
 round from a phone on the same tailnet. It runs `tailscale serve` (tailnet only,
-not Funnel) in the foreground, so the page disappears when `present` stops. A
-second loopback listener (port 8769) behind it accepts only requests that
-`serve` marks with the Mac owner's login; another person on the tailnet, a
-tagged device, or anything on the Mac calling 8769 directly gets 403. Without
-`--tailnet`, the page is on the laptop only.
+not Funnel) in the foreground, so the page disappears when `present` stops; the
+Mac must stay awake and online. A second loopback listener (port 8769) behind it
+accepts only requests that `serve` marks with the Mac owner's login, so another
+person on the tailnet or a tagged device gets 403, even where the tailnet policy
+lets them reach the Mac. A process on the Mac itself is trusted, as it already
+is for 8768. Without `--tailnet`, the page is on the laptop only.
 
 The page shows the public URL as text and a QR code, the teams and whether they
 have picked, the execution ARN, and three buttons:
