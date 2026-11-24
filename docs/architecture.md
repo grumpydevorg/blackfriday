@@ -58,9 +58,9 @@ Two deployments with the same shape and no shared resources (selected by
 ```mermaid
 flowchart LR
   Ph["Players' phones<br/>(join, pick, scoreboard)"] -->|"public HTTPS"| W
-  P["Presenter laptop<br/>operate.py present<br/>(localhost, adds the presenter key)"] -->|"HTTPS + key"| W
+  P["Presenter<br/>/host: passphrase sign-in on any device<br/>(or operate.py present, adds the key)"] -->|"HTTPS + cookie or key"| W
   W["Web Function<br/>black-friday-round<br/>(created by operate.py)"]
-  K[("SSM<br/>presenter key")] -.- W
+  K[("SSM<br/>presenter key + passphrase")] -.- W
   subgraph R["Stack BlackFridayRound"]
     D["Durable Function<br/>black-friday-round-workflow"]
     E["Event Function<br/>black-friday-round-evaluator"]
@@ -81,7 +81,7 @@ flowchart LR
 
 | Resource | Kind | Job | Limits |
 |:--|:--|:--|:--|
-| `black-friday-round` ([`operate.py`](../demo/aws/operate.py), [`web.mjs`](../demo/aws/web.mjs)) | Web Function, Node.js 24 | Player page, presenter page, API | Public endpoint (`ApplicationManaged`); presenter actions need the SSM key; 2 KiB bodies; at most 2 environments, 100 requests/s, 15 s timeout |
+| `black-friday-round` ([`operate.py`](../demo/aws/operate.py), [`web.mjs`](../demo/aws/web.mjs)) | Web Function, Node.js 24 | Player page, presenter page, API | Public endpoint (`ApplicationManaged`); presenter routes need a sign-in cookie or the SSM key; 10 failed sign-ins per 10 minutes; 2 KiB bodies; at most 10 environments, 100 requests/s, 15 s timeout |
 | `black-friday-round-workflow` ([`workflow.py`](../demo/aws/workflow.py)) | Durable Function | Launch → wait for Close → one migration per team → wait → one shopper check per team → scoreboard | 48 h execution, 23 h callbacks, 7-day history |
 | `black-friday-round-evaluator` ([`evaluator.py`](../demo/aws/evaluator.py)) | Event Function | Starts MicroVMs, drives the shop, checks orders and payments, scores the architecture, saves results | 512 MB, 300 s, at most 10 at once |
 | `black-friday-round-shop` | MicroVM image | PHP shop with SQLite or PostgreSQL 17 | ARM64, 1 GiB; each VM at most 120 s, no role |
@@ -192,11 +192,17 @@ rules in [`game.mjs`](../demo/aws/game.mjs)) serves two pages.
   team, pick a release and an architecture, watch the round, see the scoreboard.
   A team token kept on the phone guards its pick. Other teams' picks are hidden
   until the round closes.
-- **Presenter page** ([`host.html`](../demo/aws/host.html), key required): QR and
-  public URL, team list, execution ARN, three buttons, Open/Launch → Close and
-  deploy every release → Send the shoppers back, each resuming the paused Durable
-  round. Each action is bound to the current run, so a double-click cannot
-  advance it twice. Only these actions start compute.
+- **Presenter page** ([`host.html`](../demo/aws/host.html)): the page is public
+  but shows only a passphrase form until sign-in
+  ([`host_auth.mjs`](../demo/aws/host_auth.mjs)). The passphrase is Rick's own
+  (SSM SecureString, set with `operate.py passphrase`); the session cookie is an
+  HMAC keyed by the SSM presenter key over the current passphrase, so changing
+  either signs every device out. After sign-in: QR and public URL, team list,
+  execution ARN, three buttons, Open/Launch → Close and deploy every release →
+  Send the shoppers back, each resuming the paused Durable round. Each action is
+  bound to the current run, so a double-click cannot advance it twice. Only
+  these actions start compute. `operate.py present` (presenter key header)
+  remains as a second way in.
 
 Routes and rules: [AWS round and rehearsal](processes/aws-rehearsal.md#what-runs).
 The frozen rehearsal serves the older single presenter page,

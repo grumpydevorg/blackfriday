@@ -45,15 +45,46 @@ places are taken, or with the wrong team token.
 
 ## What the presenter does (round)
 
+**Sign in on the page itself.** Open `<public URL>/host` on a laptop or phone, no
+helper and no Tailscale. The page is public but holds no secret: until you sign
+in it shows only a passphrase form. After sign-in it shows the buttons, QR, team
+list and execution ARN. The cookie lasts 12 hours (`HttpOnly`, `Secure`,
+`SameSite=Strict`); **Sign out** clears it.
+
+Set your own passphrase once (at least 12 characters), before the talk:
+
 ```sh
 cd demo
 export BLACK_FRIDAY_AWS_ACCOUNT=<12-digit account id> BLACK_FRIDAY_AWS_PROFILE=<AWS CLI profile>
+BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py passphrase
+```
+
+It asks twice with no echo (or reads one line from stdin when piped), stores it
+as the SSM SecureString `/black-friday/round/presenter-passphrase`, and confirms
+with the new parameter version, never the value. Console fallback: Systems
+Manager → Parameter Store → `/black-friday/round/presenter-passphrase` → Edit →
+SecureString value (at least 12 characters). Changing it signs every device out
+within 30 seconds: each cookie is an HMAC over its expiry, keyed by the SSM
+presenter key over the current passphrase, so neither secret is in it. Until a
+passphrase exists, sign-in answers 503 and presenter routes stay 403.
+
+Sign-in is throttled across all of the Web Function's environments: ten failed
+attempts in ten minutes, then every sign-in gets 429 until the window passes.
+Successful sign-ins do not count. Presenter POSTs also need the
+`X-Rehearsal-Action: 1` header, the current run token and, when the browser sends
+one, an `Origin` equal to the endpoint's own origin.
+
+**The helper still works, as a second way in.** Either a valid cookie or the
+presenter key authorises presenter routes:
+
+```sh
 BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py present --tailnet
 ```
 
 `present` reads the presenter key from SSM (`/black-friday/round/presenter-key`)
 and runs a loopback proxy at <http://127.0.0.1:8768/host> that adds it to every
-request. The key never reaches a browser.
+request. The key never reaches a browser. (The key is also the MAC secret of the
+cookie.)
 
 `--tailnet` also publishes the presenter page at
 `https://<this Mac's MagicDNS name>:8443/host`, so the presenter can drive the
@@ -91,7 +122,7 @@ return chance) − migration cost (A 200, B 100). Details: [game.md](../game.md#
 ```mermaid
 flowchart LR
   Ph[Players' phones] -->|public HTTPS| W[Web Function]
-  P[Presenter laptop: present, adds key] -->|public HTTPS + key| W
+  P[Presenter: passphrase cookie, or the helper adds the key] -->|public HTTPS| W
   W -->|start or callback| D[Durable Function: one round]
   D -->|publish stage| T[(DynamoDB: round state)]
   W -->|read stage| T
@@ -109,9 +140,10 @@ there is no idle RDS instance. The image runs only trusted organiser code: it
 has no execution role, but has internet egress for a short-lived, object-scoped
 payment PUT. It is **not** a sandbox for arbitrary uploads.
 
-Public routes: `GET /`, `/round.js`, `/round.css`, `/art/cloud-surge.png`,
-`/api/state`; `POST /api/join`, `/api/pick`. Presenter routes (key required,
-otherwise 403): `GET /host`, `/api/host/state`, `/api/host/qr.svg`;
+Public routes: `GET /`, `/host` (the page only), `/round.js`, `/round.css`,
+`/art/cloud-surge.png`, `/api/state`; `POST /api/join`, `/api/pick`,
+`/api/host/login`, `/api/host/logout`. Presenter routes (a valid cookie or the
+presenter key, otherwise 403): `GET /api/host/state`, `/api/host/qr.svg`;
 `POST /api/launch`, `/api/migrate`, `/api/compare`, `/api/reset`. Only presenter
 routes start compute.
 
@@ -186,7 +218,9 @@ CloudFormation does not own it, then the stacks. Without `--artifacts` it keeps
 the artifacts stack and its bucket, with the packages and run evidence. With it,
 the stack goes before the bucket it retains, then the bucket is found by name
 and emptied, so a re-run finishes an interrupted teardown. It never touches the
-other deployment. The round's presenter key stays in SSM.
+other deployment. The round's presenter key and passphrase stay in SSM
+(`aws ssm delete-parameter --name /black-friday/round/presenter-passphrase` removes
+the passphrase; the sign-in then answers 503).
 
 Managed Instances is not part of either deployment. See
 [On-demand vs Managed Instances](launch-wave.md#on-demand-vs-managed-instances).

@@ -3,6 +3,7 @@ Description: BLACK FRIDAY AWS rehearsal (two real PHP migrations from one durabl
 Parameters:
   Prefix: {Type: String, Default: black-friday-round}
   PresenterParameter: {Type: String, Default: /black-friday/round/presenter-key}
+  PassphraseParameter: {Type: String, Default: /black-friday/round/presenter-passphrase}
   ArtifactBucket: {Type: String}
   ImageKey: {Type: String}
   BaseImageVersion: {Type: String}
@@ -202,8 +203,19 @@ Resources:
                 Action: [lambda:GetDurableExecution, lambda:SendDurableExecutionCallbackSuccess]
                 Resource: !Sub '${Workflow.Arn}:*/durable-execution/*'
               - Effect: Allow
-                Action: ssm:GetParameter
-                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PresenterParameter}'
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PresenterParameter}'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PassphraseParameter}'
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+                    kms:EncryptionContext:PARAMETER_ARN:
+                      - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PresenterParameter}'
+                      - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PassphraseParameter}'
 Outputs:
   WebRole: {Value: !GetAtt WebRole.Arn}
   RunTable: {Value: !Ref Runs}

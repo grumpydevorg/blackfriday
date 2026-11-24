@@ -9,8 +9,9 @@ import {
   ListDurableExecutionsByFunctionCommand,
   SendDurableExecutionCallbackSuccessCommand,
 } from '@aws-sdk/client-lambda';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
-import { RequestError, presenter, houses, join, pick, frozen, publicTeams, open } from './game.mjs';
+import { SSMClient, GetParametersCommand } from '@aws-sdk/client-ssm';
+import { RequestError, houses, join, pick, frozen, publicTeams, open } from './game.mjs';
+import { presenterAuth, routeKind, MAX_FAILURES, WINDOW_MS } from './host_auth.mjs';
 import QRCode from 'qrcode';
 
 const { RUN_TABLE: table, WORKFLOW_ARN: workflow } = process.env;
@@ -32,13 +33,47 @@ const staticFiles = new Map([
   ['/round.css', ['text/css; charset=utf-8', readFileSync(new URL('./round.css', import.meta.url))]],
   ['/art/cloud-surge.png', ['image/png', readFileSync(new URL('./art/cloud-surge.png', import.meta.url))]],
 ]);
-let secret;
-async function authorize(headers) {
-  if (!headers['x-presenter-key']) throw new RequestError(403, 'Presenter key required');
-  secret ??= new SSMClient({}).send(new GetParameterCommand({ Name: process.env.PRESENTER_PARAMETER, WithDecryption: true }))
-    .then(result => result.Parameter.Value).catch(error => { secret = undefined; throw error; });
-  presenter(headers['x-presenter-key'], await secret);
+const loginKey = { pk: { S: 'login' } };
+// At most MAX_FAILURES failed sign-ins per window across every environment: each attempt
+// reserves a slot before the passphrase is compared and a success hands it back.
+const throttle = {
+  async reserve(now) {
+    const cutoff = now - WINDOW_MS;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (await conditional(new UpdateItemCommand({
+        TableName: table, Key: loginKey, UpdateExpression: 'SET window_start = :now, failures = :one',
+        ConditionExpression: 'attribute_not_exists(window_start) OR window_start <= :cutoff',
+        ExpressionAttributeValues: { ':now': n(now), ':one': n(1), ':cutoff': n(cutoff) },
+      }))) return true;
+      if (await conditional(new UpdateItemCommand({
+        TableName: table, Key: loginKey, UpdateExpression: 'ADD failures :one',
+        ConditionExpression: 'window_start > :cutoff AND failures < :max',
+        ExpressionAttributeValues: { ':one': n(1), ':cutoff': n(cutoff), ':max': n(MAX_FAILURES) },
+      }))) return true;
+      const { Item } = await db.send(new GetItemCommand({ TableName: table, Key: loginKey, ConsistentRead: true }));
+      if (Item && Number(Item.window_start.N) > cutoff && Number(Item.failures.N) >= MAX_FAILURES) return false;
+    }
+    return false;
+  },
+  release(now) {
+    return conditional(new UpdateItemCommand({
+      TableName: table, Key: loginKey, UpdateExpression: 'ADD failures :minus',
+      ConditionExpression: 'window_start > :cutoff AND failures > :zero',
+      ExpressionAttributeValues: { ':minus': n(-1), ':cutoff': n(now - WINDOW_MS), ':zero': n(0) },
+    }));
+  },
+};
+const ssm = new SSMClient({});
+async function loadSecrets() {
+  const names = [process.env.PRESENTER_PARAMETER, process.env.PASSPHRASE_PARAMETER];
+  const { Parameters = [] } = await ssm.send(new GetParametersCommand({ Names: names, WithDecryption: true }));
+  const value = name => Parameters.find(parameter => parameter.Name === name)?.Value;
+  return { key: value(names[0]), passphrase: value(names[1]) };
 }
+const auth = presenterAuth({
+  load: loadSecrets, throttle, origin: process.env.PUBLIC_HOST && `https://${process.env.PUBLIC_HOST}`,
+});
+const publicUrl = headers => auth.publicOrigin({ host: headers['x-public-url']?.replace(/^https:\/\//, '') ?? headers.host });
 const fresh = () => ({ phase: s('ready'), run_id: s(id()), teams_data: s(JSON.stringify(houses())) });
 const teamsOf = row => JSON.parse(row.teams_data.S);
 async function initialized() {
@@ -234,16 +269,16 @@ async function resume(action, token, row, state) {
     'run_id = :id AND callback_id = :callback AND phase = :busy AND lease_until = :lease', values);
 }
 
-function send(response, code, type, body) {
+function send(response, code, type, body, extra = {}) {
   response.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', ...extra,
     'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   });
   response.end(body);
 }
 
-function json(response, code, body) {
-  send(response, code, 'application/json; charset=utf-8', JSON.stringify(body));
+function json(response, code, body, extra) {
+  send(response, code, 'application/json; charset=utf-8', JSON.stringify(body), extra);
 }
 
 async function body(request) {
@@ -268,7 +303,7 @@ async function view(row, headers, hostView = false) {
   result.max_audience_teams = 8;
   result.audience_count = result.teams.filter(team => !team.house).length;
   result.public_url = process.env.PUBLIC_URL;
-  if (hostView) result.public_url = headers['x-public-url'] ?? `https://${headers.host}`;
+  if (hostView) result.public_url = publicUrl(headers);
   else {
     delete result.execution_arn;
     delete result.action_token;
@@ -301,22 +336,30 @@ async function changeTeam(request, action) {
 
 async function route(request, response) {
   const { url, method, headers } = request;
-  const hostRoute = url === '/host' || url.startsWith('/api/host/') || /^\/api\/(launch|migrate|compare|reset)$/.test(url);
-  if (hostRoute) await authorize(headers);
+  const kind = routeKind(method, url);
+  const presenterRoute = kind === 'presenter';
+  if (kind === 'login') {
+    auth.checkOrigin(headers);
+    const cookie = await auth.login((await body(request)).passphrase);
+    return json(response, 200, { signed_in: true }, { 'Set-Cookie': cookie });
+  }
+  if (kind === 'logout') {
+    auth.checkOrigin(headers);
+    return json(response, 200, { signed_in: false }, { 'Set-Cookie': auth.logout() });
+  }
+  if (presenterRoute) await auth.authorize(headers, method);
   if (method === 'GET' && url === '/api/host/qr.svg') {
-    const publicUrl = headers['x-public-url'] ?? `https://${headers.host}`;
-    return send(response, 200, 'image/svg+xml', await QRCode.toString(publicUrl, { type: 'svg', margin: 4 }));
+    return send(response, 200, 'image/svg+xml', await QRCode.toString(publicUrl(headers), { type: 'svg', margin: 4 }));
   }
   if (method === 'GET' && staticFiles.has(url)) return send(response, 200, ...staticFiles.get(url));
   if (method === 'GET' && ['/api/state', '/api/host/state'].includes(url)) {
-    return json(response, 200, await view(await recoverStart(await initialized()), headers, hostRoute));
+    return json(response, 200, await view(await recoverStart(await initialized()), headers, presenterRoute));
   }
   if (method === 'POST' && ['/api/join', '/api/pick'].includes(url)) {
     return json(response, 200, await changeTeam(request, url.slice(5)));
   }
   const action = url?.match(/^\/api\/(launch|migrate|compare|reset)$/)?.[1];
   if (method !== 'POST' || !action) return json(response, 404, { error: 'Not found' });
-  if (headers['x-rehearsal-action'] !== '1') throw new RequestError(403, 'Use the presenter page');
   if (Number(headers['content-length'] ?? 0) > 0 || headers['transfer-encoding']) throw new RequestError(413, 'Presenter actions have no body');
   const token = headers['x-rehearsal-run'];
   const row = await initialized();

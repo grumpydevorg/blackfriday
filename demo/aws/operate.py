@@ -5,6 +5,7 @@
 """Package, deploy and open the private BLACK FRIDAY rehearsal."""
 
 import argparse
+import getpass
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,6 +48,7 @@ STACK = 'BlackFridayRehearsal' if DEPLOYMENT == 'rehearsal' else 'BlackFridayRou
 ARTIFACTS = STACK + 'Artifacts'
 WEB_FUNCTION = 'black-friday-arena' if DEPLOYMENT == 'rehearsal' else 'black-friday-round'
 PRESENTER_PARAMETER = '/black-friday/round/presenter-key'
+PASSPHRASE_PARAMETER = '/black-friday/round/presenter-passphrase'
 WEB_ENDPOINT = 'stage'
 TAILSCALE = shutil.which('tailscale') or '/usr/local/bin/tailscale'  # macOS app CLI is not always on PATH
 TAILNET_PORT = 8443
@@ -141,7 +144,9 @@ def packages(out: Path) -> dict[str, tuple[str, Path]]:
             }, {'': root / 'sdk'}),
             'web': ({
                 'index.mjs': AWS_DIR / 'web.mjs',
-                **{name: AWS_DIR / name for name in ('game.mjs', 'player.html', 'host.html', 'round.js', 'round.css')},
+                **{name: AWS_DIR / name for name in (
+                    'game.mjs', 'host_auth.mjs', 'player.html', 'host.html', 'round.js', 'round.css',
+                )},
                 'art/cloud-surge.png': DEMO.parent / 'assets' / 'cloud-surge.png',
             }, {'node_modules/': web / 'node_modules'}),
         }
@@ -210,40 +215,46 @@ def deploy_web(session, bucket: str, key: str) -> str:
         'codeConfig': {'s3Object': {'bucket': bucket, 'key': key, 'versionId': version}},
         'runtimeConfig': {'runtime': 'nodejs24.x'},
     }
-    service = {
-        'executionRoleArn': outputs['WebRole'], 'timeoutSeconds': 15, 'maxConcurrencyPerEnvironment': 8,
-        'environmentVariables': {
-            'AWS_LAMBDA_NODEJS_ENTRYPOINT': 'index.mjs',
-            'RUN_TABLE': outputs['RunTable'], 'WORKFLOW_ARN': outputs['WorkflowVersion'],
-            'PRESENTER_PARAMETER': PRESENTER_PARAMETER,
-        },
-    }
+
+    def service_config(domain: str | None) -> dict:
+        # The page's own origin, for the Origin check and the QR code. Known only once the endpoint exists.
+        return {
+            'executionRoleArn': outputs['WebRole'], 'timeoutSeconds': 15, 'maxConcurrencyPerEnvironment': 8,
+            'environmentVariables': {
+                'AWS_LAMBDA_NODEJS_ENTRYPOINT': 'index.mjs',
+                'RUN_TABLE': outputs['RunTable'], 'WORKFLOW_ARN': outputs['WorkflowVersion'],
+                'PRESENTER_PARAMETER': PRESENTER_PARAMETER, 'PASSPHRASE_PARAMETER': PASSPHRASE_PARAMETER,
+                **({'PUBLIC_HOST': domain} if domain else {}),
+            },
+        }
+
     web = session.client('lambda-web')
     try:
         current = web.get_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
     except web.exceptions.ResourceNotFoundException:
         created = web.create_web_function(
             functionName=WEB_FUNCTION, tags={'project': 'black-friday-demo'},
-            revisionConfig={'buildConfig': build, 'serviceConfig': service},
+            revisionConfig={'buildConfig': build, 'serviceConfig': service_config(None)},
             endpointConfig={
                 'endpointName': WEB_ENDPOINT, 'endpointType': 'HomeRegion', 'authType': 'ApplicationManaged',
                 'autoDeploymentMode': 'Disabled', **ENDPOINT_LIMITS,
             },
         )
         wait_web(web, revision=created['revision']['revisionId'])
-    else:
-        live = web.get_web_function_revision(functionName=WEB_FUNCTION, revisionId=current['revisionWeights'][0]['revisionId'])
-        same = (
-            live['buildConfig']['codeConfig']['s3Object'] == build['codeConfig']['s3Object']
-            and {name: live['serviceConfig'].get(name) for name in service} == service
-        )
-        update = {} if same else {'revisionWeights': [{'revisionId': web.create_web_function_revision(
-            functionName=WEB_FUNCTION, buildConfig=build, serviceConfig=service)['revisionId'], 'weight': 100}]}
-        if update:
-            wait_web(web, revision=update['revisionWeights'][0]['revisionId'])
-        update.update({name: value for name, value in ENDPOINT_LIMITS.items() if current.get(name) != value})
-        if update:
-            web.update_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT, **update)
+        current = wait_web(web, endpoint=True)
+    service = service_config(current['domainName'])
+    live = web.get_web_function_revision(functionName=WEB_FUNCTION, revisionId=current['revisionWeights'][0]['revisionId'])
+    same = (
+        live['buildConfig']['codeConfig']['s3Object'] == build['codeConfig']['s3Object']
+        and {name: live['serviceConfig'].get(name) for name in service} == service
+    )
+    update = {} if same else {'revisionWeights': [{'revisionId': web.create_web_function_revision(
+        functionName=WEB_FUNCTION, buildConfig=build, serviceConfig=service)['revisionId'], 'weight': 100}]}
+    if update:
+        wait_web(web, revision=update['revisionWeights'][0]['revisionId'])
+    update.update({name: value for name, value in ENDPOINT_LIMITS.items() if current.get(name) != value})
+    if update:
+        web.update_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT, **update)
     return 'https://' + wait_web(web, endpoint=True)['domainName']
 
 
@@ -323,6 +334,28 @@ def destroy(*, artifacts: bool = False) -> None:
         print(f'Deleted bucket {name}', flush=True)
 
 
+def passphrase() -> None:
+    """Set the presenter's own passphrase. It is read from a prompt or stdin and never printed."""
+    if DEPLOYMENT != 'round':
+        raise SystemExit('Only the round has a presenter passphrase (BLACK_FRIDAY_DEPLOYMENT=round)')
+    if sys.stdin.isatty():
+        value = getpass.getpass('Presenter passphrase (at least 12 characters): ')
+        if value != getpass.getpass('Again: '):
+            raise SystemExit('The two entries differ; nothing changed')
+    else:
+        value = sys.stdin.readline().rstrip('\r\n')
+    if len(value) < 12:
+        raise SystemExit('The passphrase needs at least 12 characters; nothing changed')
+    session = account_session()
+    ssm = session.client('ssm')
+    ssm.put_parameter(Name=PASSPHRASE_PARAMETER, Value=value, Type='SecureString', Overwrite=True)
+    # describe_parameters returns metadata only, never the value.
+    [item] = ssm.describe_parameters(ParameterFilters=[
+        {'Key': 'Name', 'Option': 'Equals', 'Values': [PASSPHRASE_PARAMETER]},
+    ])['Parameters']
+    print(f'Presenter passphrase updated (version {item["Version"]}); devices sign in again within 30 s', flush=True)
+
+
 def deploy(*, keep_failed: bool = False) -> None:
     session = account_session()
     if DEPLOYMENT == 'rehearsal':
@@ -348,6 +381,7 @@ def deploy(*, keep_failed: bool = False) -> None:
             'rehearsal.yaml', STACK, keep_failed=keep_failed, ArtifactBucket=bucket,
             BaseImageVersion=base_version, ReleaseId=release, Prefix=WEB_FUNCTION,
             PresenterParameter=PRESENTER_PARAMETER,
+            PassphraseParameter=PASSPHRASE_PARAMETER,
             **{f'{kind.title()}Key': key for kind, (key, _) in artifacts.items() if kind != 'web'},
         )
     url = deploy_web(session, bucket, artifacts['web'][0])
@@ -499,12 +533,15 @@ def main() -> None:
     stage.add_argument('--port', type=int, default=8767 if DEPLOYMENT == 'rehearsal' else 8768)
     stage.add_argument('--tailnet', action='store_true',
                        help="Also publish the presenter page on this Mac's tailnet name, for its owner only")
+    commands.add_parser('passphrase', help="Set the round's presenter passphrase (prompt, or stdin when piped)")
     teardown = commands.add_parser('destroy', help='Delete only the selected deployment')
     teardown.add_argument('--artifacts', action='store_true',
                           help='Also delete the artifact bucket (all versions) and its stack')
     args = parser.parse_args()
     if args.command == 'deploy':
         deploy(keep_failed=args.keep_failed)
+    elif args.command == 'passphrase':
+        passphrase()
     elif args.command == 'present':
         present(args.port, args.tailnet)
     elif args.command == 'destroy':

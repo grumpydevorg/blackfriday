@@ -6,9 +6,6 @@ export class RequestError extends Error {
 }
 export const digest = value => createHash('sha256').update(value ?? '').digest('hex');
 export const equal = (left, right) => timingSafeEqual(Buffer.from(digest(left)), Buffer.from(digest(right)));
-export function presenter(supplied, secret) {
-  if (!secret || !equal(supplied, secret)) throw new RequestError(403, 'Presenter key required');
-}
 export const defaultPick = () => ({ release: 'A', kind: 'preserve', architecture: { storage: 'small', replicas: 1, cache: false } });
 export const houses = () => ['A', 'B'].map(release => ({
   id: `house${release.toLowerCase()}`, name: `House ${release}`, house: true, picked: true,

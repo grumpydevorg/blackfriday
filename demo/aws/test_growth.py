@@ -54,13 +54,11 @@ def test_picks_need_token_are_private_and_freeze_at_close():
     """)
 
 
-def test_presenter_key_is_required_and_never_public():
+def test_public_team_list_never_carries_tokens():
     javascript("""
       import assert from 'node:assert/strict';
-      import { presenter, publicTeams, houses } from './game.mjs';
-      for(const key of [undefined,'','wrong']) assert.throws(()=>presenter(key,'secret'),e=>e.status===403);
-      presenter('secret','secret');
-      assert.ok(!JSON.stringify(publicTeams(houses(),'ready')).includes('token'));
+      import { publicTeams, houses } from './game.mjs';
+      assert.ok(!JSON.stringify(publicTeams(houses(), 'ready')).includes('token'));
     """)
 
 

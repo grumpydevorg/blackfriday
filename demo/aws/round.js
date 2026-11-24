@@ -25,7 +25,11 @@ async function api(path, input, action = false) {
     await new Promise(resolve => setTimeout(resolve, 300 * attempt + Math.random() * 300));
   }
   const data = (response.headers.get('content-type') ?? '').includes('json') ? await response.json() : {};
-  if (!response.ok) throw new Error(data.error || (response.status === 429 ? 'Busy, try again' : `HTTP ${response.status}`));
+  if (!response.ok) {
+    const failure = new Error(data.error || (response.status === 429 ? 'Busy, try again' : `HTTP ${response.status}`));
+    failure.status = response.status;
+    throw failure;
+  }
   return data;
 }
 function score(row) {
@@ -81,11 +85,38 @@ function render(state) {
   $('own-result').hidden = !own;
   if (own) $('own-result').replaceChildren(make('h2', `Your result · #${own.rank}`), make('p', `${own.name} · ${money(own.cumulative_cents)} profit`));
 }
+function signedOut() {
+  $('panel').hidden = true;
+  $('signin').hidden = false;
+}
 async function refresh() {
   if (pending) return;
-  try { render(await api(host ? 'host/state' : 'state')); } catch (error) { $('error').textContent = error.message; }
+  try {
+    render(await api(host ? 'host/state' : 'state'));
+    if (host) {
+      $('signin').hidden = true;
+      $('panel').hidden = false;
+      if (!$('qr').getAttribute('src')) $('qr').src = '/api/host/qr.svg';
+    }
+  } catch (error) {
+    if (host && error.status === 403) signedOut();
+    else $('error').textContent = error.message;
+  }
 }
 if (host) {
+  $('login').addEventListener('submit', async event => {
+    event.preventDefault(); if (pending) return; pending = true; $('login-error').textContent = '';
+    try {
+      await api('host/login', { passphrase: $('passphrase').value });
+      $('passphrase').value = '';
+    } catch (error) { $('login-error').textContent = error.message; }
+    finally { pending = false; await refresh(); }
+  });
+  $('logout').addEventListener('click', async () => {
+    try { await api('host/logout', {}); } catch (error) { $('error').textContent = error.message; }
+    $('qr').removeAttribute('src');
+    signedOut();
+  });
   for (const action of ['launch', 'migrate', 'compare', 'reset']) $(action).addEventListener('click', async () => {
     if (pending) return;
     pending = true; $('error').textContent = ''; $(action).disabled = true;
