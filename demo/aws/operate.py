@@ -10,11 +10,13 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import subprocess
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Thread
 from time import sleep
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -45,6 +47,8 @@ ARTIFACTS = STACK + 'Artifacts'
 WEB_FUNCTION = 'black-friday-arena' if DEPLOYMENT == 'rehearsal' else 'black-friday-round'
 PRESENTER_PARAMETER = '/black-friday/round/presenter-key'
 WEB_ENDPOINT = 'stage'
+TAILSCALE = shutil.which('tailscale') or '/usr/local/bin/tailscale'  # macOS app CLI is not always on PATH
+TAILNET_PORT = 8443
 LOGGER = logging.getLogger(__name__)
 
 
@@ -360,7 +364,16 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def present(port: int) -> None:
+def tailnet_identity() -> tuple[str, str]:
+    """This Mac's MagicDNS name and its owner's login, from the local tailscaled."""
+    status = json.loads(subprocess.run(
+        [TAILSCALE, 'status', '--self', '--json'], check=True, capture_output=True, text=True,
+    ).stdout)
+    me = status['Self']
+    return me['DNSName'].rstrip('.'), status['User'][str(me['UserID'])]['LoginName']
+
+
+def present(port: int, tailnet: bool = False) -> None:
     session = account_session()
     endpoint = stage_url(session)
     if not re.fullmatch(rf'https://[a-z0-9.-]+\.lambda-web\.{re.escape(REGION)}\.on\.aws', endpoint):
@@ -369,21 +382,28 @@ def present(port: int) -> None:
     presenter_key = None if credentials else session.client('ssm').get_parameter(
         Name=PRESENTER_PARAMETER, WithDecryption=True,
     )['Parameter']['Value']
-    allowed_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
+    local_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
     allowed_get = {'/', '/api/state', '/art/cloud-surge.png', '/host', '/api/host/state', '/api/host/qr.svg', '/round.js', '/round.css'}
     allowed_post = {f'/api/{action}' for action in ('launch', 'migrate', 'compare', 'reset')}
     http = build_opener(NoRedirect)
 
-    class Proxy(BaseHTTPRequestHandler):
+    def proxy(allowed_hosts: set[str], origin: str | None, login: str | None) -> type[BaseHTTPRequestHandler]:
+      class Proxy(BaseHTTPRequestHandler):
         def forward(self) -> None:
             host = self.headers.get('Host', '')
+            # tailscale serve sets Tailscale-User-Login itself and drops any copy a
+            # client sends; tagged devices get none. So only the owner passes.
+            if login is not None and self.headers.get('Tailscale-User-Login') != login:
+                self.send_error(403)
+                return
             if host not in allowed_hosts or self.headers.get('Sec-Fetch-Site') not in (None, 'same-origin', 'none'):
                 self.send_error(403)
                 return
             if self.command == 'POST':
+                expected = origin or f'http://{host}'
                 if (
                     self.path not in allowed_post or self.headers.get('X-Rehearsal-Action') != '1'
-                    or self.headers.get('Origin', f'http://{host}') != f'http://{host}'
+                    or self.headers.get('Origin', expected) != expected
                     or self.headers.get('Content-Length', '0') != '0'
                     or self.headers.get('Transfer-Encoding') is not None
                 ):
@@ -432,13 +452,40 @@ def present(port: int) -> None:
         do_GET = forward
         do_POST = forward
 
-    with ThreadingHTTPServer(('127.0.0.1', port), Proxy) as server:
-        path = '/' if DEPLOYMENT == 'rehearsal' else '/host'
+        def log_message(self, format: str, *args) -> None:
+            if login is not None:
+                super().log_message(format, *args)
+      return Proxy
+
+    path = '/' if DEPLOYMENT == 'rehearsal' else '/host'
+    with ThreadingHTTPServer(('127.0.0.1', port), proxy(local_hosts, None, None)) as server:
         print(f'Open http://127.0.0.1:{port}{path} · the arena is served by {endpoint}', flush=True)
+        serve = None
+        if tailnet:
+            name, login = tailnet_identity()
+            # 443 is taken on this Mac's tailnet address outside the serve config; 8443 is free.
+            public = f'https://{name}:{TAILNET_PORT}'
+            remote = ThreadingHTTPServer(
+                ('127.0.0.1', port + 1), proxy({f'{name}:{TAILNET_PORT}', name, f'127.0.0.1:{port + 1}'}, public, login),
+            )
+            Thread(target=remote.serve_forever, daemon=True).start()
+            # Foreground serve: published only while this process runs, tailnet only (not Funnel).
+            serve = subprocess.Popen(
+                [TAILSCALE, 'serve', f'--https={TAILNET_PORT}', f'http://127.0.0.1:{port + 1}'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+            sleep(3)
+            if serve.poll() is not None:
+                raise SystemExit(f'tailscale serve failed: {serve.stderr.read().strip()}')
+            print(f'Tailnet: {public}{path} · only {login}', flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            if serve is not None:
+                serve.terminate()
+                serve.wait(timeout=10)
 
 
 def main() -> None:
@@ -450,6 +497,8 @@ def main() -> None:
     deploy_command.add_argument('--keep-failed', action='store_true', help='Preserve failed stack resources for diagnosis')
     stage = commands.add_parser('present', help='Proxy to the selected deployment (IAM rehearsal, keyed round)')
     stage.add_argument('--port', type=int, default=8767 if DEPLOYMENT == 'rehearsal' else 8768)
+    stage.add_argument('--tailnet', action='store_true',
+                       help="Also publish the presenter page on this Mac's tailnet name, for its owner only")
     teardown = commands.add_parser('destroy', help='Delete only the selected deployment')
     teardown.add_argument('--artifacts', action='store_true',
                           help='Also delete the artifact bucket (all versions) and its stack')
@@ -457,7 +506,7 @@ def main() -> None:
     if args.command == 'deploy':
         deploy(keep_failed=args.keep_failed)
     elif args.command == 'present':
-        present(args.port)
+        present(args.port, args.tailnet)
     elif args.command == 'destroy':
         destroy(artifacts=args.artifacts)
     else:

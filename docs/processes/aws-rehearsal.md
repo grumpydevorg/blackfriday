@@ -48,14 +48,24 @@ places are taken, or with the wrong team token.
 ```sh
 cd demo
 export BLACK_FRIDAY_AWS_ACCOUNT=<12-digit account id> BLACK_FRIDAY_AWS_PROFILE=<AWS CLI profile>
-BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py present
+BLACK_FRIDAY_DEPLOYMENT=round uv run aws/operate.py present --tailnet
 ```
 
 `present` reads the presenter key from SSM (`/black-friday/round/presenter-key`)
 and runs a loopback proxy at <http://127.0.0.1:8768/host> that adds it to every
-request. The key never reaches a browser. The page shows the public URL as text
-and a QR code, the teams and whether they have picked, the execution ARN, and
-three buttons:
+request. The key never reaches a browser.
+
+`--tailnet` also publishes the presenter page at
+`https://<this Mac's MagicDNS name>:8443/host`, so the presenter can drive the
+round from a phone on the same tailnet. It runs `tailscale serve` (tailnet only,
+not Funnel) in the foreground, so the page disappears when `present` stops. A
+second loopback listener (port 8769) behind it accepts only requests that
+`serve` marks with the Mac owner's login; another person on the tailnet, a
+tagged device, or anything on the Mac calling 8769 directly gets 403. Without
+`--tailnet`, the page is on the laptop only.
+
+The page shows the public URL as text and a QR code, the teams and whether they
+have picked, the execution ARN, and three buttons:
 
 1. **Open round / Run Launch.** Starts the version-pinned Durable execution.
    Launch runs once, for everyone. Players can join from the moment the round
