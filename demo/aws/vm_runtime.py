@@ -130,14 +130,18 @@ class Runtime:
         self.shop = subprocess.Popen(
             ['php', '-S', '127.0.0.1:8081', 'shop.php'], cwd=APP, env=self.env,
         )
-        deadline = monotonic() + 3
+        # Was 3 s. On 24 Nov 2026 PHP in a fresh Sydney MicroVM was not listening
+        # within 3 s (ConnectionRefusedError), though it had been at 17:07 that day.
+        started = monotonic()
+        deadline = started + 20
         while True:
             if self.shop.poll() is not None:
-                raise RuntimeError('PHP shop exited before readiness')
+                raise RuntimeError(f'PHP shop exited before readiness with code {self.shop.returncode}')
             try:
                 status, _, _ = shop_request('GET', '/health')
                 if status != 200:
                     raise RuntimeError('PHP shop could not read the database')
+                print(f'PHP shop ready in {monotonic() - started:.2f} s', flush=True)
                 return
             except ConnectionRefusedError:
                 if monotonic() >= deadline:
