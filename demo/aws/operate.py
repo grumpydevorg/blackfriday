@@ -322,7 +322,7 @@ def destroy(*, artifacts: bool = False) -> None:
 def deploy(*, keep_failed: bool = False) -> None:
     session = account_session()
     if DEPLOYMENT == 'rehearsal':
-        raise SystemExit('The rehearsal is frozen. Deploy it from tag rehearsal-fallback-2026-11-24; use BLACK_FRIDAY_DEPLOYMENT=round for the audience round.')
+        raise SystemExit('The rehearsal is frozen. Deploy it from tag rehearsal-fallback-2026-11-24b; use BLACK_FRIDAY_DEPLOYMENT=round for the audience round.')
     ssm = session.client('ssm')
     try:
         ssm.get_parameter(Name=PRESENTER_PARAMETER)

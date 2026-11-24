@@ -53,7 +53,7 @@ load balancer, VPC or NAT gateway.
 Two deployments with the same shape and no shared resources (selected by
 `BLACK_FRIDAY_DEPLOYMENT`): the **round**, a public game for an audience, and the
 **rehearsal**, its frozen IAM-only predecessor kept as a fallback (tag
-`rehearsal-fallback-2026-11-24`). The round:
+`rehearsal-fallback-2026-11-24b`). The round:
 
 ```mermaid
 flowchart LR

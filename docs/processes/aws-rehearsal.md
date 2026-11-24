@@ -10,7 +10,7 @@ Two separate deployments run the same story in Sydney (`ap-southeast-2`):
 Select one with `BLACK_FRIDAY_DEPLOYMENT=round` or `rehearsal` (the default).
 They share no stacks, functions, tables or Web Function, so one can change or
 be torn down without touching the other. The rehearsal is frozen at tag
-`rehearsal-fallback-2026-11-24`; the [local demo](local-play.md) needs no AWS
+`rehearsal-fallback-2026-11-24b`; the [local demo](local-play.md) needs no AWS
 account and is the last fallback.
 
 **The story.** In Launch, the unchanged PHP/SQLite shop sells a mug in a real
@@ -143,8 +143,8 @@ The rehearsal (`BlackFridayRehearsal`, `BlackFridayRehearsalArtifacts`,
 from the tag, and present it from either:
 
 ```sh
-git worktree add ../bf-rehearsal rehearsal-fallback-2026-11-24
-cd ../bf-rehearsal/demo && uv run aws/operate.py deploy
+out=$(mktemp -d) && git archive rehearsal-fallback-2026-11-24b | tar -x -C "$out"
+cd "$out/demo" && uv run aws/operate.py deploy
 uv run aws/operate.py present    # from any checkout: signs requests, http://127.0.0.1:8767/
 ```
 
