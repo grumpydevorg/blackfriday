@@ -129,7 +129,7 @@ class Runtime:
         self.shop = subprocess.Popen(
             ['php', '-S', '127.0.0.1:8081', 'shop.php'], cwd=APP, env=self.env,
         )
-        deadline = monotonic() + 3
+        deadline = monotonic() + 20  # was 3; PHP took ~2 s in Sydney MicroVMs on 24 Nov 2026
         while True:
             if self.shop.poll() is not None:
                 raise RuntimeError('PHP shop exited before readiness')
