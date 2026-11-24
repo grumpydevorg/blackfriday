@@ -4,7 +4,7 @@ import { RequestError, equal } from './game.mjs';
 // The __Host- prefix makes browsers accept the cookie only with Secure, Path=/ and no Domain,
 // so a sibling subdomain cannot plant or shadow it.
 export const COOKIE = '__Host-bf_host';
-export const MIN_PASSPHRASE = 12;
+export const MIN_PASSPHRASE = 8;
 export const SESSION_SECONDS = 43200;
 export const REFRESH_MS = 30_000;
 export const MAX_FAILURES = 10;

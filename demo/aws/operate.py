@@ -339,13 +339,13 @@ def passphrase() -> None:
     if DEPLOYMENT != 'round':
         raise SystemExit('Only the round has a presenter passphrase (BLACK_FRIDAY_DEPLOYMENT=round)')
     if sys.stdin.isatty():
-        value = getpass.getpass('Presenter passphrase (at least 12 characters): ')
+        value = getpass.getpass('Presenter passphrase (at least 8 characters): ')
         if value != getpass.getpass('Again: '):
             raise SystemExit('The two entries differ; nothing changed')
     else:
         value = sys.stdin.readline().rstrip('\r\n')
-    if len(value) < 12:
-        raise SystemExit('The passphrase needs at least 12 characters; nothing changed')
+    if len(value) < 8:
+        raise SystemExit('The passphrase needs at least 8 characters; nothing changed')
     session = account_session()
     ssm = session.client('ssm')
     ssm.put_parameter(Name=PASSPHRASE_PARAMETER, Value=value, Type='SecureString', Overwrite=True)

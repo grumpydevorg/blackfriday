@@ -53,7 +53,7 @@ list and execution ARN. The cookie is `__Host-bf_host` and lasts 12 hours
 subdomain cannot set or shadow it); **Sign out** clears it. When the page is
 driven through the helper below there is no cookie, so Sign out is hidden.
 
-Set your own passphrase once (at least 12 characters), before the talk:
+Set your own passphrase once (at least 8 characters), before the talk:
 
 ```sh
 cd demo
@@ -65,7 +65,7 @@ It asks twice with no echo (or reads one line from stdin when piped), stores it
 as the SSM SecureString `/black-friday/round/presenter-passphrase`, and confirms
 with the new parameter version, never the value. Console fallback: Systems
 Manager → Parameter Store → `/black-friday/round/presenter-passphrase` → Edit →
-SecureString value (at least 12 characters). Changing it signs every device out
+SecureString value (at least 8 characters). Changing it signs every device out
 within 30 seconds: each cookie is an HMAC over its expiry, keyed by the SSM
 presenter key over the current passphrase, so neither secret is in it. Until a
 passphrase exists, sign-in answers 503 and presenter routes stay 403.
@@ -154,7 +154,7 @@ routes (a valid cookie or the presenter key, otherwise 403): `GET /api/host/stat
 Only presenter routes start compute. API responses are `no-store`; every response
 carries `Strict-Transport-Security`. The public URL and the origin check come only
 from the deployed `PUBLIC_HOST`, never from request headers; without it they fail
-closed. A stored passphrase shorter than 12 characters counts as unset (503).
+closed. A stored passphrase shorter than 8 characters counts as unset (503).
 
 Close is one atomic write: it moves the phase from `launch` to `migrating` for this
 run and callback and copies the roster at that instant into the Durable callback.

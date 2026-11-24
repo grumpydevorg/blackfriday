@@ -114,10 +114,10 @@ def test_the_presenter_key_header_is_a_second_way_in_and_reports_its_mode():
     """)
 
 
-def test_a_stored_passphrase_under_twelve_characters_counts_as_unset():
+def test_a_stored_passphrase_under_eight_characters_counts_as_unset():
     javascript("""
-      secrets = { key: 'k'.repeat(64), passphrase: 'too short' };
-      assert.equal(await status(auth.login('too short')), 503);
+      secrets = { key: 'k'.repeat(64), passphrase: 'short' };
+      assert.equal(await status(auth.login('short')), 503);
       assert.equal(throttle.failures, 0);
     """)
 
