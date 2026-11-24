@@ -28,7 +28,8 @@ def test_sign_in_sets_a_strict_cookie_and_wrong_passphrase_counts():
       assert.equal(await status(auth.login('wrong passphrase!')), 401);
       assert.equal(throttle.failures, 1);
       const setCookie = await auth.login('correct horse battery');
-      assert.match(setCookie, /^bf_host=\\d+\\.[0-9a-f]{32}\\.[0-9a-f]{64}; HttpOnly; Secure; SameSite=Strict; Path=\\/; Max-Age=43200$/);
+      assert.match(setCookie, /^__Host-bf_host=\\d+\\.[0-9a-f]{32}\\.[0-9a-f]{64}; HttpOnly; Secure; SameSite=Strict; Path=\\/; Max-Age=43200$/);
+      assert.ok(!/Domain/i.test(setCookie), 'a __Host- cookie must not set Domain');
       assert.ok(!setCookie.includes('correct') && !setCookie.includes('kkkk'));
       assert.equal(throttle.failures, 1, 'a success does not count');
       await auth.authorize(post(cookieOf(setCookie)), 'POST');
@@ -98,16 +99,50 @@ def test_no_passphrase_set_gives_503_and_presenter_routes_stay_403():
       secrets = { key: 'k'.repeat(64) };
       assert.equal(await status(auth.login('anything at all')), 503);
       assert.equal(throttle.failures, 0);
-      assert.equal(await status(auth.authorize(post('bf_host=9999999999.' + 'a'.repeat(32) + '.' + 'b'.repeat(64)), 'POST')), 403);
+      assert.equal(await status(auth.authorize(post('__Host-bf_host=9999999999.' + 'a'.repeat(32) + '.' + 'b'.repeat(64)), 'POST')), 403);
       assert.equal(await status(auth.authorize({}, 'GET')), 403);
     """)
 
 
-def test_the_presenter_key_header_is_a_second_way_in():
+def test_the_presenter_key_header_is_a_second_way_in_and_reports_its_mode():
     javascript("""
-      await auth.authorize(post(undefined, { 'x-presenter-key': 'k'.repeat(64) }), 'POST');
+      assert.equal(await auth.authorize(post(undefined, { 'x-presenter-key': 'k'.repeat(64) }), 'POST'), 'key');
       assert.equal(await status(auth.authorize(post(undefined, { 'x-presenter-key': 'wrong' }), 'POST')), 403);
       assert.equal(await status(auth.authorize({ 'x-presenter-key': 'k'.repeat(64) }, 'POST')), 403);
+      const cookie = cookieOf(await auth.login('correct horse battery'));
+      assert.equal(await auth.authorize(post(cookie), 'POST'), 'cookie');
+    """)
+
+
+def test_a_stored_passphrase_under_twelve_characters_counts_as_unset():
+    javascript("""
+      secrets = { key: 'k'.repeat(64), passphrase: 'too short' };
+      assert.equal(await status(auth.login('too short')), 503);
+      assert.equal(throttle.failures, 0);
+    """)
+
+
+def test_the_cookie_is_found_by_exact_name_and_a_sibling_cannot_shadow_it():
+    javascript("""
+      const [, value] = cookieOf(await auth.login('correct horse battery')).split('=');
+      const good = `__Host-bf_host=${value}`;
+      await auth.authorize(post(`theme=dark; ${good}; other=1`), 'POST');
+      assert.equal(await status(auth.authorize(post(`xx__Host-bf_host=${value}`), 'POST')), 403);
+      assert.equal(await status(auth.authorize(post(`bf_host=${value}`), 'POST')), 403);
+      // Two cookies of the same name are ambiguous: refuse rather than pick one.
+      assert.equal(await status(auth.authorize(post(`__Host-bf_host=${'0'.repeat(10)}.${'a'.repeat(32)}.${'b'.repeat(64)}; ${good}`), 'POST')), 403);
+    """)
+
+
+def test_without_a_configured_origin_the_cookie_path_and_the_public_url_fail_closed():
+    javascript("""
+      const open = presenterAuth({ load: async () => structuredClone(secrets), throttle, origin: undefined, now });
+      const cookie = cookieOf(await open.login('correct horse battery'));
+      assert.equal(await status(open.authorize(post(cookie), 'POST')), 403, 'a cookie is worthless without an origin to check');
+      assert.equal(await status((async () => open.publicOrigin())()), 503);
+      assert.equal(await status((async () => open.checkOrigin({}))()), 403);
+      // The presenter key path does not depend on the origin.
+      assert.equal(await open.authorize(post(undefined, { 'x-presenter-key': 'k'.repeat(64) }), 'POST'), 'key');
     """)
 
 
@@ -119,4 +154,10 @@ def test_player_routes_need_no_credentials_and_presenter_routes_do():
           ['POST', '/api/migrate'], ['POST', '/api/compare'], ['POST', '/api/reset']]) assert.equal(routeKind(method, url), 'presenter', url);
       assert.equal(routeKind('POST', '/api/host/login'), 'login');
       assert.equal(routeKind('POST', '/api/host/logout'), 'logout');
+    """)
+
+
+def test_remove_is_a_presenter_route():
+    javascript("""
+      assert.equal(routeKind('POST', '/api/host/remove'), 'presenter');
     """)

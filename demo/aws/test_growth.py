@@ -87,3 +87,17 @@ def test_architecture_is_the_virtual_rds_model():
 def test_ranking_shares_equal_ranks():
     rows = [{'id': name, 'name': name, 'cumulative_cents': profit} for name, profit in [('c', 10), ('a', 20), ('b', 20)]]
     assert [(row['name'], row['rank']) for row in scoring.rank(rows)] == [('a', 1), ('b', 1), ('c', 3)]
+
+
+def test_the_web_package_contains_every_file_the_web_function_loads():
+    import re
+
+    web = (AWS_DIR / 'web.mjs').read_text()
+    needed = set(re.findall(r"from '\./([\w.-]+)'", web)) | set(re.findall(r"new URL\('\./([\w./-]+)'", web))
+    assert {'game.mjs', 'host_auth.mjs', 'roster.mjs', 'player.html', 'host.html', 'round.js', 'round.css', 'art/cloud-surge.jpg'} <= needed
+    packaging = (AWS_DIR / 'operate.py').read_text()
+    missing = {name for name in needed if f"'{name}'" not in packaging and name.rsplit('/', 1)[-1] not in packaging}
+    assert not missing, missing
+    for name in needed:
+        assert (AWS_DIR / name).is_file(), name
+    assert (AWS_DIR / 'art' / 'cloud-surge.jpg').stat().st_size <= 300_000

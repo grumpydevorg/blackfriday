@@ -145,9 +145,9 @@ def packages(out: Path) -> dict[str, tuple[str, Path]]:
             'web': ({
                 'index.mjs': AWS_DIR / 'web.mjs',
                 **{name: AWS_DIR / name for name in (
-                    'game.mjs', 'host_auth.mjs', 'player.html', 'host.html', 'round.js', 'round.css',
+                    'game.mjs', 'host_auth.mjs', 'roster.mjs', 'player.html', 'host.html', 'round.js', 'round.css',
                 )},
-                'art/cloud-surge.png': DEMO.parent / 'assets' / 'cloud-surge.png',
+                'art/cloud-surge.jpg': AWS_DIR / 'art' / 'cloud-surge.jpg',  # derived from assets/cloud-surge.png
             }, {'node_modules/': web / 'node_modules'}),
         }
         results = {}
@@ -356,6 +356,17 @@ def passphrase() -> None:
     print(f'Presenter passphrase updated (version {item["Version"]}); devices sign in again within 30 s', flush=True)
 
 
+def retain_web_logs(session) -> None:
+    """Keep the Web Function's request logs seven days, like every other log group here. Idempotent."""
+    logs = session.client('logs')
+    prefix = f'/aws/lambda/web/{WEB_FUNCTION}'
+    for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=prefix):
+        for group in page['logGroups']:
+            if group.get('retentionInDays') != 7:
+                logs.put_retention_policy(logGroupName=group['logGroupName'], retentionInDays=7)
+                print(f'Log group {group["logGroupName"]}: retention 7 days', flush=True)
+
+
 def deploy(*, keep_failed: bool = False) -> None:
     session = account_session()
     if DEPLOYMENT == 'rehearsal':
@@ -385,6 +396,7 @@ def deploy(*, keep_failed: bool = False) -> None:
             **{f'{kind.title()}Key': key for kind, (key, _) in artifacts.items() if kind != 'web'},
         )
     url = deploy_web(session, bucket, artifacts['web'][0])
+    retain_web_logs(session)
     print(json.dumps({**stack_outputs(session, STACK), 'StageUrl': url}, indent=2))
 
 
@@ -417,8 +429,12 @@ def present(port: int, tailnet: bool = False) -> None:
         Name=PRESENTER_PARAMETER, WithDecryption=True,
     )['Parameter']['Value']
     local_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
-    allowed_get = {'/', '/api/state', '/art/cloud-surge.png', '/host', '/api/host/state', '/api/host/qr.svg', '/round.js', '/round.css'}
+    allowed_get = {'/', '/api/state', '/art/cloud-surge.png', '/art/cloud-surge.jpg', '/host', '/api/host/state', '/api/host/qr.svg', '/round.js', '/round.css'}
     allowed_post = {f'/api/{action}' for action in ('launch', 'migrate', 'compare', 'reset')}
+    # Round only: these two carry a small JSON body (a team id; an empty object) and are no
+    # longer bodyless. The rehearsal's old code has neither route.
+    with_body = {'/api/host/remove', '/api/host/logout'} if credentials is None else set()
+    allowed_post |= with_body
     http = build_opener(NoRedirect)
 
     def proxy(allowed_hosts: set[str], origin: str | None, login: str | None) -> type[BaseHTTPRequestHandler]:
@@ -433,21 +449,28 @@ def present(port: int, tailnet: bool = False) -> None:
             if host not in allowed_hosts or self.headers.get('Sec-Fetch-Site') not in (None, 'same-origin', 'none'):
                 self.send_error(403)
                 return
+            length = 0
             if self.command == 'POST':
                 expected = origin or f'http://{host}'
+                try:
+                    length = int(self.headers.get('Content-Length', '0'))
+                except ValueError:
+                    length = -1
                 if (
                     self.path not in allowed_post or self.headers.get('X-Rehearsal-Action') != '1'
                     or self.headers.get('Origin', expected) != expected
-                    or self.headers.get('Content-Length', '0') != '0'
                     or self.headers.get('Transfer-Encoding') is not None
+                    or not (0 <= length <= 2048 if self.path in with_body else length == 0)
                 ):
                     self.send_error(403)
                     return
             elif self.path not in allowed_get:
                 self.send_error(404)
                 return
-            body = b''
+            body = self.rfile.read(length) if length > 0 else b''
             headers = {'X-Amz-Content-SHA256': sha256(body).hexdigest()}
+            if body:
+                headers['Content-Type'] = 'application/json'
             for name in ('X-Rehearsal-Action', 'X-Rehearsal-Run'):
                 if value := self.headers.get(name):
                     headers[name] = value
@@ -458,9 +481,8 @@ def present(port: int, tailnet: bool = False) -> None:
                     SigV4Auth(credentials.get_frozen_credentials(), 'lambda', REGION).add_auth(req)
                 else:
                     req.headers['X-Presenter-Key'] = presenter_key
-                    req.headers['X-Public-Url'] = endpoint
                 try:
-                    result = http.open(Request(url, headers=dict(req.headers), method=self.command), timeout=20)
+                    result = http.open(Request(url, data=body or None, headers=dict(req.headers), method=self.command), timeout=20)
                 except HTTPError as error:
                     result = error
                 with result:

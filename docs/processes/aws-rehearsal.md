@@ -48,8 +48,10 @@ places are taken, or with the wrong team token.
 **Sign in on the page itself.** Open `<public URL>/host` on a laptop or phone, no
 helper and no Tailscale. The page is public but holds no secret: until you sign
 in it shows only a passphrase form. After sign-in it shows the buttons, QR, team
-list and execution ARN. The cookie lasts 12 hours (`HttpOnly`, `Secure`,
-`SameSite=Strict`); **Sign out** clears it.
+list and execution ARN. The cookie is `__Host-bf_host` and lasts 12 hours
+(`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`, no `Domain`, so a sibling
+subdomain cannot set or shadow it); **Sign out** clears it. When the page is
+driven through the helper below there is no cookie, so Sign out is hidden.
 
 Set your own passphrase once (at least 12 characters), before the talk:
 
@@ -97,7 +99,10 @@ lets them reach the Mac. A process on the Mac itself is trusted, as it already
 is for 8768. Without `--tailnet`, the page is on the laptop only.
 
 The page shows the public URL as text and a QR code, the teams and whether they
-have picked, the execution ARN, and three buttons:
+have picked, the execution ARN, and three buttons. While the round is open each
+audience team has a **Remove** button (house teams have none): it frees a squatted
+or rude name, and that phone shows "Your team was removed" and can join again.
+Removal is refused once the round closes.
 
 1. **Open round / Run Launch.** Starts the version-pinned Durable execution.
    Launch runs once, for everyone. Players can join from the moment the round
@@ -140,12 +145,24 @@ there is no idle RDS instance. The image runs only trusted organiser code: it
 has no execution role, but has internet egress for a short-lived, object-scoped
 payment PUT. It is **not** a sandbox for arbitrary uploads.
 
-Public routes: `GET /`, `/host` (the page only), `/round.js`, `/round.css`,
-`/art/cloud-surge.png`, `/api/state`; `POST /api/join`, `/api/pick`,
-`/api/host/login`, `/api/host/logout`. Presenter routes (a valid cookie or the
-presenter key, otherwise 403): `GET /api/host/state`, `/api/host/qr.svg`;
-`POST /api/launch`, `/api/migrate`, `/api/compare`, `/api/reset`. Only presenter
-routes start compute.
+Public routes: `GET /`, `/host` (the page only), `/round.js`, `/round.css`
+(cached for an hour, like the hero image), `/art/cloud-surge.jpg`, `/api/state`;
+`POST /api/join`, `/api/pick`, `/api/host/login`, `/api/host/logout`. Presenter
+routes (a valid cookie or the presenter key, otherwise 403): `GET /api/host/state`,
+`/api/host/qr.svg`; `POST /api/launch`, `/api/migrate`, `/api/compare`,
+`/api/reset`, and `/api/host/remove` (a JSON body of at most 2 KiB: the team id).
+Only presenter routes start compute. API responses are `no-store`; every response
+carries `Strict-Transport-Security`. The public URL and the origin check come only
+from the deployed `PUBLIC_HOST`, never from request headers; without it they fail
+closed. A stored passphrase shorter than 12 characters counts as unset (503).
+
+Close is one atomic write: it moves the phase from `launch` to `migrating` for this
+run and callback and copies the roster at that instant into the Durable callback.
+A pick that races it either committed first (it counts) or is refused ("round
+closed"); a retry of an unconfirmed callback re-sends the same frozen roster. The
+page and phones stop polling after `compared`, `expired` or `failed` (a phone
+reloads; the presenter page resumes on Reset), never overlap polls, and never retry
+a throttled poll.
 
 ## Prerequisites
 

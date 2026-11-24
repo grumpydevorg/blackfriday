@@ -10,8 +10,9 @@ import {
   SendDurableExecutionCallbackSuccessCommand,
 } from '@aws-sdk/client-lambda';
 import { SSMClient, GetParametersCommand } from '@aws-sdk/client-ssm';
-import { RequestError, houses, join, pick, frozen, publicTeams, open } from './game.mjs';
+import { RequestError, houses, join, pick, remove, publicTeams, frozen, open } from './game.mjs';
 import { presenterAuth, routeKind, MAX_FAILURES, WINDOW_MS } from './host_auth.mjs';
+import { s, n, writeRoster, closeRound } from './roster.mjs';
 import QRCode from 'qrcode';
 
 const { RUN_TABLE: table, WORKFLOW_ARN: workflow } = process.env;
@@ -22,16 +23,15 @@ const key = { pk: { S: 'arena' } };
 const startWindow = 90_000;
 const callbackLease = 20_000;
 const id = () => randomUUID().replaceAll('-', '');
-const s = value => ({ S: value });
-const n = value => ({ N: String(value) });
 const terminal = new Set(['compared', 'expired', 'failed']);
 const callbacks = { migrate: ['launch', 'migrating'], compare: ['migrated', 'comparing'] };
+const immutable = { 'Cache-Control': 'public, max-age=3600' };
 const staticFiles = new Map([
   ['/', ['text/html; charset=utf-8', readFileSync(new URL('./player.html', import.meta.url))]],
   ['/host', ['text/html; charset=utf-8', readFileSync(new URL('./host.html', import.meta.url))]],
-  ['/round.js', ['text/javascript; charset=utf-8', readFileSync(new URL('./round.js', import.meta.url))]],
-  ['/round.css', ['text/css; charset=utf-8', readFileSync(new URL('./round.css', import.meta.url))]],
-  ['/art/cloud-surge.png', ['image/png', readFileSync(new URL('./art/cloud-surge.png', import.meta.url))]],
+  ['/round.js', ['text/javascript; charset=utf-8', readFileSync(new URL('./round.js', import.meta.url)), immutable]],
+  ['/round.css', ['text/css; charset=utf-8', readFileSync(new URL('./round.css', import.meta.url)), immutable]],
+  ['/art/cloud-surge.jpg', ['image/jpeg', readFileSync(new URL('./art/cloud-surge.jpg', import.meta.url)), immutable]],
 ]);
 const loginKey = { pk: { S: 'login' } };
 // At most MAX_FAILURES failed sign-ins per window across every environment: each attempt
@@ -73,7 +73,6 @@ async function loadSecrets() {
 const auth = presenterAuth({
   load: loadSecrets, throttle, origin: process.env.PUBLIC_HOST && `https://${process.env.PUBLIC_HOST}`,
 });
-const publicUrl = headers => auth.publicOrigin({ host: headers['x-public-url']?.replace(/^https:\/\//, '') ?? headers.host });
 const fresh = () => ({ phase: s('ready'), run_id: s(id()), teams_data: s(JSON.stringify(houses())) });
 const teamsOf = row => JSON.parse(row.teams_data.S);
 async function initialized() {
@@ -110,6 +109,20 @@ function update(expression, condition, values) {
     ConditionExpression: condition, ExpressionAttributeValues: values,
   }));
 }
+
+async function claim(expression, condition, values) {
+  try {
+    const { Attributes } = await db.send(new UpdateItemCommand({
+      TableName: table, Key: key, UpdateExpression: expression, ConditionExpression: condition,
+      ExpressionAttributeValues: values, ReturnValues: 'ALL_NEW',
+    }));
+    return Attributes;
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') return null;
+    throw error;
+  }
+}
+const rosterStore = { update, claim };
 
 function replace(item, condition, values) {
   return conditional(new PutItemCommand({
@@ -245,17 +258,26 @@ async function resume(action, token, row, state) {
   const now = Date.now();
   const lease = n(now + callbackLease);
   const values = { ':id': row.run_id, ':callback': row.callback_id, ':busy': s(busy), ':lease': lease };
-  const claim = state.phase === waiting
-    ? await update('SET phase = :busy, lease_until = :lease',
-      'run_id = :id AND callback_id = :callback AND phase = :waiting AND teams_data = :teams',
-      { ...values, ':waiting': s(waiting), ':teams': row.teams_data })
-    : await update('SET phase = :busy, lease_until = :lease',
+  let claimed;
+  if (state.phase !== waiting) {
+    // Retry of a callback AWS never confirmed: the roster was frozen by the first claim.
+    claimed = await claim('SET phase = :busy, lease_until = :lease',
       'run_id = :id AND callback_id = :callback AND phase = :busy AND lease_until <= :now', { ...values, ':now': n(now) });
-  if (!claim) throw new ActionConflict();
+  } else if (action === 'migrate') {
+    // One write ends joining and picking and copies the roster at that instant. A pick that
+    // raced it either committed before (it is in frozen_data) or fails its own condition.
+    claimed = await closeRound(rosterStore, row, lease);
+  } else {
+    claimed = await claim('SET phase = :busy, lease_until = :lease',
+      'run_id = :id AND callback_id = :callback AND phase = :waiting', { ...values, ':waiting': s(waiting) });
+  }
+  if (!claimed) throw new ActionConflict();
   try {
     await lambda.send(new SendDurableExecutionCallbackSuccessCommand({
       CallbackId: row.callback_id.S,
-      Result: Buffer.from(JSON.stringify({ action, ...(action === 'migrate' ? { teams: frozen(teamsOf(row)) } : {}) })),
+      Result: Buffer.from(JSON.stringify({
+        action, ...(action === 'migrate' ? { teams: frozen(JSON.parse(claimed.frozen_data.S)) } : {}),
+      })),
     }), { abortSignal: AbortSignal.timeout(10_000) });
   } catch (error) {
     // AWS uses the same exception for expiration and an already-consumed token.
@@ -271,7 +293,8 @@ async function resume(action, token, row, state) {
 
 function send(response, code, type, body, extra = {}) {
   response.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', ...extra,
+    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+    'Strict-Transport-Security': 'max-age=31536000', ...extra,
     'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   });
   response.end(body);
@@ -296,40 +319,41 @@ async function body(request) {
   } catch { throw new RequestError(400, 'JSON object required'); }
 }
 
-async function view(row, headers, hostView = false) {
+async function view(row, headers, hostView = false, mode) {
   const result = await describe(row);
   result.open = open(result.phase);
   result.teams = publicTeams(teamsOf(row), result.phase, headers['x-team-id'], headers['x-team-token']);
   result.max_audience_teams = 8;
   result.audience_count = result.teams.filter(team => !team.house).length;
-  result.public_url = process.env.PUBLIC_URL;
-  if (hostView) result.public_url = publicUrl(headers);
-  else {
+  if (hostView) {
+    // Never derived from request headers: unset PUBLIC_HOST means no URL, no QR code.
+    result.public_url = process.env.PUBLIC_HOST ? `https://${process.env.PUBLIC_HOST}` : null;
+    result.auth_mode = mode;
+  } else {
     delete result.execution_arn;
     delete result.action_token;
   }
   return result;
 }
 
-async function changeTeam(request, action) {
-  const input = await body(request);
+async function changeTeam(input, action) {
   for (let attempt = 0; attempt < 8; attempt++) {
     const row = await initialized(), teams = teamsOf(row);
-    let reply;
+    let next = teams, reply;
     if (action === 'join') {
       const { team, token } = join(teams, row.phase.S, input.name);
-      teams.push(team);
+      next = [...teams, team];
       reply = { id: team.id, token, run_id: row.run_id.S };
-    } else {
+    } else if (action === 'pick') {
       const team = pick(teams, row.phase.S, input);
-      teams[teams.findIndex(value => value.id === team.id)] = team;
+      next = teams.map(value => (value.id === team.id ? team : value));
       reply = { saved: true };
+    } else {
+      if (input.run !== row.run_id.S) throw new ActionConflict();
+      next = remove(teams, row.phase.S, input.id);
+      reply = { removed: true };
     }
-    if (await update('SET teams_data = :next',
-      'run_id = :id AND phase IN (:ready, :launching, :launch) AND teams_data = :before', {
-        ':next': s(JSON.stringify(teams)), ':id': row.run_id, ':before': row.teams_data,
-        ':ready': s('ready'), ':launching': s('launching'), ':launch': s('launch'),
-      })) return reply;
+    if (await writeRoster(rosterStore, row, next)) return reply;
   }
   throw new ActionConflict();
 }
@@ -347,16 +371,20 @@ async function route(request, response) {
     auth.checkOrigin(headers);
     return json(response, 200, { signed_in: false }, { 'Set-Cookie': auth.logout() });
   }
-  if (presenterRoute) await auth.authorize(headers, method);
+  const mode = presenterRoute ? await auth.authorize(headers, method) : undefined;
   if (method === 'GET' && url === '/api/host/qr.svg') {
-    return send(response, 200, 'image/svg+xml', await QRCode.toString(publicUrl(headers), { type: 'svg', margin: 4 }));
+    return send(response, 200, 'image/svg+xml', await QRCode.toString(auth.publicOrigin(), { type: 'svg', margin: 4 }));
   }
   if (method === 'GET' && staticFiles.has(url)) return send(response, 200, ...staticFiles.get(url));
   if (method === 'GET' && ['/api/state', '/api/host/state'].includes(url)) {
-    return json(response, 200, await view(await recoverStart(await initialized()), headers, presenterRoute));
+    return json(response, 200, await view(await recoverStart(await initialized()), headers, presenterRoute, mode));
+  }
+  if (method === 'POST' && url === '/api/host/remove') {
+    const input = await body(request);
+    return json(response, 200, await changeTeam({ id: input.id, run: headers['x-rehearsal-run'] }, 'remove'));
   }
   if (method === 'POST' && ['/api/join', '/api/pick'].includes(url)) {
-    return json(response, 200, await changeTeam(request, url.slice(5)));
+    return json(response, 200, await changeTeam(await body(request), url.slice(5)));
   }
   const action = url?.match(/^\/api\/(launch|migrate|compare|reset)$/)?.[1];
   if (method !== 'POST' || !action) return json(response, 404, { error: 'Not found' });
@@ -375,7 +403,7 @@ async function route(request, response) {
       await resume(action, token, row, state);
     }
   }
-  return json(response, 200, await view(await stored(), headers, true));
+  return json(response, 200, await view(await stored(), headers, true, mode));
 }
 
 const endpoint = process.env.AWS_LAMBDA_HTTP_ENDPOINT ?? 'localhost:3000';

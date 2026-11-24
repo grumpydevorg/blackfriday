@@ -81,7 +81,7 @@ flowchart LR
 
 | Resource | Kind | Job | Limits |
 |:--|:--|:--|:--|
-| `black-friday-round` ([`operate.py`](../demo/aws/operate.py), [`web.mjs`](../demo/aws/web.mjs)) | Web Function, Node.js 24 | Player page, presenter page, API | Public endpoint (`ApplicationManaged`); presenter routes need a sign-in cookie or the SSM key; 10 failed sign-ins per 10 minutes; 2 KiB bodies; at most 10 environments, 100 requests/s, 15 s timeout |
+| `black-friday-round` ([`operate.py`](../demo/aws/operate.py), [`web.mjs`](../demo/aws/web.mjs), roster rules in [`roster.mjs`](../demo/aws/roster.mjs)) | Web Function, Node.js 24 | Player page, presenter page, API | Public endpoint (`ApplicationManaged`); presenter routes need a sign-in cookie or the SSM key; 10 failed sign-ins per 10 minutes; 2 KiB bodies; at most 10 environments, 100 requests/s, 15 s timeout; request logs kept 7 days; HSTS; a 270 KB hero image cached for an hour |
 | `black-friday-round-workflow` ([`workflow.py`](../demo/aws/workflow.py)) | Durable Function | Launch → wait for Close → one migration per team → wait → one shopper check per team → scoreboard | 48 h execution, 23 h callbacks, 7-day history |
 | `black-friday-round-evaluator` ([`evaluator.py`](../demo/aws/evaluator.py)) | Event Function | Starts MicroVMs, drives the shop, checks orders and payments, scores the architecture, saves results | 512 MB, 300 s, at most 10 at once |
 | `black-friday-round-shop` | MicroVM image | PHP shop with SQLite or PostgreSQL 17 | ARM64, 1 GiB; each VM at most 120 s, no role |
