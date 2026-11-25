@@ -484,3 +484,62 @@ recorded-evidence fallback is covered by unit tests only.
 
 The game was then played live at the AWS User Group Adelaide talk on 25 November
 2026: 28 players to the final board.
+
+## After the talk
+
+Found by the pre-talk reviews of 25 November 2026 and deferred because each
+needed another game-path deploy. None was seen to fail in the go/no-go or the
+talk.
+
+**Make invalid log and game states unrepresentable**
+
+- `vm_runtime.record(**fields)` spreads caller fields last, so a caller can store
+  an unredacted `msg`, a negative `seq` or a full run id; only the judge's relay
+  validation stops it. Take `ms` and the PHP fields as explicit parameters.
+- `evaluator.Rehearsal` constructs from any action and option strings. Use
+  `Literal` types, derive `kind`, validate in `__post_init__`.
+- The real migration kind (`preserve`/`omit`) is derived from
+  `recorded_evidence[option].cart_kept`, the fallback table. Give each real
+  option an explicit `migration` field in `rounds.json`.
+- Timeline writes use DynamoDB `list_append`, which a re-executed Durable step
+  repeats. Store lines in a map keyed by line id, built from a frozen
+  `TimelineLine` type.
+- `workflow.real_evidence` catches `Exception`, which includes the SDK's
+  `CheckpointError`. Narrow it to invoke and runtime errors.
+- `model.py` growth scoring hand-lists `careful`/`fast` defaults, and a recorded
+  dict without `cart_kept` bypasses `RECORDED`; so do `logs_page/logs.js`,
+  `round.js` and `workflow.py`. Derive them from `rounds.json`.
+- Put `run` in the `[EVENT]` contract and in timeline detail so Story and Follow
+  attach by run, not by time; then delete the time cutoff in `attached()` (it
+  drops EVENT lines for a viewer opened mid-game without a Durable start time).
+- One timeline parser shared by `web.mjs` and `logs.mjs`.
+- `round.js` `badge()` defaults a missing evidence source to `real`; make it
+  required.
+- The judge accepts duplicate VM `seq` values, and entries carry no VM id, so a
+  retried stage repeats `(run, action, option, seq)`.
+
+**Smaller defects**
+
+- The redaction pattern is case-sensitive (`HTTPS://…x-amz-signature=` passes),
+  and it blanks "Cookie" in generated player names ("Lazy [redacted]") in the
+  viewer's debug lines.
+- A `REPORT … Status: timeout` line shows as info "Event judge done in 300.0 s";
+  a text-format workflow `REPORT` is dropped (no `LogFormat` is set).
+- A `make()` throw after `seenCloudWatch.set` in `logs.mjs` would lose the batch.
+- The viewer's `place()` looks back only 500 rows; with debug on and a full room,
+  relayed VM lines append out of order.
+- `web-reset` is `warn`; the contract lists only recorded evidence and expiry.
+- An expired run has no Story card.
+- `execution_arn` is cut at 100 characters, dropping the execution name.
+- Autoscale is billed twice ([game.md](../game.md)); fixing it needs the balance
+  re-tuned.
+
+**Checks and housekeeping**
+
+- Add a failure-injection hook to the go/no-go harness and force one stage
+  failure in AWS; the recorded-evidence fallback has only run in unit tests.
+- Old games in the run table never expire: add a TTL.
+- The one-round and rehearsal artifacts buckets are kept; delete them when the
+  fallback tags are no longer needed.
+- The `four-round` commits made on rick-dev are unsigned: re-sign or
+  squash-merge into `main`.
