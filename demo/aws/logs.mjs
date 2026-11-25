@@ -271,11 +271,17 @@ export function cloudWatchId(group, raw) {
   return `cw:${createHash('sha1').update(`${group}\n${Number(raw.timestamp)}\n${raw.message}`).digest('hex').slice(0, 16)}`;
 }
 
+/** The short `source` of a CloudWatch line: web, workflow, evaluator or vm ([VM]/[PHP] lines and the MicroVM image group). */
+export function sourceOf(group, tag) {
+  if (tag === 'VM' || tag === 'PHP') return 'vm';
+  return { WEB: 'web', WORKFLOW: 'workflow', EVENT: 'evaluator', MICROVM: 'vm' }[groupTag(group)];
+}
+
 /** A CloudWatch event -> an event, or undefined when it is noise. Id and ts come from the log line itself. */
 export function fromCloudWatch(group, raw) {
   const line = classify(groupTag(group), raw.message);
   if (!line) return undefined;
-  return make(cloudWatchId(group, raw), Number(raw.timestamp), line.tag, line.level, logSource(group), line.text, line.detail);
+  return make(cloudWatchId(group, raw), Number(raw.timestamp), line.tag, line.level, sourceOf(group, line.tag), line.text, line.detail);
 }
 
 /** `arn:aws:logs:<region>:<account>:log-group:<name>[:*]` or `<account>:<name>` -> `<name>`. */
@@ -329,25 +335,32 @@ export function fromDurable(arn, history) {
 
 // ---------------------------------------------------------------- game state
 
-const TAGS = new Set(['GAME', 'DURABLE', 'EVENT', 'MICROVM', 'WEB', 'WORKFLOW', 'VM', 'PHP', 'ERROR']);
-const DEFAULT_SOURCE = { GAME: 'arena', MICROVM: 'arena', DURABLE: 'durable', WEB: 'web' };
+// The workflow's timeline lines for rounds (registered, open-, close-, plan-, score-, results-, final) repeat what the
+// Durable history and the [WORKFLOW] log lines already say, so only the real-VM evidence and the web function's own
+// lines are kept. Nothing from the timeline is ever tagged EVENT or GAME.
+const VM_EVIDENCE = /^(launch|migrate-(careful|fast)|compare-(careful|fast))$/;
+const WEB_LINE = /^web-(start|close-.+|reset)$/;
 
-function timelineLevel(text) {
+function evidenceLevel(text) {
   if (ERRORISH.test(text) || text.includes(' failed')) return 'error';
-  return WARNISH.test(text) ? 'warn' : 'info';
+  return WARNISH.test(text) || /\bLOST\b/.test(text) ? 'warn' : 'info';
 }
 
-/** `timeline#<run>` lines (written by the workflow and the web function) -> events. Ids: tl:<run8>:<line id>. */
+/** `timeline#<run>` lines -> events. Ids: tl:<run8>:<line id>. */
 export function fromTimeline(runId, lines) {
   const out = [];
-  lines.forEach((line, index) => {
-    if (!isRecord(line) || !Number.isFinite(Number(line.t))) return;
-    const tag = TAGS.has(line.tag) ? line.tag : 'GAME';
-    const source = typeof line.log_group === 'string' && line.log_group ? logSource(line.log_group) : DEFAULT_SOURCE[tag] ?? 'timeline';
+  for (const line of lines) {
+    if (!isRecord(line) || !Number.isFinite(Number(line.t)) || typeof line.id !== 'string') continue;
+    const web = WEB_LINE.test(line.id);
+    if (!web && !VM_EVIDENCE.test(line.id)) continue;
     const text = String(line.text ?? '');
-    out.push(make(`tl:${runId.slice(0, 8)}:${line.id ?? `n${index}`}`, Number(line.t), tag, timelineLevel(text), source, text,
-      isRecord(line.detail) ? line.detail : {}));
-  });
+    const detail = {
+      ...(isRecord(line.detail) ? line.detail : {}),
+      ...(typeof line.log_group === 'string' && line.log_group && { log_group: line.log_group }),
+    };
+    out.push(make(`tl:${runId.slice(0, 8)}:${line.id}`, Number(line.t), web ? 'WEB' : 'MICROVM', web ? 'info' : evidenceLevel(text),
+      web ? 'web' : 'workflow', text, detail));
+  }
   return out;
 }
 

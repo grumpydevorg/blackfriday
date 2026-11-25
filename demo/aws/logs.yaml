@@ -82,6 +82,12 @@ Resources:
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WorkflowLogGroup}:*'
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${EvaluatorLogGroup}:*'
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ShopLogGroup}:*'
+                  # StartLiveTail authorises against the bare log-group ARN (no trailing :*); granting only the
+                  # :* form answered AccessDenied on 25 Nov 2026.
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WebLogGroup}'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WorkflowLogGroup}'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${EvaluatorLogGroup}'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ShopLogGroup}'
               - Effect: Allow
                 Action: [lambda:GetDurableExecution, lambda:GetDurableExecutionHistory]
                 Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WorkflowFunctionName}:*/durable-execution/*'

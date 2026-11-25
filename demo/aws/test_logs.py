@@ -111,9 +111,22 @@ const arena = () => ({
 });
 const timelineItem = () => ({
   pk: s(`timeline#${RUN}`), run_id: s(RUN), lines: { L: [
+    // What the workflow writes: only launch, migrate- and compare- lines survive, tagged MICROVM.
     { id: 'registered', t: T - 120000, tag: 'DURABLE', text: 'Execution registered', detail: { run_id: RUN, execution_arn: ARN }, log_group: WORKFLOW },
     { id: 'open-growth', t: T - 100000, tag: 'GAME', text: 'Growth open', detail: { round: 'growth' } },
-    { id: 'old', t: T - 25 * 60000, tag: 'GAME', text: 'Older than the window' },
+    { id: 'close-growth', t: T - 95000, tag: 'EVENT', text: 'Close received: 2/3 picked' },
+    { id: 'plan-growth', t: T - 94000, tag: 'GAME', text: 'Plan' },
+    { id: 'score-growth', t: T - 93000, tag: 'GAME', text: 'Round scored' },
+    { id: 'results-growth', t: T - 92000, tag: 'GAME', text: 'Results published' },
+    { id: 'final', t: T - 91000, tag: 'GAME', text: 'Final results published' },
+    { id: 'surprise', t: T - 90000, tag: 'GAME', text: 'An id nobody knows' },
+    { id: 'launch', t: T - 110000, tag: 'MICROVM', text: 'Launch shop (real MicroVM): checkout 200', detail: { run_id: RUN, source: 'real' }, log_group: EVALUATOR },
+    { id: 'migrate-careful', t: T - 109000, tag: 'MICROVM', text: 'Careful (preserve, real): cart kept', log_group: EVALUATOR },
+    { id: 'compare-fast', t: T - 108000, tag: 'DURABLE', text: 'Fast (omit, recorded): cart LOST' },
+    // What the web function writes.
+    { id: 'web-start', t: T - 125000, tag: 'WEB', text: 'Presenter pressed Start: 3 players in the room', detail: { players: 3, run_id: RUN } },
+    { id: 'web-close-growth', t: T - 96000, tag: 'WEB', text: 'Presenter closed growth: 2 of 3 players picked' },
+    { id: 'web-close-launch', t: T - 25 * 60000, tag: 'WEB', text: 'Older than the window' },
   ].map(line => s(JSON.stringify(line))) },
 });
 const history = () => [
@@ -316,9 +329,12 @@ def test_every_cloudwatch_line_type_gets_its_tag_level_and_text():
             continue
         assert (got['tag'], got['level'], got['text']) == expected, LINES[index]
         assert re.fullmatch(r'cw:[0-9a-f]{16}', got['id']) and got['ts'] == -1000 * index
-    assert out[0]['source'] == 'web/black-friday-four'
-    assert out[18]['source'] == 'black-friday-four-evaluator'
-    assert out[29]['source'] == 'black-friday-four-shop'
+    assert out[0]['source'] == 'web'
+    assert out[7]['source'] == 'workflow'
+    assert out[18]['source'] == 'evaluator' and out[18]['tag'] == 'EVENT' and out[26]['source'] == 'evaluator'
+    assert [(out[i]['tag'], out[i]['source']) for i in (19, 20, 21)] == [('VM', 'vm'), ('PHP', 'vm'), ('PHP', 'vm')], '[VM] and [PHP] lines'
+    assert out[29]['source'] == 'vm', 'the MicroVM image group'
+    assert out[5]['tag'] == 'ERROR' and out[5]['source'] == 'web'
 
 
 def test_error_lines_are_trimmed_to_200_characters():
@@ -340,19 +356,26 @@ def test_timeline_durable_and_status_events_use_ids_taken_from_the_data():
       result({
         ids: events.map(event => event.id), status: hub.status,
         pick: Object.fromEntries(events.filter(e => /^(tl|du):/.test(e.id)).map(e => [e.id, [e.tag, e.level, e.text, e.ts - T, e.source]])),
-        detail: events.find(e => e.id === `tl:${RUN.slice(0, 8)}:registered`).detail,
+        detail: events.find(e => e.id === `tl:${RUN.slice(0, 8)}:launch`).detail,
+        tags: events.filter(e => e.id.startsWith('tl:') && ['EVENT', 'GAME'].includes(e.tag)).map(e => e.id),
         sorted: events.every((e, i) => !i || events[i - 1].ts <= e.ts),
       });
     """)
     assert out['status'] == {'run8': '01234567', 'phase': 'open', 'round': 'growth', 'players': 3, 'picked': 2}
     assert out['pick'] == {
-        'tl:01234567:registered': ['DURABLE', 'info', 'Execution registered', -120000, 'black-friday-four-workflow'],
-        'tl:01234567:open-growth': ['GAME', 'info', 'Growth open', -100000, 'arena'],
+        'tl:01234567:launch': ['MICROVM', 'info', 'Launch shop (real MicroVM): checkout 200', -110000, 'workflow'],
+        'tl:01234567:migrate-careful': ['MICROVM', 'info', 'Careful (preserve, real): cart kept', -109000, 'workflow'],
+        'tl:01234567:compare-fast': ['MICROVM', 'warn', 'Fast (omit, recorded): cart LOST', -108000, 'workflow'],
+        'tl:01234567:web-start': ['WEB', 'info', 'Presenter pressed Start: 3 players in the room', -125000, 'web'],
+        'tl:01234567:web-close-growth': ['WEB', 'info', 'Presenter closed growth: 2 of 3 players picked', -96000, 'web'],
         'du:abcdefabcdef:1': ['DURABLE', 'info', 'execution started', -119000, 'durable'],
         'du:abcdefabcdef:3': ['DURABLE', 'info', 'plan: step done 1.5 s', -116500, 'durable'],
         'du:abcdefabcdef:4': ['DURABLE', 'info', 'close-growth: waiting for the presenter to Close', -100000, 'durable'],
-    }, 'the 25-minute-old line is outside the 20-minute window; the parallel branch and StepStarted are skipped'
-    assert out['detail']['run_id'] == '01234567…'
+    }, 'the workflow round lines, the unknown id and the 25-minute-old line are dropped; the parallel branch and StepStarted are skipped'
+    assert out['tags'] == [], 'no timeline line is ever tagged EVENT or GAME'
+    assert out['detail'] == {'run_id': '01234567…', 'source': 'real', 'log_group': '/aws/lambda/black-friday-four-evaluator'}
+    assert not [key for key in out['pick'] if key.rsplit(':', 1)[1] in (
+        'registered', 'open-growth', 'close-growth', 'plan-growth', 'score-growth', 'results-growth', 'final', 'surprise')]
     assert out['sorted'] and len(out['ids']) == len(set(out['ids']))
     blob = json.dumps(out)
     for secret in ('Zelda', 'Yuri', 'Xena', 'ffffffff', 'token'):

@@ -259,6 +259,26 @@ per round at 101 players, computed offline with `model.py`) carries `id`, `name`
 `cost_cents`, `refund_cents`, `profit_cents`, `cumulative_cents`, `returning`
 and `evidence` (`real`, `recorded` or `modelled`).
 
+## The logs function
+
+`black-friday-four-logs` ([`logs_web.mjs`](../demo/aws/logs_web.mjs), event model
+in [`logs.mjs`](../demo/aws/logs.mjs)) is a second Web Function beside the game,
+in its own stack `BlackFridayFourRoundLogs`. Its role is read-only:
+`dynamodb:GetItem` on the run table, `lambda:GetDurableExecution` and
+`lambda:GetDurableExecutionHistory` on the workflow's executions,
+`logs:FilterLogEvents` and `logs:StartLiveTail` on the game's four log groups,
+and the two presenter SSM parameters. It writes nothing to the game, and its
+package sits in its own bucket, so the game bucket's policy is unchanged.
+
+It turns the timeline item, the Durable history and the CloudWatch lines into
+one event stream `{id, ts, tag, level, source, text, detail}`. Ids are
+deterministic (`tl:`, `du:`, and `cw:` plus a hash of group, timestamp and
+message), so every environment, and Live Tail and FilterLogEvents alike, gives
+the same id for the same line. Text and details are redacted again: signed or
+payment URLs, 32-hex ids, token-, receipt- and cookie-shaped values. The status
+bar counts players and picks without names. Running and signing in:
+[aws-rehearsal.md](processes/aws-rehearsal.md#hosted-live-log-fourround).
+
 ## The arena
 
 **Today (built and run):** one Web Function ([`web.mjs`](../demo/aws/web.mjs),

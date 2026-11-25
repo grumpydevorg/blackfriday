@@ -151,6 +151,42 @@ The pages load `round.js` and `round.css` as `?v=<content hash>`, so a browser
 that cached the old script for its hour never runs it against a new page after
 a redeploy.
 
+### Hosted live log (fourround)
+
+A separate, presenter-only Web Function, `black-friday-four-logs`, serves the
+same log from AWS. It needs no laptop, tunnel or SSO session:
+
+```sh
+cd demo
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py deploy-logs    # prints LogsUrl
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy-logs   # its function, log groups, stack and bucket
+```
+
+`deploy-logs` deploys only the stack `BlackFridayFourRoundLogs`, which holds a
+read-only `LogsRole` and the bucket for the logs package, and then the function.
+It reads the game stack's outputs but never changes the game's stacks,
+functions or bucket policy.
+
+Only the sign-in page and its own script and stylesheet are public. Sign in with
+the presenter passphrase; the same `__Host-bf_host` cookie rules apply, on this
+function's own origin, with an in-memory throttle. The viewer (`/viewer`), its
+assets and every data route (`/stream`, `/events`, `/api/status`) need the
+cookie or the presenter key. Signed out they answer 403, or 303 to sign-in for
+the viewer page.
+
+Each environment runs one shared poller while someone is watching, so more
+viewers never mean more AWS reads. It reads the arena and timeline items and
+the current execution's Durable history every 2 s, and CloudWatch through one
+Live Tail session (lines within a few seconds). FilterLogEvents fills the last
+15 minutes on connect and any gaps every 10 s.
+
+`GET /stream` is Server-Sent Events and streams unbuffered. Each connection
+lasts up to the 900-second timeout, then the browser reconnects with
+`Last-Event-ID`. The server re-sends from 60 s before that cursor, and the page
+drops duplicates by event id, so a reconnect leaves no gap and no duplicate. If
+no `hello` arrives within 5 s the page polls `/events` every 2 s instead.
+Filtering is client-side, as in `watch_web.py`.
+
 ### Live log for the room (fourround)
 
 ```sh
