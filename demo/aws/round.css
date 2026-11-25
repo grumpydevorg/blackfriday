@@ -169,11 +169,11 @@ body[data-host] .evidence-card .option-label{font-size:.95rem}
 .bhead:hover,.bline.open .bhead{background:#111c2c}
 .btime{color:#b9c7dc}
 .btag{display:inline-block;text-align:center;border-radius:.25rem;padding:0 .3rem;font-weight:800;font-size:.72rem;letter-spacing:.04em;border:1px solid}
-.btag-game{color:#ffd3ab;border-color:#8a6a4a}
 .btag-durable{color:#9fc4ff;border-color:#4a6fa8}
-.btag-event{color:#d7b6ff;border-color:#7a5aa8}
 .btag-microvm{color:#8cf1c0;border-color:#3e856f}
 .btag-web{color:#ffe08a;border-color:#a88a3e}
+.blevel-warn .btext{color:#ffd166}
+.blevel-error .btext{color:#ff7b72;font-weight:700}
 .btext{min-width:0;overflow-wrap:anywhere}
 .bbody{padding:.2rem .6rem .6rem 6.6rem}
 .bbody dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.1rem 1rem;margin:.2rem 0 .5rem}

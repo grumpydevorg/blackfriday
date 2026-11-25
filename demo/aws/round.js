@@ -83,8 +83,10 @@ function badge(source) {
 }
 
 // One ranked line. The working is in the tooltip; the outcome line says what happened and what the dice said.
+// Colour follows the outcome, not the dice: a lost cart is bad even when the roll was safe.
+const bad = row => row.outcome !== 'held';
 function boardRow(state, results, row, own) {
-  const line = make('article', '', `row ${row.hit ? 'hit' : 'ok'}${own ? ' own' : ''}`);
+  const line = make('article', '', `row ${bad(row) ? 'hit' : 'ok'}${own ? ' own' : ''}`);
   const name = make('span', row.name, 'name');
   if (row.bot) name.append(' ', make('span', 'bot', 'pill'));
   else if (row.house) name.append(' ', make('span', 'house', 'pill'));
@@ -93,7 +95,7 @@ function boardRow(state, results, row, own) {
   const dice = row.risk > 0 ? ` (rolled ${row.roll}, risk ${row.risk})` : '';
   line.append(
     make('span', `#${row.rank}`, 'rank'), name, pick,
-    make('span', `${row.event}${dice}`, row.hit ? 'outcome red' : 'outcome green'),
+    make('span', `${row.event}${dice}`, bad(row) ? 'outcome red' : 'outcome green'),
     make('span', money(row.cumulative_cents), 'money'),
   );
   line.title = `Sales ${row.sales}, slow ${row.slow}, failed ${row.failed} · cost ${money(row.cost_cents)}${row.refund_cents ? `, refunds ${money(row.refund_cents)}` : ''} · profit ${money(row.profit_cents)} · total ${money(row.cumulative_cents)}`;
@@ -203,7 +205,7 @@ function renderPhone(state) {
     );
     const head = make('p', '', 'option-head');
     head.append(make('span', optionLabel(state, results.round, mine.option), 'option-label'), badge(mine.evidence));
-    const nodes = [make('p', `${resultRound?.weeks ?? ''} · result`, 'kicker'), make('h2', `${resultRound?.title ?? 'Last round'}: #${mine.rank} of ${results.board.total}`), head, make('p', mine.event, `event ${mine.hit ? 'red' : 'green'}`)];
+    const nodes = [make('p', `${resultRound?.weeks ?? ''} · result`, 'kicker'), make('h2', `${resultRound?.title ?? 'Last round'}: #${mine.rank} of ${results.board.total}`), head, make('p', mine.event, `event ${bad(mine) ? 'red' : 'green'}`)];
     if (mine.risk > 0) nodes.push(make('p', `Dice: rolled ${mine.roll} against a risk of ${mine.risk}. ${mine.hit ? 'It hit.' : 'You were safe.'}`, 'dice'));
     if (resultRound) nodes.push(make('p', marketDraw(resultRound, results.market), 'market'));
     nodes.push(stats);
@@ -386,7 +388,8 @@ const limitName = event => {
 const BEHIND_POLL_MS = 2000;
 const LOGS_URL = 'https://ap-southeast-2.console.aws.amazon.com/cloudwatch/home?region=ap-southeast-2#logsV2:log-groups/log-group/';
 const clock = new Intl.DateTimeFormat('en-AU', { timeZone: 'Australia/Adelaide', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
-const TAGS = ['GAME', 'DURABLE', 'EVENT', 'MICROVM', 'WEB'];
+// The only tags a timeline line can carry (workflow.timeline_line and web.mjs webLine). Errors are a level, not a tag.
+const TAGS = ['DURABLE', 'MICROVM', 'WEB'];
 // The logsV2 fragment encodes the group name twice over: percent-encode, then escape each % as $25.
 const logGroupUrl = group => `${LOGS_URL}${encodeURIComponent(group).replaceAll('%', '$25')}`;
 const detailValue = value => (value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value));
@@ -397,13 +400,13 @@ let behindLines = [];
 const behindHidden = new Set();
 let behindQuery = '';
 const behindCounts = {};
-const lineTag = line => (TAGS.includes(line.tag) ? line.tag : 'EVENT');
-const lineHaystack = line => [clock.format(new Date(line.t)), lineTag(line), line.text, ...Object.values(line.detail ?? {}).map(detailValue)].join('\n').toLowerCase();
+const known = line => TAGS.includes(line.tag);
+const lineHaystack = line => [clock.format(new Date(line.t)), line.tag, line.level, line.text, ...Object.values(line.detail ?? {}).map(detailValue)].join('\n').toLowerCase();
 
 function behindLine(line) {
   const open = behindOpen.has(line.id);
-  const tag = lineTag(line);
-  const item = make('div', '', `bline${open ? ' open' : ''}`);
+  const tag = line.tag;
+  const item = make('div', '', `bline${open ? ' open' : ''}${['warn', 'error'].includes(line.level) ? ` blevel-${line.level}` : ''}`);
   item.dataset.id = line.id;
   const head = make('div', '', 'bhead');
   head.tabIndex = 0;
@@ -436,12 +439,13 @@ function renderBehind(lines) {
   if (signature === behindSignature) return;
   behindSignature = signature;
   behindLines = lines;
+  lines = lines.filter(known);
   const needle = behindQuery.trim().toLowerCase();
   const matching = needle ? lines.filter(line => lineHaystack(line).includes(needle)) : lines;
   const counts = Object.fromEntries(TAGS.map(tag => [tag, 0]));
-  for (const line of matching) counts[lineTag(line)] += 1;
+  for (const line of matching) counts[line.tag] += 1;
   for (const tag of TAGS) if (behindCounts[tag]) behindCounts[tag].textContent = String(counts[tag]);
-  const shown = matching.filter(line => !behindHidden.has(lineTag(line)));
+  const shown = matching.filter(line => !behindHidden.has(line.tag));
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
   const top = box.scrollTop;
   box.replaceChildren(...shown.map(behindLine));
