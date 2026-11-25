@@ -4,10 +4,11 @@
 const MAX_LINES = 10000;
 const HELLO_WAIT_MS = 5000;
 const POLL_MS = 2000;
-const KNOWN_TAGS = ['GAME', 'DURABLE', 'EVENT', 'VM', 'PHP', 'MICROVM', 'WEB', 'WORKFLOW', 'ERROR', 'WATCH'];
+// The log's vocabulary. A copy of TAGS and LEVEL_LIST in logs.mjs: test_logs.py fails when they differ.
+const KNOWN_TAGS = ['DURABLE', 'WORKFLOW', 'EVENT', 'MICROVM', 'VM', 'PHP', 'WEB', 'WATCH'];
 const TAG_COLOURS = {
-  GAME: '#3fb950', DURABLE: '#d2a8ff', EVENT: '#e3b341', VM: '#39c5cf', PHP: '#79e0ee', MICROVM: '#39c5cf',
-  WEB: '#58a6ff', WORKFLOW: '#ff9bce', ERROR: '#ff7b72', WATCH: '#ffffff',
+  DURABLE: '#d2a8ff', WORKFLOW: '#ff9bce', EVENT: '#e3b341', MICROVM: '#39c5cf', VM: '#56d4dd', PHP: '#9be9a8',
+  WEB: '#58a6ff', WATCH: '#ffffff',
 };
 const LEVELS = ['debug', 'info', 'warn', 'error'];
 const LEVEL_COLOURS = { debug: '#8b949e', info: '#e6edf3', warn: '#f2cc60', error: '#ff7b72' };
@@ -252,9 +253,8 @@ function ingest(list) {
 const TRAIL = 6;
 const STAGE_CARD = { launch: 'launch', migrate: 'migrations', compare: 'checks' };
 const VM_STAGES = new Set(['launch', 'migrations', 'checks']);
-const DETAIL_TAGS = new Set(['VM', 'PHP', 'EVENT', 'MICROVM']);
 const cards = new Map();      // card id -> card; the server re-sends a card with the same id when its numbers change
-const lineEvents = [];        // VM, PHP and EVENT log lines, kept to show under the card of their stage
+const lineEvents = [];        // log lines that name a stage, kept to show under the card of that stage
 const openCards = new Set();  // cards whose detail the presenter expanded
 const storyEl = $('story'), nowEl = $('story-now'), trailEl = $('story-trail'), toggleEl = $('story-toggle'), followEl = $('follow');
 let storyRun = null, storyTimer = null, playersKey = '';
@@ -272,8 +272,9 @@ function addCards(list) {
   }
   scheduleStory();
 }
+// A line belongs under a story card when it names its stage (launch, migrate or compare) in its own `detail.stage`.
 function collectDetail(ev) {
-  if (!DETAIL_TAGS.has(ev.tag)) return;
+  if (!ev.detail || !ev.detail.stage) return;
   lineEvents.push(ev);
   if (lineEvents.length > 3000) lineEvents.shift();
   scheduleStory();
@@ -288,23 +289,19 @@ function followedOption() {
   }
   return null;
 }
-/** The log lines that belong under a card: by the stage in their own label, else (VM/PHP) by time. */
-function attached(card, list) {
+/** The log lines that belong under a card: those whose own fields say so (stage, run, option), oldest first. */
+function attached(card) {
   if (!VM_STAGES.has(card.stage)) return [];
-  const next = list.find((other) => VM_STAGES.has(other.stage) && other.seq > card.seq);
   const mine = followedOption();
   const out = [];
   for (const ev of lineEvents) {
-    const stage = ev.detail && ev.detail.stage;
-    if (stage) {
-      if (STAGE_CARD[stage] !== card.stage) continue;
-    } else if (ev.tag === 'VM' || ev.tag === 'PHP') {
-      if (ev.ts < card.ts - 2000 || (next && ev.ts >= next.ts - 2000)) continue;
-    } else continue;
-    const option = ev.detail && ev.detail.option;
-    if (mine && option && option !== mine) continue;
+    const d = ev.detail;
+    if (STAGE_CARD[d.stage] !== card.stage) continue;
+    if (d.run && d.run !== storyRun) continue;
+    if (mine && d.option && d.option !== mine) continue;
     out.push(ev);
   }
+  out.sort((a, b) => a.ts - b.ts || (a.detail.seq || 0) - (b.detail.seq || 0));
   return out.slice(-60);
 }
 function el(tag, cls, text) {
@@ -313,8 +310,8 @@ function el(tag, cls, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
-function detailsFor(card, list) {
-  const events = attached(card, list);
+function detailsFor(card) {
+  const events = attached(card);
   if (!events.length) return null;
   const box = el('details', 'card-detail');
   box.open = openCards.has(card.id);
@@ -345,11 +342,11 @@ function renderStory() {
   if (!list.length) { nowEl.append(el('div', 'text', 'Waiting for the game…')); return; }
   const current = list[list.length - 1];
   nowEl.append(el('div', 'stage', current.title), el('div', 'text', current.text));
-  for (const part of [followBox(current, 'follow'), detailsFor(current, list)]) if (part) nowEl.append(part);
+  for (const part of [followBox(current, 'follow'), detailsFor(current)]) if (part) nowEl.append(part);
   for (const card of list.slice(-1 - TRAIL, -1).reverse()) {
     const past = el('div', 'past');
     past.append(el('div', 'stage', card.title), el('div', 'text', card.text));
-    for (const part of [followBox(card, 'follow'), detailsFor(card, list)]) if (part) past.append(part);
+    for (const part of [followBox(card, 'follow'), detailsFor(card)]) if (part) past.append(part);
     trailEl.append(past);
   }
 }

@@ -8,7 +8,7 @@ import { LambdaClient } from '@aws-sdk/client-lambda';
 import { GetParametersCommand, SSMClient } from '@aws-sdk/client-ssm';
 import { RequestError } from './game.mjs';
 import { memoryThrottle, presenterAuth } from './host_auth.mjs';
-import { createHub } from './logs.mjs';
+import { createHub, parseCursor } from './logs.mjs';
 
 // The presenter's live log as its own streaming Web Function. Only the sign-in page and the two small
 // files it needs are public; the viewer, its files and every data route need the presenter cookie or key.
@@ -119,20 +119,12 @@ function accessLine(entry, status) {
 
 // ---------------------------------------------------------------- streaming
 
-const cursorOf = (...values) => {
-  for (const value of values) {
-    if (value === undefined || value === '') continue;
-    const number = Number(value);
-    if (Number.isFinite(number)) return number;
-  }
-  return undefined;
-};
 const message = (ts, event) => `id: ${ts}\ndata: ${JSON.stringify(event)}\n\n`;
 const statusMessage = status => `event: status\ndata: ${JSON.stringify(status)}\n\n`;
 
 function stream(request, response, query) {
   const debug = query.get('debug') === '1';
-  const cursor = cursorOf(request.headers['last-event-id'], query.get('after'));
+  const cursor = parseCursor(request.headers['last-event-id'], query.get('after'));
   response.writeHead(200, headersFor('text/event-stream', { 'X-Accel-Buffering': 'no' }));
   response.flushHeaders();
   request.socket.setNoDelay(true);
@@ -200,7 +192,7 @@ async function route(request, response, path, query) {
   if (path === '/stream') return stream(request, response, query);
   if (path === '/events') {
     await hub.touch();
-    const events = hub.eventsAfter(cursorOf(query.get('after')), query.get('debug') === '1');
+    const events = hub.eventsAfter(parseCursor(query.get('after')), query.get('debug') === '1');
     return json(response, 200, { now: Date.now(), events, status: hub.status, story: hub.storyCards() });
   }
   if (path === '/api/status') {

@@ -1,5 +1,6 @@
 import { ROUNDS } from './game.mjs';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { GetItemCommand } from '@aws-sdk/client-dynamodb';
 import { GetDurableExecutionHistoryCommand } from '@aws-sdk/client-lambda';
 import { FilterLogEventsCommand, StartLiveTailCommand } from '@aws-sdk/client-cloudwatch-logs';
@@ -8,6 +9,13 @@ import { FilterLogEventsCommand, StartLiveTailCommand } from '@aws-sdk/client-cl
 // {id, ts, tag, level, source, text, detail}; id and ts come from the data, never from the clock, so
 // two environments that read the same records produce the same ids and a client can dedupe by id.
 
+/** The log's one vocabulary. logs_page/logs.js keeps a copy of TAGS and LEVEL_LIST, and test_logs.py checks the copy
+ *  against these. An error is a level, never a tag. WATCH is this function's own status line: nothing read from
+ *  CloudWatch, DynamoDB or Durable can carry it. */
+export const TAGS = Object.freeze(['DURABLE', 'WORKFLOW', 'EVENT', 'MICROVM', 'VM', 'PHP', 'WEB', 'WATCH']);
+export const LEVEL_LIST = Object.freeze(['debug', 'info', 'warn', 'error']);
+const LEVELS = new Set(LEVEL_LIST);
+
 export const WINDOW_MS = 20 * 60_000;      // how much the shared buffer keeps
 export const BACKFILL_MS = 15 * 60_000;    // the first read of a log group
 export const OVERLAP_MS = 60_000;          // late-arriving CloudWatch ingestion; also the resume overlap
@@ -15,6 +23,13 @@ export const DEBUG_CAP = 3000;
 export const PAGE_CAP = 5;
 const TEXT_MAX = 500;
 const ERROR_MAX = 200;
+const MSG_MAX = 200;                       // the longest `msg` of a structured line
+
+// What rounds.json says: the rounds, and the options whose evidence is a real MicroVM run (never listed by hand here).
+const ROUND_LIST = ROUNDS.map(round => round.id);
+const ROUND = new Map(ROUNDS.map(round => [round.id, round]));
+export const REAL_OPTIONS = ROUNDS.flatMap(round => round.options).filter(option => option.evidence === 'real').map(option => option.id);
+const ACTIONS = ['launch', 'migrate', 'compare'];
 
 // ---------------------------------------------------------------- redaction
 
@@ -51,26 +66,21 @@ function cleanDetail(value, depth = 0) {
   return undefined;
 }
 
-const squash = text => redact(String(text ?? '').split(/\s+/).filter(Boolean).join(' '));
-const LEVELS = new Set(['debug', 'info', 'warn', 'error']);
+const squash = text => String(text ?? '').split(/\s+/).filter(Boolean).join(' ');
+/** Redact first, then cut: a cut can never leave the front half of a receipt behind. */
+const clip = (text, max) => redact(text).slice(0, max);
 
 function make(id, ts, tag, level, source, text, detail) {
-  return {
-    id, ts, tag, level: LEVELS.has(level) ? level : 'info', source,
-    text: squash(text).slice(0, TEXT_MAX), detail: cleanDetail(detail ?? {}) ?? {},
-  };
+  if (!TAGS.includes(tag)) throw new Error(`Not a log tag: ${tag}`);
+  if (!LEVELS.has(level)) throw new Error(`Not a log level: ${level}`);
+  return { id, ts, tag, level, source, text: clip(squash(text), TEXT_MAX), detail: cleanDetail(detail ?? {}) ?? {} };
 }
 
 // ---------------------------------------------------------------- CloudWatch lines
 
-const LEVEL_NAMES = { DEBUG: 'debug', INFO: 'info', WARN: 'warn', WARNING: 'warn', ERROR: 'error', CRITICAL: 'error', FATAL: 'error' };
-const ERRORISH = /\b(ERROR|Error|Exception|Traceback|FAILED|Task timed out)\b/;
-const WARNISH = /\b(WARN|WARNING|warn|warning|retry|retrying|fallback)\b/;
+const ERRORISH = /\b(ERROR|Error|Exception|Traceback|FAILED|Task timed out)\b/;   // only for lines that are not structured
 const REPORT = /REPORT RequestId: \S+\s+Duration: ([\d.]+) ms.*?(?:Init Duration: ([\d.]+) ms)?\s*$/s;
 const CONTRACT = /(?:^|\s)\[(EVENT|VM|PHP|WORKFLOW)\] ?([^]*)$/;
-const PHP_ACCESS = /^([A-Z]+) (\S+) (\d{3}) ([\d.]+) ms\b/;
-const STAGE_LINE = /^(\S+) (\S+): /;
-const STEP_LINE = /^([^\s:]+): /;
 const ACCESS_KEYS = ['method', 'route', 'status', 'ms', 'phase', 'round'];
 const ACCESS_IN_TEXT = /\{[^{}]*"bf"\s*:\s*"access"[^{}]*\}/;
 const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -81,7 +91,7 @@ function jsonOf(text) {
 }
 
 function accessLevel(status, given) {
-  if (typeof given === 'string' && Object.values(LEVEL_NAMES).includes(given.toLowerCase())) return given.toLowerCase();
+  if (typeof given === 'string' && LEVELS.has(given)) return given;
   status = Number.isInteger(status) ? status : 0;
   return status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info';
 }
@@ -118,45 +128,79 @@ function accessText(access) {
   return extra ? `${text} · ${extra}` : text;
 }
 
-function contractLevel(tag, text, hint) {
-  if (tag === 'PHP') {
-    const match = PHP_ACCESS.exec(text);
-    if (match) {
-      const status = Number(match[3]);
-      return status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info';
-    }
-  }
-  if (hint) return hint;
-  if (ERRORISH.test(text) || text.includes(' failed')) return 'error';
-  return WARNISH.test(text) ? 'warn' : 'info';
+// ---- the structured lines: `[VM] <json>`, `[EVENT] <json>`, `[WORKFLOW] <json>`
+//
+// Each is one JSON object whose fields are closed: exactly the contract's field set, each of the contract's type and
+// value. A line that breaks it is not shown (never raw): it is dropped and counted, and the hub says so in one WATCH
+// line. The level always comes from the line itself. PHP is not a prefix: a VM entry of kind `php` is tagged PHP.
+
+const isInt = value => Number.isInteger(value) && value >= 0;
+const FIELD = {
+  seq: isInt, t: isInt, ms: isInt, status: isInt,
+  kind: value => value === 'stage' || value === 'php',
+  level: value => LEVELS.has(value),
+  run: value => typeof value === 'string' && /^[0-9a-f]{8}$/.test(value),
+  action: value => ACTIONS.includes(value),
+  option: value => value === null || REAL_OPTIONS.includes(value),
+  msg: value => typeof value === 'string' && value.length <= MSG_MAX,
+  method: value => typeof value === 'string' && /^[A-Z]{3,7}$/.test(value),
+  path: value => typeof value === 'string' && value.startsWith('/') && !value.includes('?') && value.length <= MSG_MAX,
+  step: value => typeof value === 'string' && /^[a-z0-9-]{1,48}$/.test(value),
+  round: value => value === null || ROUND_LIST.includes(value),
+};
+const VM_REQUIRED = ['seq', 't', 'kind', 'level', 'run', 'action', 'option', 'msg'];
+const PHP_REQUIRED = [...VM_REQUIRED, 'method', 'path', 'status', 'ms'];
+const EVENT_REQUIRED = ['t', 'level', 'action', 'option', 'step', 'msg'];
+const WORKFLOW_REQUIRED = ['step', 'round', 'level', 'msg'];
+
+/** True when `record` is an object with every required field, no field outside required + optional, and each valid. */
+function closed(record, required, optional = []) {
+  if (!isRecord(record)) return false;
+  const keys = Object.keys(record);
+  return required.every(key => Object.hasOwn(record, key)) && keys.every(key => (required.includes(key) || optional.includes(key)) && FIELD[key](record[key]));
 }
 
-/** `[EVENT] ...`, `[VM] ...`, `[PHP] ...` or `[WORKFLOW] ...`, also inside a JSON record's `message`. */
-export function parseContract(message) {
-  let hint;
-  message = message.trim();
-  if (message.startsWith('{')) {
-    const record = jsonOf(message);
-    if (isRecord(record) && typeof record.message === 'string') {
-      message = record.message.trim();
-      hint = LEVEL_NAMES[String(record.level ?? '').toUpperCase()];
-    }
+/** `{tag, level, text, detail, at}` for a valid structured line, or undefined. `at` is the line's own time, when it has one. */
+function structured(tag, record) {
+  if (tag === 'VM') {
+    const php = isRecord(record) && record.kind === 'php';
+    if (!closed(record, php ? PHP_REQUIRED : VM_REQUIRED, php ? [] : ['ms'])) return undefined;
+    const { run, action, option, seq, msg, ms } = record;
+    const detail = { run, stage: action, ...(option && { option }), seq };
+    if (php) Object.assign(detail, { method: record.method, path: record.path, status: record.status, ms });
+    else if (ms !== undefined) detail.ms = ms;
+    return { tag: php ? 'PHP' : 'VM', level: record.level, text: `${action}${option ? ` ${option}` : ''}: ${msg}`, detail, at: record.t };
   }
-  const match = CONTRACT.exec(message);
+  if (tag === 'EVENT') {
+    if (!closed(record, EVENT_REQUIRED, ['ms'])) return undefined;
+    const { action, option, step, msg, ms } = record;
+    return { tag, level: record.level, text: `${step}: ${msg}`, detail: { stage: action, step, ...(option && { option }), ...(ms !== undefined && { ms }) }, at: record.t };
+  }
+  if (tag === 'WORKFLOW') {
+    if (!closed(record, WORKFLOW_REQUIRED)) return undefined;
+    return { tag, level: record.level, text: `${record.step}: ${record.msg}`, detail: { step: record.step, ...(record.round && { round: record.round }) } };
+  }
+  return undefined;
+}
+
+/** Which structured tags each log group may carry: the evaluator its own lines and the VM entries it relays, the workflow its own. */
+const CONTRACT_TAGS = { EVENT: ['EVENT', 'VM'], WORKFLOW: ['WORKFLOW'] };
+
+/**
+ * `[EVENT] <json>`, `[VM] <json>` or `[WORKFLOW] <json>` (also inside a JSON record's `message`) read in the log group
+ * `group` -> a line, `{invalid: tag}` when the prefix is there but the line is not valid, or undefined when it is no
+ * structured line at all.
+ */
+export function parseContract(message, group) {
+  let line = message.trim();
+  if (line.startsWith('{')) {
+    const record = jsonOf(line);
+    if (isRecord(record) && typeof record.message === 'string') line = record.message.trim();
+  }
+  const match = CONTRACT.exec(line);
   if (!match) return undefined;
-  const tag = match[1], text = match[2].split(/\s+/).filter(Boolean).join(' ');
-  let detail = {};
-  if (tag === 'PHP') {
-    const php = PHP_ACCESS.exec(text);
-    if (php) detail = { method: php[1], path: php[2], status: Number(php[3]), ms: Number(php[4]) };
-  } else if (tag === 'EVENT') {
-    const stage = STAGE_LINE.exec(text);
-    if (stage) detail = { stage: stage[1], option: stage[2] === '-' ? null : stage[2] };
-  } else if (tag === 'WORKFLOW') {
-    const step = STEP_LINE.exec(text);
-    if (step) detail = { step: step[1] };
-  }
-  return { tag, level: contractLevel(tag, text, hint), text, detail };
+  const tag = match[1];
+  return (CONTRACT_TAGS[group] ?? []).includes(tag) ? structured(tag, jsonOf(match[2].trim())) ?? { invalid: tag } : { invalid: tag };
 }
 
 /** `/aws/lambda/web/black-friday-four` -> `web/black-friday-four`. */
@@ -176,19 +220,20 @@ export function groupTag(group) {
 const shown = (message, record) => String(record?.message ?? message);
 const seconds = ms => (Number(ms) / 1000);
 
-/** One CloudWatch message -> {tag, level, text, detail} or undefined (dropped). */
+/**
+ * One CloudWatch message -> {tag, level, text, detail, at?}, {invalid: tag} (a structured line that broke its contract)
+ * or undefined (dropped). A platform or runtime error keeps the tag of its own group and gets level error.
+ */
 export function classify(groupKind, rawMessage) {
   const message = String(rawMessage ?? '').trim();
   if (!message) return undefined;
   const tag = groupKind;
-  const failure = (label, text, extra = {}) => ({
-    tag: 'ERROR', level: 'error', text: `${label}: ${text}`.slice(0, ERROR_MAX), detail: { raw: message.slice(0, 2000), ...extra },
-  });
+  const failure = text => ({ tag, level: 'error', text: clip(text, ERROR_MAX), detail: { raw: message } });
   if (tag === 'WEB') {
     const access = parseAccess(message);
     if (access) return { tag: 'WEB', level: access.level, text: accessText(access), detail: access };
   } else {
-    const line = parseContract(message);
+    const line = parseContract(message, tag);
     if (line) return line;
   }
   const record = message.startsWith('{') ? jsonOf(message) : undefined;
@@ -208,8 +253,7 @@ export function classify(groupKind, rawMessage) {
         text: kind + (body.status ? ` ${body.status}` : ''), detail: { type: kind, ...(body.status && { status: body.status }) },
       };
     }
-    if (record.level === 'ERROR' || ERRORISH.test(String(record.message ?? ''))) return failure('web', shown(message, record));
-    return undefined;
+    return record.level === 'ERROR' || ERRORISH.test(String(record.message ?? '')) ? failure(shown(message, record)) : undefined;
   }
   if (tag === 'WORKFLOW' && isRecord(record)) {
     if (record.type === 'platform.report') {
@@ -223,22 +267,7 @@ export function classify(groupKind, rawMessage) {
         detail: { duration_s: seconds(metrics.durationMs ?? 0), ...(body.status && { status: body.status }) },
       };
     }
-    if (['ERROR', 'CRITICAL'].includes(record.level) || ERRORISH.test(String(record.message ?? ''))) {
-      return failure('workflow', shown(message, record));
-    }
-    if ('fallback' in record) {
-      return {
-        tag: 'ERROR', level: 'warn', text: `workflow fell back to recorded evidence: ${record.fallback} · ${record.error ?? ''}`.slice(0, ERROR_MAX),
-        detail: { fallback: record.fallback, ...(record.action && { action: record.action }) },
-      };
-    }
-    if ('timeline_error' in record) {
-      return {
-        tag: 'ERROR', level: 'warn', text: `workflow timeline write failed: ${record.timeline_error}`.slice(0, ERROR_MAX),
-        detail: {},
-      };
-    }
-    return undefined;
+    return ['ERROR', 'CRITICAL'].includes(record.level) || ERRORISH.test(String(record.message ?? '')) ? failure(shown(message, record)) : undefined;
   }
   if (tag === 'EVENT') {
     const match = REPORT.exec(message);
@@ -250,18 +279,10 @@ export function classify(groupKind, rawMessage) {
       };
     }
     if (/^(START|END|INIT_START)/.test(message)) return undefined;
-    if (ERRORISH.test(message)) return failure('event', message);
-    return { tag: 'EVENT', level: 'info', text: message, detail: {} };
   }
-  if (tag === 'MICROVM') {
-    let text = message;
-    if (isRecord(record)) text = String(record.message ?? record.log ?? message).trim();
-    if (text.startsWith('#') && !ERRORISH.test(text)) return undefined;   // image build output
-    if (ERRORISH.test(text) || text.includes(' failed with code ') || text.includes('php: PHP ')) return failure('microvm', text);
-    return { tag: 'MICROVM', level: 'info', text, detail: {} };
-  }
-  if (ERRORISH.test(message)) return failure(tag.toLowerCase(), message);
-  return undefined;
+  // The MicroVM group carries nothing structured (the evaluator relays the VM's entries); only an error shows.
+  const text = tag === 'MICROVM' && isRecord(record) ? String(record.message ?? record.log ?? message).trim() : message;
+  return ERRORISH.test(text) ? failure(text) : undefined;
 }
 
 /**
@@ -272,37 +293,52 @@ export function cloudWatchId(group, raw) {
   return `cw:${createHash('sha1').update(`${group}\n${Number(raw.timestamp)}\n${raw.message}`).digest('hex').slice(0, 16)}`;
 }
 
-/** The short `source` of a CloudWatch line: web, workflow, evaluator or vm ([VM]/[PHP] lines and the MicroVM image group). */
+/** The short `source` of a CloudWatch line: web, workflow, evaluator or vm (VM and PHP entries and the MicroVM image group). */
 export function sourceOf(group, tag) {
   if (tag === 'VM' || tag === 'PHP') return 'vm';
   return { WEB: 'web', WORKFLOW: 'workflow', EVENT: 'evaluator', MICROVM: 'vm' }[groupTag(group)];
 }
 
-const STAGE_IN_TEXT = /(?:^|\[|\s)(launch|migrate|compare)(?:\s+(careful|fast|-))?(?=[\]:\s]|$)/;
-
-/** Which launch, migrate or compare stage (and option) a VM, PHP, EVENT or MicroVM line is about, from its own label. */
-export function stageOf(text) {
-  const match = STAGE_IN_TEXT.exec(String(text).slice(0, 80));
-  return match ? { stage: match[1], ...(match[2] && match[2] !== '-' && { option: match[2] }) } : undefined;
-}
-
-/** A CloudWatch event -> an event, or undefined when it is noise. Id and ts come from the log line itself. */
-export function fromCloudWatch(group, raw) {
+/**
+ * A CloudWatch event -> {event} (shown), {invalid: tag} (a structured line that broke its contract: the caller counts it)
+ * or {} (noise). Id comes from the log line; ts from the line's own time (VM entries and evaluator lines carry one) held
+ * within the resume overlap of the CloudWatch time, so a cursor-based resume can never miss it.
+ */
+export function inspectCloudWatch(group, raw) {
   const line = classify(groupTag(group), raw.message);
-  if (!line) return undefined;
-  const detail = ['VM', 'PHP', 'EVENT', 'MICROVM'].includes(line.tag) && !line.detail.stage ? { ...line.detail, ...stageOf(line.text) } : line.detail;
-  return make(cloudWatchId(group, raw), Number(raw.timestamp), line.tag, line.level, sourceOf(group, line.tag), line.text, detail);
+  if (!line) return {};
+  if (line.invalid) return { invalid: line.invalid };
+  const logged = Number(raw.timestamp);
+  const ts = Number.isFinite(line.at) ? Math.min(logged, Math.max(line.at, logged - OVERLAP_MS)) : logged;
+  return { event: make(cloudWatchId(group, raw), ts, line.tag, line.level, sourceOf(group, line.tag), line.text, line.detail) };
 }
+
+/** A CloudWatch event -> an event, or undefined when it is noise or an invalid structured line. */
+export const fromCloudWatch = (group, raw) => inspectCloudWatch(group, raw).event;
 
 /** `arn:aws:logs:<region>:<account>:log-group:<name>[:*]` or `<account>:<name>` -> `<name>`. */
 export const groupOfIdentifier = identifier => String(identifier ?? '').split('log-group:').pop().replace(/:\*$/, '').replace(/^\d{12}:/, '');
+
+/**
+ * The resume cursor of a request: the first of `values` (Last-Event-ID, then `after=`) that is a non-negative number.
+ * A missing value is undefined, meaning "from the start of the window". A missing query parameter reaches here as `null`,
+ * and `Number(null)` is 0: it must never be read as the cursor 0.
+ */
+export function parseCursor(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || String(value).trim() === '') continue;
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) return number;
+  }
+  return undefined;
+}
 
 // ---------------------------------------------------------------- Durable history
 
 const SKIP_STARTED = new Set(['StepStarted', 'ContextStarted']);
 const stamp = value => new Date(value).getTime();
 
-/** [text, 'ERROR'|null] or null. `started` maps operation id -> start time in seconds, and is updated. */
+/** [text, level] or null. `started` maps operation id -> start time in seconds, and is updated. */
 export function durableLine(event, started) {
   const kind = event.EventType, name = event.Name ?? '', sub = event.SubType ?? '';
   const at = stamp(event.EventTimestamp) / 1000;
@@ -310,21 +346,25 @@ export function durableLine(event, started) {
   const elapsed = op in started ? ` ${(at - started[op]).toFixed(1)} s` : '';
   if (kind.endsWith('Started') && op) started[op] = at;
   if (sub === 'ParallelBranch') return null;
-  if (kind === 'ExecutionStarted') return ['execution started', null];
-  if (kind === 'ExecutionSucceeded') return ['execution finished: game over', null];
-  if (['ExecutionFailed', 'ExecutionTimedOut', 'ExecutionStopped'].includes(kind)) return [`execution ${kind.slice(9).toLowerCase()}`, 'ERROR'];
-  if (kind === 'InvocationCompleted') return ['invocation ended · workflow suspended; the next one replays from checkpoints', null];
-  if (kind === 'ContextStarted' && sub === 'Parallel') return [`${name}: started in parallel`, null];
+  if (kind === 'ExecutionStarted') return ['execution started', 'info'];
+  if (kind === 'ExecutionSucceeded') return ['execution finished: game over', 'info'];
+  if (['ExecutionFailed', 'ExecutionTimedOut', 'ExecutionStopped'].includes(kind)) return [`execution ${kind.slice(9).toLowerCase()}`, 'error'];
+  if (kind === 'InvocationCompleted') return ['invocation ended · workflow suspended; the next one replays from checkpoints', 'info'];
+  if (kind === 'ContextStarted' && sub === 'Parallel') return [`${name}: started in parallel`, 'info'];
   if (SKIP_STARTED.has(kind)) return null;
-  if (kind === 'ChainedInvokeStarted') return [`${name}: invoke Event judge (MicroVM)`, null];
-  if (kind === 'CallbackStarted') return [`${name}: waiting for the presenter to Close`, null];
-  if (kind === 'CallbackSucceeded') return [`${name}: Close received after${elapsed}`, null];
+  if (kind === 'ChainedInvokeStarted') return [`${name}: invoke Event judge (MicroVM)`, 'info'];
+  if (kind === 'CallbackStarted') return [`${name}: waiting for the presenter to Close`, 'info'];
+  // One source per fact: the timeline states these with their numbers (see TIMELINE_TWIN), so the history stays silent.
+  if (kind === 'StepSucceeded' && TIMELINE_TWIN.test(name)) return null;
+  if (kind === 'CallbackSucceeded' && CLOSE_CALLBACK.test(name)) return null;
+  if (kind === 'CallbackSucceeded') return [`${name}: Close received after${elapsed}`, 'info'];
   if (kind.endsWith('Succeeded')) {
-    const label = { Step: 'step', ChainedInvoke: 'invoke', Parallel: 'parallel' }[sub] ?? (sub.toLowerCase() || 'op');
-    return [`${name}: ${label} done${elapsed.trim() === '0.0 s' ? '' : elapsed}`, null];
+    const type = sub || kind.slice(0, -'Succeeded'.length);
+    const label = { Step: 'step', ChainedInvoke: 'invoke', Parallel: 'parallel' }[type] ?? (type.toLowerCase() || 'op');
+    return [`${name}: ${label} done${elapsed.trim() === '0.0 s' ? '' : elapsed}`, 'info'];
   }
-  if (/(Failed|TimedOut|Stopped)$/.test(kind)) return [`${name}: ${sub || 'op'} ${kind}${elapsed}`, 'ERROR'];
-  return [`${name || '-'}: ${kind}`, null];
+  if (/(Failed|TimedOut|Stopped)$/.test(kind)) return [`${name}: ${sub || 'op'} ${kind}${elapsed}`, 'error'];
+  return [`${name || '-'}: ${kind}`, 'info'];
 }
 
 const TERMINAL = new Set(['ExecutionSucceeded', 'ExecutionFailed', 'ExecutionTimedOut', 'ExecutionStopped']);
@@ -337,7 +377,7 @@ export function fromDurable(arn, history) {
   for (const event of sorted) {
     const line = durableLine(event, started);
     if (!line) continue;
-    out.push(make(`du:${arn.slice(-12)}:${event.EventId}`, stamp(event.EventTimestamp), 'DURABLE', line[1] ? 'error' : 'info',
+    out.push(make(`du:${arn.slice(-12)}:${event.EventId}`, stamp(event.EventTimestamp), 'DURABLE', line[1],
       'durable', line[0], { event_type: event.EventType, name: event.Name, sub_type: event.SubType }));
   }
   return out;
@@ -345,33 +385,51 @@ export function fromDurable(arn, history) {
 
 // ---------------------------------------------------------------- game state
 
-// The workflow's timeline lines for rounds (registered, open-, close-, plan-, score-, results-, final) repeat what the
-// Durable history and the [WORKFLOW] log lines already say, so only the real-VM evidence and the web function's own
-// lines are kept. Nothing from the timeline is ever tagged EVENT or GAME.
-const VM_EVIDENCE = /^(launch|migrate-(careful|fast)|compare-(careful|fast))$/;
-const WEB_LINE = /^web-(start|close-.+|reset)$/;
+// Two sources describe the same moments: the timeline (what the workflow and the web function decided, with their
+// counts) and Durable history (the engine's own events). Each fact is shown once, and the timeline wins for what it
+// states: registered, open, Close received, plan, score, results, final, expiry, the evidence and the presenter's
+// actions. So the history drops the "step done" of a step whose timeline line says the same thing, and the "Close
+// received after N s" of the Close callback; it keeps everything else (execution start and end, invokes, callbacks
+// waiting, failures, suspensions).
+const TIMELINE_TWIN = new RegExp(`^(?:register-execution|timeline-evidence|publish-final|(?:publish-open|plan|score|publish-results|expire-close)-(?:${ROUND_LIST.join('|')}))$`);
+const CLOSE_CALLBACK = new RegExp(`^await-close-(?:${ROUND_LIST.join('|')})$`);
 
-function evidenceLevel(text) {
-  if (ERRORISH.test(text) || text.includes(' failed')) return 'error';
-  return WARNISH.test(text) || /\bLOST\b/.test(text) ? 'warn' : 'info';
+// The ids a timeline line may have, with the tags it may carry: evidence is MICROVM when a VM really ran and DURABLE
+// when the recorded result was used; the workflow's own decisions are DURABLE; the presenter's actions are WEB.
+const TIMELINE_IDS = [
+  [new RegExp(`^(?:launch|(?:migrate|compare)-(?:${REAL_OPTIONS.join('|')}))$`), ['MICROVM', 'DURABLE']],
+  [new RegExp(`^(?:registered|final|(?:open|close|plan|score|results|expire)-(?:${ROUND_LIST.join('|')}))$`), ['DURABLE']],
+  [new RegExp(`^web-(?:start|reset|close-(?:${ROUND_LIST.join('|')}))$`), ['WEB']],
+];
+const TIMELINE_FIELDS = ['t', 'id', 'tag', 'level', 'text', 'detail', 'log_group'];
+const EVIDENCE_ID = /^(launch|migrate|compare)(?:-|$)/;
+const EVIDENCE_TAG = { real: 'MICROVM', recorded: 'DURABLE' };   // detail.source -> the only tag that source may carry
+
+/** The tag and level come from the line; a line whose id, tag, level or fields are outside the contract is invalid. */
+function timelineLine(line) {
+  if (!isRecord(line) || typeof line.id !== 'string') return false;
+  const tags = TIMELINE_IDS.find(([pattern]) => pattern.test(line.id))?.[1];
+  return Boolean(tags) && Object.keys(line).every(key => TIMELINE_FIELDS.includes(key))
+    && typeof line.t === 'number' && Number.isFinite(line.t) && tags.includes(line.tag) && LEVELS.has(line.level) && typeof line.text === 'string'
+    && (line.detail === undefined || isRecord(line.detail)) && (line.log_group === undefined || typeof line.log_group === 'string')
+    // Evidence that really ran is MICROVM and recorded evidence is DURABLE, never the other way round.
+    && (!EVIDENCE_ID.test(line.id) || EVIDENCE_TAG[line.detail?.source] === line.tag);
 }
 
-/** `timeline#<run>` lines -> events. Ids: tl:<run8>:<line id>. */
-export function fromTimeline(runId, lines) {
-  const out = [];
-  for (const line of lines) {
-    if (!isRecord(line) || !Number.isFinite(Number(line.t)) || typeof line.id !== 'string') continue;
-    const web = WEB_LINE.test(line.id);
-    if (!web && !VM_EVIDENCE.test(line.id)) continue;
-    const text = String(line.text ?? '');
-    const detail = {
-      ...(isRecord(line.detail) ? line.detail : {}),
-      ...(typeof line.log_group === 'string' && line.log_group && { log_group: line.log_group }),
-    };
-    out.push(make(`tl:${runId.slice(0, 8)}:${line.id}`, Number(line.t), web ? 'WEB' : 'MICROVM', web ? 'info' : evidenceLevel(text),
-      web ? 'web' : 'workflow', text, detail));
-  }
-  return out;
+/**
+ * `timeline#<run>` lines -> {events, lines, invalid}: the events to show (ids tl:<run8>:<line id>), the valid lines
+ * (the story reads these) and one key per invalid line, for the caller to count.
+ */
+export function fromTimeline(runId, raw) {
+  const run8 = runId.slice(0, 8), events = [], lines = [], invalid = [];
+  raw.forEach((line, index) => {
+    if (!timelineLine(line)) { invalid.push(`tl:${run8}:#${index}`); return; }
+    lines.push(line);
+    const stage = EVIDENCE_ID.exec(line.id)?.[1];
+    const detail = { ...line.detail, ...(line.log_group && { log_group: line.log_group }), ...(stage && { stage }) };
+    events.push(make(`tl:${run8}:${line.id}`, line.t, line.tag, line.level, line.tag === 'WEB' ? 'web' : 'workflow', line.text, detail));
+  });
+  return { events, lines, invalid };
 }
 
 /** {run8, phase, round, players, picked}: counts only, no names and no tokens. */
@@ -391,8 +449,6 @@ export function snapshot(item) {
 
 // ---------------------------------------------------------------- roster, story cards and follow lines
 
-const ROUND_LIST = ROUNDS.map(round => round.id);
-const ROUND = new Map(ROUNDS.map(round => [round.id, round]));
 const optionLabel = (round, option) => ROUND.get(round)?.options.find(candidate => candidate.id === option)?.label ?? String(option);
 const roundName = round => String(ROUND.get(round)?.title ?? round).split('·').pop().trim();
 const ordinal = n => { const suffix = ['th', 'st', 'nd', 'rd'], v = n % 100; return `${n}${suffix[(v - 20) % 10] || suffix[v] || suffix[0]}`; };
@@ -411,7 +467,7 @@ export function parseRoster(item) {
 }
 
 function playerEvent(run8, player, kind, at, level, text, detail) {
-  return make(`pl:${run8}:${player}:${kind}`, at, 'PLAYER', level, 'arena', text, { player, ...detail });
+  return make(`pl:${run8}:${player}:${kind}`, at, 'WEB', level, 'arena', text, { player, ...detail });
 }
 
 /** What changed between two rosters of one run. `previous` is a Map id -> player, or undefined for the first look. */
@@ -478,11 +534,21 @@ export function rowLines(row, round) {
   return out;
 }
 
+// An option whose recorded evidence loses the carts is the designed fumble: its loss is the lesson, not a failure.
+// Only a loss by any other option is unexpected.
+const FUMBLES = new Set(Object.entries(JSON.parse(readFileSync(new URL('./rounds.json', import.meta.url))).recorded_evidence)
+  .filter(([, result]) => result.cart_kept === false).map(([option]) => option));
+/** What a real check found, in words: kept, fumbled (the designed loss) or lost (unexpected). */
+function cartOutcome(option, kept) {
+  return kept ? 'kept' : FUMBLES.has(option) ? 'fumbled' : 'lost';
+}
+
 function pickLine(player, round, option, evidence) {
   let line = `${player.name} picked ${optionLabel(round, option)}`;
   const result = evidence?.[option];
   if (round === 'growth' && isRecord(result) && result.source === 'real' && typeof result.cart_kept === 'boolean') {
-    line += `: their shop is the real VM that ${result.cart_kept ? 'kept' : 'lost'} Maya's cart`;
+    const outcome = cartOutcome(option, result.cart_kept);
+    line += `: their shop is the real VM that ${outcome === 'kept' ? "kept Maya's cart" : outcome === 'fumbled' ? "fumbled the migration, skipping the carts by design" : "lost Maya's cart (unexpected)"}`;
   }
   return sentence(line);
 }
@@ -565,9 +631,12 @@ export function buildStory({ item, players, history, lines, results, firstSeen, 
   }
   const checkedC = ops.get('compare-careful'), checkedF = ops.get('compare-fast');
   if (checkedC || checkedF || byId.has('compare-careful') || byId.has('compare-fast')) {
-    const verdict = option => (isRecord(evidence?.[option]) && typeof evidence[option].cart_kept === 'boolean'
-      ? `${option} ${evidence[option].cart_kept ? 'KEPT' : 'LOST'} it` : undefined);
-    const said = [verdict('careful'), verdict('fast')].filter(Boolean);
+    const verdict = option => {
+      if (!isRecord(evidence?.[option]) || typeof evidence[option].cart_kept !== 'boolean') return undefined;
+      const outcome = cartOutcome(option, evidence[option].cart_kept);
+      return outcome === 'kept' ? `${option} kept it` : outcome === 'fumbled' ? `${option} fumbled it (carts skipped by design)` : `${option} LOST it (unexpected)`;
+    };
+    const said = REAL_OPTIONS.map(verdict).filter(Boolean);
     add('checks', SEQ.checks, earliest(checkedC?.started, checkedF?.started, byId.get('compare-careful')?.t), 'Checks',
       `Two fresh VMs restore each database and look for Maya's cart${said.length ? `: ${said.join(', ')}` : ''}.`);
   }
@@ -642,6 +711,19 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
   let roster = { run: undefined, players: undefined }, latestPlayers = [], cards = [], storyChanged = [], cardJson = new Map();
   const durable = new Map();          // arn -> complete history of a finished execution
   let sorted = [], dirty = false, status = snapshot(undefined);
+  // Lines that broke their contract are dropped, never shown raw, and counted here: by what they claimed to be.
+  const dropped = new Map(), countedInvalid = new Set();
+  let droppedTotal = 0, droppedShown = 0;
+  const drop = what => { dropped.set(what, (dropped.get(what) ?? 0) + 1); droppedTotal++; };
+  /** One WATCH warn line per batch that dropped something. The id carries the running total, so each batch has its own. */
+  function droppedEvent() {
+    if (droppedTotal === droppedShown) return undefined;
+    droppedShown = droppedTotal;
+    const parts = [...dropped].map(([what, count]) => `${what} ${count}`).join(', ');
+    return make(`wt:dropped:${droppedTotal}`, now(), 'WATCH', 'warn', 'logs',
+      `${droppedTotal} log line${droppedTotal === 1 ? '' : 's'} broke the log contract and ${droppedTotal === 1 ? 'was' : 'were'} dropped (${parts})`,
+      { dropped: droppedTotal, ...Object.fromEntries(dropped) });
+  }
   let connections = 0, lastTouch = -Infinity, timer, running = false, inflight, polls = 0, lastDone = -Infinity;
 
 
@@ -713,7 +795,9 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
         }
       }),
     ]);
-    const events = [...(runId ? fromTimeline(runId, lines) : []), ...(arn ? fromDurable(arn, steps) : [])];
+    const timeline = runId ? fromTimeline(runId, lines) : { events: [], lines: [], invalid: [] };
+    for (const key of timeline.invalid) if (!countedInvalid.has(key)) { countedInvalid.add(key); drop('timeline'); }
+    const events = [...timeline.events, ...(arn ? fromDurable(arn, steps) : [])];
     if (!runId) { cards = []; storyChanged = []; return events; }
     const run8 = runId.slice(0, 8), players = parseRoster(item), at = now();
     const results = new Map(wanted.filter(r => resultsCache.has(`${runId}#${r}`)).map(r => [r, resultsCache.get(`${runId}#${r}`)]));
@@ -727,7 +811,7 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
         if (!row.bot && Number.isFinite(done)) events.push(playerEvent(run8, row.id, `res:${r}`, done, 'debug', rowLines(row, r).join(' '), { round: r }));
       }
     }
-    cards = buildStory({ item, players, history: steps, lines, results, firstSeen, at });
+    cards = buildStory({ item, players, history: steps, lines: timeline.lines, results, firstSeen, at });
     const next = new Map(cards.map(card => [card.id, JSON.stringify(card)]));
     storyChanged = cards.filter(card => cardJson.get(card.id) !== next.get(card.id));
     cardJson = next;
@@ -749,8 +833,9 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
         const id = cloudWatchId(group, raw);
         if (seenCloudWatch.has(id)) continue;
         seenCloudWatch.set(id, raw.timestamp);
-        const event = fromCloudWatch(group, raw);
-        if (event) out.push(event);
+        const inspected = inspectCloudWatch(group, raw);
+        if (inspected.invalid) drop(inspected.invalid);
+        else if (inspected.event) out.push(inspected.event);
       }
       nextToken = reply.nextToken;
       if (!nextToken) break;
@@ -785,6 +870,8 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
       report(tasks[index][0], error);
       events.push(failureEvent(tasks[index][0], error));
     });
+    const watch = droppedEvent();
+    if (watch) events.push(watch);
     const added = [];
     insert(events, added);
     added.sort(byTime);
@@ -798,6 +885,8 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
 
   // ---- Live Tail: one session per environment, results pushed to clients as they arrive
   function pushLive(events) {
+    const watch = droppedEvent();
+    if (watch) events.push(watch);
     const added = [];
     insert(events, added);
     if (!added.length) return;
@@ -813,8 +902,9 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
       const id = cloudWatchId(group, raw);
       if (seenCloudWatch.has(id)) continue;
       seenCloudWatch.set(id, Number(raw.timestamp));
-      const event = fromCloudWatch(group, raw);
-      if (event) events.push(event);
+      const inspected = inspectCloudWatch(group, raw);
+      if (inspected.invalid) drop(inspected.invalid);
+      else if (inspected.event) events.push(inspected.event);
     }
     pushLive(events);
   }
@@ -913,7 +1003,7 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
         if (tail.active && connections === 0) armTailCheck();
       };
     },
-    /** Buffered events at or after cursor - 60 s (or all of them without a cursor). */
+    /** Buffered events at or after cursor - 60 s; with no cursor (undefined), everything in the window. */
     eventsAfter(cursor, debug) {
       let from = 0;
       if (Number.isFinite(cursor)) {

@@ -109,32 +109,36 @@ const teams = [
 const arena = () => ({
   pk: s('arena'), run_id: s(RUN), phase: s('open'), round: s('growth'), execution_arn: s(ARN), teams_data: s(JSON.stringify(teams)),
 });
-const timelineItem = () => ({
-  pk: s(`timeline#${RUN}`), run_id: s(RUN), lines: { L: [
-    // What the workflow writes: only launch, migrate- and compare- lines survive, tagged MICROVM.
-    { id: 'registered', t: T - 120000, tag: 'DURABLE', text: 'Execution registered', detail: { run_id: RUN, execution_arn: ARN }, log_group: WORKFLOW },
-    { id: 'open-growth', t: T - 100000, tag: 'GAME', text: 'Growth open', detail: { round: 'growth' } },
-    { id: 'close-growth', t: T - 95000, tag: 'EVENT', text: 'Close received: 2/3 picked' },
-    { id: 'plan-growth', t: T - 94000, tag: 'GAME', text: 'Plan' },
-    { id: 'score-growth', t: T - 93000, tag: 'GAME', text: 'Round scored' },
-    { id: 'results-growth', t: T - 92000, tag: 'GAME', text: 'Results published' },
-    { id: 'final', t: T - 91000, tag: 'GAME', text: 'Final results published' },
-    { id: 'surprise', t: T - 90000, tag: 'GAME', text: 'An id nobody knows' },
-    { id: 'launch', t: T - 110000, tag: 'MICROVM', text: 'Launch shop (real MicroVM): checkout 200', detail: { run_id: RUN, source: 'real' }, log_group: EVALUATOR },
-    { id: 'migrate-careful', t: T - 109000, tag: 'MICROVM', text: 'Careful (preserve, real): cart kept', log_group: EVALUATOR },
-    { id: 'compare-fast', t: T - 108000, tag: 'DURABLE', text: 'Fast (omit, recorded): cart LOST' },
-    // What the web function writes.
-    { id: 'web-start', t: T - 125000, tag: 'WEB', text: 'Presenter pressed Start: 3 players in the room', detail: { players: 3, run_id: RUN } },
-    { id: 'web-close-growth', t: T - 96000, tag: 'WEB', text: 'Presenter closed growth: 2 of 3 players picked' },
-    { id: 'web-close-launch', t: T - 25 * 60000, tag: 'WEB', text: 'Older than the window' },
-  ].map(line => s(JSON.stringify(line))) },
+const tl = (id, ago, tag, level, text, detail, log_group) => ({ id, t: T - ago, tag, level, text, ...(detail && { detail }), ...(log_group && { log_group }) });
+const timelineLines = () => [
+  // What the workflow writes: its decisions are DURABLE, evidence that really ran in a VM is MICROVM, recorded evidence DURABLE warn.
+  tl('registered', 120000, 'DURABLE', 'info', 'Execution registered', { run_id: RUN, execution_arn: ARN }, WORKFLOW),
+  tl('open-growth', 100000, 'DURABLE', 'info', 'Round 2 · Growth open', { round: 'growth' }, WORKFLOW),
+  tl('close-growth', 95000, 'DURABLE', 'info', 'Close received: 2/3 picked', { players: 3, picked: 2, round: 'growth' }, WORKFLOW),
+  tl('plan-growth', 94000, 'DURABLE', 'info', 'Market draw 105%', { market: 105, bots: 3, round: 'growth' }, WORKFLOW),
+  tl('score-growth', 93000, 'DURABLE', 'info', 'Round scored', { round: 'growth' }, WORKFLOW),
+  tl('results-growth', 92000, 'DURABLE', 'info', 'Results published', { round: 'growth' }, WORKFLOW),
+  tl('expire-christmas', 91500, 'DURABLE', 'warn', 'Close never arrived: the run expired', { round: 'christmas' }, WORKFLOW),
+  tl('final', 91000, 'DURABLE', 'info', 'Final results published', undefined, WORKFLOW),
+  tl('launch', 110000, 'MICROVM', 'info', 'Launch shop (real MicroVM): checkout 200', { charges: 1, checkout_status: 200, vm_id: 'vm-launch', source: 'real' }, EVALUATOR),
+  tl('migrate-careful', 109000, 'MICROVM', 'info', 'Careful migration done (real MicroVM)', { option: 'careful', vm_id: 'vm-careful', source: 'real' }, EVALUATOR),
+  tl('compare-fast', 108000, 'DURABLE', 'warn', "Fast migration check (recorded): fumbled, Maya's cart lost (404)", { cart_status: 404, charges: 0, option: 'fast', source: 'recorded' }, WORKFLOW),
+  // What the web function writes.
+  tl('web-start', 125000, 'WEB', 'info', 'Presenter pressed Start: 3 players in the room', { players: 3, run_id: RUN }),
+  tl('web-close-growth', 96000, 'WEB', 'info', 'Presenter closed growth: 2 of 3 players picked', { round: 'growth', picked: 2, players: 3 }),
+  tl('web-close-launch', 25 * 60000, 'WEB', 'info', 'Older than the window', { round: 'launch', picked: 3, players: 3 }),
+];
+const timelineItem = (lines = timelineLines()) => ({
+  pk: s(`timeline#${RUN}`), run_id: s(RUN), lines: { L: lines.map(line => s(JSON.stringify(line))) },
 });
 const history = () => [
   { EventId: 1, EventType: 'ExecutionStarted', EventTimestamp: new Date(T - 119000) },
-  { EventId: 2, EventType: 'StepStarted', SubType: 'Step', Id: 'op1', Name: 'plan', EventTimestamp: new Date(T - 118000) },
-  { EventId: 3, EventType: 'StepSucceeded', SubType: 'Step', Id: 'op1', Name: 'plan', EventTimestamp: new Date(T - 116500) },
-  { EventId: 4, EventType: 'CallbackStarted', Id: 'op2', Name: 'close-growth', EventTimestamp: new Date(T - 100000) },
+  { EventId: 2, EventType: 'StepStarted', SubType: 'Step', Id: 'op1', Name: 'plan-growth', EventTimestamp: new Date(T - 118000) },
+  { EventId: 3, EventType: 'StepSucceeded', SubType: 'Step', Id: 'op1', Name: 'plan-growth', EventTimestamp: new Date(T - 116500) },
+  { EventId: 4, EventType: 'CallbackStarted', Id: 'op2', Name: 'await-close-growth', EventTimestamp: new Date(T - 100000) },
   { EventId: 5, EventType: 'ContextStarted', SubType: 'ParallelBranch', Id: 'op3', Name: 'b', EventTimestamp: new Date(T - 99000) },
+  { EventId: 6, EventType: 'ChainedInvokeStarted', Id: 'op4', Name: 'launch-shop', EventTimestamp: new Date(T - 112000) },
+  { EventId: 7, EventType: 'ChainedInvokeSucceeded', Id: 'op4', Name: 'launch-shop', EventTimestamp: new Date(T - 109000) },
 ];
 const seed = () => {
   aws.items.set('arena', arena());
@@ -143,14 +147,20 @@ const seed = () => {
 };
 seed();
 const cwEvent = (id, ago, message) => ({ eventId: `e${id}`, timestamp: T - ago, message, logStreamName: 'x', ingestionTime: T });
+// The structured lines the producers print: `[VM] <json>` (the VM's entry, relayed), `[EVENT] <json>`, `[WORKFLOW] <json>`.
+const jline = (tag, entry) => `[${tag}] ${JSON.stringify(entry)}`;
+const vmEntry = (extra = {}) => ({ seq: 0, t: T - 70000, kind: 'stage', level: 'info', run: RUN.slice(0, 8), action: 'compare', option: 'careful', msg: 'initdb done in 1.20 s', ms: 1200, ...extra });
+const phpEntry = (extra = {}) => vmEntry({ seq: 1, kind: 'php', level: 'warn', msg: 'GET /cart/cart-saved 404 12 ms', method: 'GET', path: '/cart/cart-saved', status: 404, ms: 12, ...extra });
+const eventEntry = (msg, extra = {}) => ({ t: T - 80000, level: 'info', action: 'compare', option: 'careful', step: 'compare-careful', msg, ...extra });
+const workflowEntry = (step, round, level, msg) => ({ step, round, level, msg });
 const fill = () => {
   // Thirty events spread over ten minutes in the web group, plus every other kind of line.
   aws.cw[WEB] = Array.from({ length: 30 }, (_, i) => cwEvent(`w${i}`, 600000 - i * 20000, access(i % 3 ? '/api/join' : '/api/state', 200, i % 3 ? 'info' : 'debug')));
-  aws.cw[WORKFLOW] = [cwEvent('f1', 90000, '[WORKFLOW] open-round: callback registered')];
-  aws.cw[EVALUATOR] = [cwEvent('v1', 80000, '[EVENT] compare careful: VM running'), cwEvent('v2', 70000, '[PHP] GET /cart 404 12 ms')];
-  aws.cw[MICROVM] = [cwEvent('m1', 60000, '[1a2b3c4d migrate careful] PHP shop ready in 1.92 s')];
+  aws.cw[WORKFLOW] = [cwEvent('f1', 90000, jline('WORKFLOW', workflowEntry('plan-growth', 'growth', 'info', 'market 18%, 0 bots, 2 players')))];
+  aws.cw[EVALUATOR] = [cwEvent('v1', 80000, jline('EVENT', eventEntry('VM running'))), cwEvent('v2', 70000, jline('VM', phpEntry()))];
+  aws.cw[MICROVM] = [cwEvent('m1', 60000, 'PHP Fatal error: Uncaught Exception in /app/x.php')];
 };
-const { createHub, fromCloudWatch, cloudWatchId, redact, snapshot } = await import('./logs.mjs');
+const { createHub, fromCloudWatch, inspectCloudWatch, fromTimeline, cloudWatchId, redact, snapshot, TAGS, LEVEL_LIST, REAL_OPTIONS, parseCursor } = await import('./logs.mjs');
 const cwId = (group, event) => cloudWatchId(group, event);
 const arnOf = group => `arn:aws:logs:ap-southeast-2:1:log-group:${group}`;
 const tailResult = (group, ago, message) => ({ logGroupIdentifier: arnOf(group), logStreamName: 'x', timestamp: Date.now() - ago, ingestionTime: Date.now(), message });
@@ -269,81 +279,303 @@ def test_detail_is_redacted_and_secret_keys_are_dropped():
 
 # ---------------------------------------------------------------- each line type
 
-LINES = [
-    (r'WEB', json.dumps({'bf': 'access', 'level': 'debug', 'method': 'GET', 'route': '/api/state', 'status': 200, 'ms': 12,
-                         'phase': 'open', 'round': 'growth'}),
-     ('WEB', 'debug', 'GET /api/state 200 12 ms · open growth')),
-    ('WEB', json.dumps({'level': 'INFO', 'message': json.dumps({'bf': 'access', 'level': 'info', 'method': 'POST', 'route': '/api/pick',
-                                                                'status': 409, 'ms': 3})}),
-     ('WEB', 'info', 'POST /api/pick 409 3 ms')),
-    ('WEB', json.dumps({'bf': 'access', 'method': 'GET', 'route': '/x', 'status': 503, 'ms': 3, 'token': 'zzz'}),
-     ('WEB', 'error', 'GET /x 503 3 ms')),
-    ('WEB', json.dumps({'type': 'platform.invokeSummary', 'record': {'metrics': {'requests': 42}}}),
-     ('WEB', 'info', 'environment served 42 requests')),
-    ('WEB', json.dumps({'type': 'platform.initStart', 'record': {}}), ('WEB', 'debug', 'platform.initStart')),
-    ('WEB', json.dumps({'level': 'ERROR', 'message': 'Arena request failed abc'}), ('ERROR', 'error', 'web: Arena request failed abc')),
-    ('WEB', 'plain chatter', None),
-    ('WORKFLOW', '[WORKFLOW] open-round: callback registered', ('WORKFLOW', 'info', 'open-round: callback registered')),
-    ('WORKFLOW', '[WORKFLOW] close-round: fallback to recorded evidence', ('WORKFLOW', 'warn', 'close-round: fallback to recorded evidence')),
-    ('WORKFLOW', json.dumps({'type': 'platform.report', 'record': {'status': 'success', 'metrics': {'durationMs': 1234, 'initDurationMs': 500}}}),
-     ('WORKFLOW', 'info', 'Durable invocation 1.23 s (cold start 0.5 s)')),
-    ('WORKFLOW', json.dumps({'type': 'platform.report', 'record': {'status': 'failure', 'metrics': {'durationMs': 50}}}),
-     ('WORKFLOW', 'error', 'Durable invocation 0.05 s · failure')),
-    ('WORKFLOW', json.dumps({'fallback': 'careful', 'error': 'X'}), ('ERROR', 'warn', 'workflow fell back to recorded evidence: careful · X')),
-    ('WORKFLOW', json.dumps({'timeline_error': 'boom'}), ('ERROR', 'warn', 'workflow timeline write failed: boom')),
-    ('WORKFLOW', 'Traceback (most recent call last)', ('ERROR', 'error', 'workflow: Traceback (most recent call last)')),
-    ('WORKFLOW', 'START RequestId: abc Version: $LATEST', None),
-    ('EVENT', 'REPORT RequestId: abc\tDuration: 3210.00 ms\tBilled Duration: 3211 ms\tMemory Size: 512 MB\tInit Duration: 1500.00 ms',
-     ('EVENT', 'info', 'Event judge done in 3.2 s (cold start 1.5 s)')),
-    ('EVENT', 'REPORT RequestId: abc\tDuration: 900.00 ms\tBilled Duration: 901 ms', ('EVENT', 'info', 'Event judge done in 0.9 s')),
-    ('EVENT', '[EVENT] compare careful: VM running', ('EVENT', 'info', 'compare careful: VM running')),
-    ('EVENT', '[EVENT] launch -: boot failed with code 1', ('EVENT', 'error', 'launch -: boot failed with code 1')),
-    ('EVENT', '[VM] PHP shop ready in 1.92 s', ('VM', 'info', 'PHP shop ready in 1.92 s')),
-    ('EVENT', '[PHP] GET /cart 404 12 ms', ('PHP', 'warn', 'GET /cart 404 12 ms')),
-    ('EVENT', '[PHP] POST /checkout 500 80 ms', ('PHP', 'error', 'POST /checkout 500 80 ms')),
-    ('EVENT', '[PHP] GET / 200 4 ms', ('PHP', 'info', 'GET / 200 4 ms')),
-    ('EVENT', 'START RequestId: abc Version: $LATEST', None),
-    ('EVENT', 'END RequestId: abc', None),
-    ('EVENT', 'INIT_START Runtime Version: python', None),
-    ('EVENT', 'ValueError: Exception while judging', ('ERROR', 'error', 'event: ValueError: Exception while judging')),
-    ('MICROVM', '#12 [internal] load build definition', None),
-    ('MICROVM', '[1a2b3c4d migrate careful] PHP shop ready in 1.92 s', ('MICROVM', 'info', '[1a2b3c4d migrate careful] PHP shop ready in 1.92 s')),
-    ('MICROVM', 'PHP Fatal error: Uncaught Exception in /app/x.php', ('ERROR', 'error', 'microvm: PHP Fatal error: Uncaught Exception in /app/x.php')),
+# The producers' own example lines (VmEventSlice and ProducerSlice reports), as the CloudWatch message of each group.
+VM_STAGE = {'seq': 0, 't': 1795585743478, 'kind': 'stage', 'level': 'info', 'run': 'aaaaaaaa', 'action': 'compare', 'option': 'careful',
+            'msg': 'initdb done in 1.20 s', 'ms': 1200}
+VM_PHP = {'seq': 1, 't': 1795585743478, 'kind': 'php', 'level': 'info', 'run': 'aaaaaaaa', 'action': 'compare', 'option': 'careful',
+          'msg': 'GET /cart/cart-saved 404 12 ms', 'method': 'GET', 'path': '/cart/cart-saved', 'status': 404, 'ms': 12}
+EVENT_LINE = {'t': 1795585743500, 'level': 'info', 'action': 'compare', 'option': 'careful', 'step': 'compare-careful',
+              'msg': 'check /health: HTTP 200 in 4 ms', 'ms': 4}
+WORKFLOW_LINE = {'step': 'plan-growth', 'round': 'growth', 'level': 'info', 'msg': 'market 18%, 0 bots, 2 players'}
+
+
+def structured(tag, entry):
+    return f'[{tag}] ' + json.dumps(entry, separators=(',', ':'))
+
+
+PRODUCER_LINES = [
+    # (group, message, tag, level, detail)
+    ('EVALUATOR', structured('VM', VM_STAGE), 'VM', 'info',
+     {'run': 'aaaaaaaa', 'stage': 'compare', 'option': 'careful', 'seq': 0, 'ms': 1200}),
+    ('EVALUATOR', structured('VM', VM_PHP), 'PHP', 'info',
+     {'run': 'aaaaaaaa', 'stage': 'compare', 'option': 'careful', 'seq': 1, 'method': 'GET', 'path': '/cart/cart-saved', 'status': 404, 'ms': 12}),
+    ('EVALUATOR', structured('VM', {**VM_PHP, 'seq': 2, 'level': 'error', 'action': 'migrate', 'option': 'fast', 'status': 500, 'msg': 'POST /checkout 500 80 ms',
+                                    'method': 'POST', 'path': '/checkout', 'ms': 80}), 'PHP', 'error',
+     {'run': 'aaaaaaaa', 'stage': 'migrate', 'option': 'fast', 'seq': 2, 'method': 'POST', 'path': '/checkout', 'status': 500, 'ms': 80}),
+    ('EVALUATOR', structured('VM', {**VM_STAGE, 'seq': 3, 'level': 'warn', 'action': 'launch', 'option': None, 'msg': 'php: Warning: x'}), 'VM', 'warn',
+     {'run': 'aaaaaaaa', 'stage': 'launch', 'seq': 3, 'ms': 1200}),
+    ('EVALUATOR', structured('EVENT', EVENT_LINE), 'EVENT', 'info',
+     {'stage': 'compare', 'option': 'careful', 'step': 'compare-careful', 'ms': 4}),
+    ('EVALUATOR', structured('EVENT', {'t': 1795585743600, 'level': 'warn', 'action': 'launch', 'option': None, 'step': 'launch', 'msg': 'VM log not read: ReadTimeout'}),
+     'EVENT', 'warn', {'stage': 'launch', 'step': 'launch'}),
+    ('EVALUATOR', structured('EVENT', {**EVENT_LINE, 'level': 'error', 'msg': 'stage failed: RuntimeError'}), 'EVENT', 'error',
+     {'stage': 'compare', 'option': 'careful', 'step': 'compare-careful', 'ms': 4}),
+    ('WORKFLOW', structured('WORKFLOW', {'step': 'timeline-evidence', 'round': None, 'level': 'warn',
+                                         'msg': 'launch real, careful real (cart kept), fast recorded (cart lost)'}), 'WORKFLOW', 'warn',
+     {'step': 'timeline-evidence'}),
+    ('WORKFLOW', structured('WORKFLOW', {'step': 'fallback-migrate-fast', 'round': None, 'level': 'warn',
+                                         'msg': 'migrate fast failed (RuntimeError): recorded evidence used'}), 'WORKFLOW', 'warn',
+     {'step': 'fallback-migrate-fast'}),
+    ('WORKFLOW', structured('WORKFLOW', WORKFLOW_LINE), 'WORKFLOW', 'info', {'step': 'plan-growth', 'round': 'growth'}),
+]
+
+
+def test_producer_example_lines_parse_to_the_right_tag_level_stage_and_option():
+    out = run_scenario(f"""
+      const cases = {json.dumps([[group, message] for group, message, *_ in PRODUCER_LINES])};
+      const groups = {{ EVALUATOR, WORKFLOW }};
+      result(cases.map(([group, message], index) => {{
+        const event = fromCloudWatch(groups[group], cwEvent(index, 5000, message));
+        return event && {{ tag: event.tag, level: event.level, text: event.text, detail: event.detail, source: event.source, ts: event.ts - T }};
+      }}));
+    """)
+    for (group, message, tag, level, detail), got in zip(PRODUCER_LINES, out):
+        assert got is not None, message
+        assert (got['tag'], got['level'], got['detail']) == (tag, level, detail), message
+        assert got['source'] == {'VM': 'vm', 'PHP': 'vm', 'EVENT': 'evaluator', 'WORKFLOW': 'workflow'}[tag]
+    texts = [got['text'] for got in out]
+    assert texts[0] == 'compare careful: initdb done in 1.20 s'
+    assert texts[1] == 'compare careful: GET /cart/cart-saved 404 12 ms'
+    assert texts[4] == 'compare-careful: check /health: HTTP 200 in 4 ms'
+    assert texts[9] == 'plan-growth: market 18%, 0 bots, 2 players'
+
+
+def test_a_json_wrapped_line_is_read_the_same_and_the_level_is_the_lines_own():
+    out = run_scenario(f"""
+      const wrapped = JSON.stringify({{ level: 'ERROR', message: {json.dumps(structured('VM', VM_STAGE))} }});
+      const loud = {json.dumps(structured('VM', {**VM_STAGE, 'level': 'debug', 'msg': 'Error failed fallback retry warn Traceback'}))};
+      const workflow = {json.dumps(structured('WORKFLOW', {**WORKFLOW_LINE, 'level': 'debug', 'msg': 'fallback failed with Exception'}))};
+      result([fromCloudWatch(EVALUATOR, cwEvent(1, 0, wrapped)), fromCloudWatch(EVALUATOR, cwEvent(2, 0, loud)),
+              fromCloudWatch(WORKFLOW, cwEvent(3, 0, workflow))].map(e => [e.tag, e.level]));
+    """)
+    assert out == [['VM', 'info'], ['VM', 'debug'], ['WORKFLOW', 'debug']], 'words in the message never change a structured line level'
+
+
+def bad_lines():
+    without_method = {key: value for key, value in VM_PHP.items() if key != 'method'}
+    return [
+        ('EVALUATOR', '[VM] {not json MARKER-1}'),
+        ('EVALUATOR', structured('VM', {**VM_STAGE, 'extra': 1})),
+        ('EVALUATOR', structured('VM', {**VM_STAGE, 'level': 'fatal'})),
+        ('EVALUATOR', structured('VM', {**VM_STAGE, 'option': 'medium'})),
+        ('EVALUATOR', structured('VM', {**VM_STAGE, 'action': 'deploy'})),
+        ('EVALUATOR', structured('VM', {**VM_STAGE, 'run': 'AAAAAAAAA'})),
+        ('EVALUATOR', structured('VM', {**VM_STAGE, 'msg': 'x' * 201})),
+        ('EVALUATOR', structured('VM', {**VM_STAGE, 'seq': -1})),
+        ('EVALUATOR', structured('VM', {**VM_STAGE, 'kind': 'access'})),
+        ('EVALUATOR', structured('VM', without_method)),
+        ('EVALUATOR', structured('VM', {**VM_PHP, 'path': '/cart?token=MARKER-2'})),
+        ('EVALUATOR', structured('VM', {key: value for key, value in VM_STAGE.items() if key != 'run'})),
+        ('EVALUATOR', structured('EVENT', {**EVENT_LINE, 'step': 'Compare Careful'})),
+        ('EVALUATOR', structured('EVENT', {**EVENT_LINE, 'surprise': True})),
+        ('EVALUATOR', '[EVENT] compare careful: VM running MARKER-3'),
+        ('EVALUATOR', '[PHP] GET /cart 404 12 ms MARKER-4'),
+        ('EVALUATOR', structured('WORKFLOW', WORKFLOW_LINE)),
+        ('WORKFLOW', structured('VM', VM_STAGE)),
+        ('WORKFLOW', structured('WORKFLOW', {**WORKFLOW_LINE, 'round': 'nope'})),
+        ('WORKFLOW', structured('WORKFLOW', {**WORKFLOW_LINE, 'level': 'ERROR'})),
+        ('WORKFLOW', structured('WORKFLOW', {key: value for key, value in WORKFLOW_LINE.items() if key != 'msg'})),
+        ('WORKFLOW', '[WORKFLOW] open-round: callback registered MARKER-5'),
+        ('MICROVM', structured('VM', VM_STAGE)),
+    ]
+
+
+def test_an_invalid_structured_line_is_dropped_and_counted_never_shown_raw():
+    bad = bad_lines()
+    out = run_scenario(f"""
+      const bad = {json.dumps(bad)};
+      const groups = {{ EVALUATOR, WORKFLOW, MICROVM }};
+      const inspected = bad.map(([group, message], index) => inspectCloudWatch(groups[group], cwEvent(index, 5000, message)));
+      fill();
+      bad.forEach(([group, message], index) => aws.cw[groups[group]].push(cwEvent(`bad${{index}}`, 5000 + index, message)));
+      const hub = hubFor();
+      await hub.poll();
+      const events = hub.eventsAfter(undefined, true);
+      await hub.poll();                                  // the same lines are not counted twice
+      const again = hub.eventsAfter(undefined, true);
+      result({{ inspected, again: again.length - events.length, watch: events.filter(e => e.tag === 'WATCH'), blob: JSON.stringify(events) }});
+    """)
+    for message, got in zip(bad, out['inspected']):
+        assert got.get('invalid') in ('VM', 'EVENT', 'WORKFLOW', 'PHP') and 'event' not in got, message
+    assert [got['invalid'] for got in out['inspected']][:12] == ['VM'] * 12
+    [watch] = out['watch']
+    assert watch['level'] == 'warn' and watch['source'] == 'logs' and watch['id'] == f'wt:dropped:{len(bad)}'
+    assert watch['detail'] == {'dropped': len(bad), 'VM': 14, 'EVENT': 3, 'PHP': 1, 'WORKFLOW': 5}
+    assert watch['text'].startswith(f'{len(bad)} log lines broke the log contract and were dropped (')
+    assert out['again'] == 0
+    for marker in ('MARKER-1', 'MARKER-2', 'MARKER-3', 'MARKER-4', 'MARKER-5', 'not json'):
+        assert marker not in out['blob'], marker
+
+
+def test_the_same_invalid_line_from_live_tail_and_the_group_read_is_counted_once():
+    out = run_scenario(r"""
+      fill();
+      const hub = hubFor(() => Date.now(), { accountId: '1', region: 'ap-southeast-2', pollMs: 60000, filterMs: 0 });
+      const release = hub.attach(() => {});
+      await sleep(100);
+      const live = tailResult(EVALUATOR, 0, '[VM] {broken');
+      aws.tails[0].push([live]);
+      await sleep(60);
+      const watch = () => hub.eventsAfter(undefined, true).filter(e => e.tag === 'WATCH').map(e => [e.id, e.detail.dropped]);
+      const first = watch();
+      aws.cw[EVALUATOR].push({ eventId: 'other-id', timestamp: live.timestamp, message: live.message, logStreamName: 'x' });
+      await hub.poll();
+      result({ first, second: watch() });
+      release();
+    """)
+    assert out['first'] == [['wt:dropped:1', 1]] and out['second'] == out['first']
+
+
+def test_vm_and_evaluator_lines_are_timed_by_their_own_clock_within_the_resume_overlap():
+    out = run_scenario(r"""
+      const at = ago => fromCloudWatch(EVALUATOR, { timestamp: T, message: jline('VM', vmEntry({ t: T - ago })) }).ts - T;
+      const ordered = [vmEntry({ seq: 1, t: T - 3000 }), vmEntry({ seq: 0, t: T - 4000 })].map(entry =>
+        fromCloudWatch(EVALUATOR, { timestamp: T, message: jline('VM', entry) }));
+      result({ near: at(5000), far: at(10 * 60000), future: at(-9000), ordered: ordered.map(e => [e.detail.seq, e.ts - T]) });
+    """)
+    assert out['near'] == -5000, 'a VM entry keeps its own time, so the entries of one relay keep their order'
+    assert out['far'] == -60000, 'never older than the resume overlap behind the CloudWatch time'
+    assert out['future'] == 0
+    assert out['ordered'] == [[1, -3000], [0, -4000]]
+
+
+HOSTILE = [
+    ('WEB', json.dumps({'level': 'ERROR', 'message': 'Arena request failed abc'}), 'WEB'),
+    ('WEB', json.dumps({'type': 'platform.invokeReport', 'record': {'status': 'error'}}), 'WEB'),
+    ('WORKFLOW', 'Traceback (most recent call last)', 'WORKFLOW'),
+    ('WORKFLOW', json.dumps({'level': 'ERROR', 'message': 'boom'}), 'WORKFLOW'),
+    ('WORKFLOW', json.dumps({'type': 'platform.report', 'record': {'status': 'failure', 'metrics': {'durationMs': 50}}}), 'WORKFLOW'),
+    ('EVENT', 'ValueError: Exception while judging', 'EVENT'),
+    ('EVENT', 'Task timed out after 30.00 seconds', 'EVENT'),
+    ('MICROVM', 'PHP Fatal error: Uncaught Exception in /app/x.php', 'MICROVM'),
 ]
 GROUP_NAMES = {'WEB': 'WEB', 'WORKFLOW': 'WORKFLOW', 'EVENT': 'EVALUATOR', 'MICROVM': 'MICROVM'}
 
 
-def test_every_cloudwatch_line_type_gets_its_tag_level_and_text():
-    cases = [{'group': GROUP_NAMES[kind], 'message': message} for kind, message, _ in LINES]
+def test_a_platform_or_runtime_error_is_level_error_on_the_tag_of_its_own_group():
     out = run_scenario(f"""
-      const cases = {json.dumps(cases)};
+      const cases = {json.dumps([[GROUP_NAMES[kind], message] for kind, message, _ in HOSTILE])};
       const groups = {{ WEB, WORKFLOW, EVALUATOR, MICROVM }};
-      result(cases.map(({{ group, message }}, index) => {{
-        const event = fromCloudWatch(groups[group], cwEvent(index, 1000 * index, message));
-        return event && {{ tag: event.tag, level: event.level, text: event.text, id: event.id, ts: event.ts - T, source: event.source }};
+      result(cases.map(([group, message], index) => {{
+        const event = fromCloudWatch(groups[group], cwEvent(index, 0, message));
+        return [event.tag, event.level];
       }}));
     """)
-    for index, ((_, _, expected), got) in enumerate(zip(LINES, out)):
-        if expected is None:
-            assert got is None, LINES[index]
-            continue
-        assert (got['tag'], got['level'], got['text']) == expected, LINES[index]
+    assert out == [[tag, 'error'] for _, _, tag in HOSTILE]
+
+
+def test_noise_lines_are_dropped():
+    quiet = [
+        ('WEB', 'plain chatter'), ('WORKFLOW', 'START RequestId: abc Version: $LATEST'), ('EVALUATOR', 'START RequestId: abc'),
+        ('EVALUATOR', 'END RequestId: abc'), ('EVALUATOR', 'INIT_START Runtime Version: python'),
+        ('EVALUATOR', 'free text the evaluator no longer prints'), ('MICROVM', '#12 [internal] load build definition'),
+        ('MICROVM', 'an old [1a2b3c4d migrate careful] PHP shop ready in 1.92 s'),
+    ]
+    out = run_scenario(f"""
+      const cases = {json.dumps(quiet)};
+      const groups = {{ WEB, WORKFLOW, EVALUATOR, MICROVM }};
+      result(cases.map(([group, message], index) => inspectCloudWatch(groups[group], cwEvent(index, 0, message))));
+    """)
+    assert out == [{}] * len(quiet)
+
+
+def test_the_other_cloudwatch_lines_get_their_tag_level_and_text():
+    lines = [
+        ('WEB', json.dumps({'bf': 'access', 'level': 'debug', 'method': 'GET', 'route': '/api/state', 'status': 200, 'ms': 12,
+                            'phase': 'open', 'round': 'growth'}), ('WEB', 'debug', 'GET /api/state 200 12 ms · open growth')),
+        ('WEB', json.dumps({'level': 'INFO', 'message': json.dumps({'bf': 'access', 'level': 'info', 'method': 'POST', 'route': '/api/pick',
+                                                                    'status': 409, 'ms': 3})}), ('WEB', 'info', 'POST /api/pick 409 3 ms')),
+        ('WEB', json.dumps({'bf': 'access', 'method': 'GET', 'route': '/x', 'status': 503, 'ms': 3, 'token': 'zzz'}), ('WEB', 'error', 'GET /x 503 3 ms')),
+        ('WEB', json.dumps({'type': 'platform.invokeSummary', 'record': {'metrics': {'requests': 42}}}), ('WEB', 'info', 'environment served 42 requests')),
+        ('WEB', json.dumps({'type': 'platform.initStart', 'record': {}}), ('WEB', 'debug', 'platform.initStart')),
+        ('WEB', json.dumps({'level': 'ERROR', 'message': 'Arena request failed abc'}), ('WEB', 'error', 'Arena request failed abc')),
+        ('WORKFLOW', json.dumps({'type': 'platform.report', 'record': {'status': 'success', 'metrics': {'durationMs': 1234, 'initDurationMs': 500}}}),
+         ('WORKFLOW', 'info', 'Durable invocation 1.23 s (cold start 0.5 s)')),
+        ('WORKFLOW', json.dumps({'type': 'platform.report', 'record': {'status': 'failure', 'metrics': {'durationMs': 50}}}),
+         ('WORKFLOW', 'error', 'Durable invocation 0.05 s · failure')),
+        ('EVALUATOR', 'REPORT RequestId: abc\tDuration: 3210.00 ms\tBilled Duration: 3211 ms\tMemory Size: 512 MB\tInit Duration: 1500.00 ms',
+         ('EVENT', 'info', 'Event judge done in 3.2 s (cold start 1.5 s)')),
+        ('EVALUATOR', 'REPORT RequestId: abc\tDuration: 900.00 ms\tBilled Duration: 901 ms', ('EVENT', 'info', 'Event judge done in 0.9 s')),
+    ]
+    out = run_scenario(f"""
+      const cases = {json.dumps([[group, message] for group, message, _ in lines])};
+      const groups = {{ WEB, WORKFLOW, EVALUATOR, MICROVM }};
+      result(cases.map(([group, message], index) => {{
+        const event = fromCloudWatch(groups[group], cwEvent(index, 1000 * index, message));
+        return {{ tag: event.tag, level: event.level, text: event.text, id: event.id, ts: event.ts - T }};
+      }}));
+    """)
+    for index, ((_, _, expected), got) in enumerate(zip(lines, out)):
+        assert (got['tag'], got['level'], got['text']) == expected, lines[index]
         assert re.fullmatch(r'cw:[0-9a-f]{16}', got['id']) and got['ts'] == -1000 * index
-    assert out[0]['source'] == 'web'
-    assert out[7]['source'] == 'workflow'
-    assert out[18]['source'] == 'evaluator' and out[18]['tag'] == 'EVENT' and out[26]['source'] == 'evaluator'
-    assert [(out[i]['tag'], out[i]['source']) for i in (19, 20, 21)] == [('VM', 'vm'), ('PHP', 'vm'), ('PHP', 'vm')], '[VM] and [PHP] lines'
-    assert out[29]['source'] == 'vm', 'the MicroVM image group'
-    assert out[5]['tag'] == 'ERROR' and out[5]['source'] == 'web'
 
 
 def test_error_lines_are_trimmed_to_200_characters():
     out = run_scenario(r"""
       const event = fromCloudWatch(EVALUATOR, cwEvent(1, 0, 'Exception: ' + 'x'.repeat(900)));
-      result({ tag: event.tag, length: event.text.length });
+      result({ tag: event.tag, level: event.level, length: event.text.length });
     """)
-    assert out == {'tag': 'ERROR', 'length': 200}
+    assert out == {'tag': 'EVENT', 'level': 'error', 'length': 200}
 
+
+def test_a_300_character_line_with_a_receipt_at_character_190_is_redacted_then_truncated():
+    receipt = 'a1b2c3d4' * 8
+    line = 'Exception: ' + 'x' * 179 + receipt + 'y' * 46
+    assert len(line) == 300 and line.index(receipt) == 190
+    cases = [
+        ('WEB', json.dumps({'level': 'ERROR', 'message': line})), ('WORKFLOW', json.dumps({'level': 'ERROR', 'message': line})),
+        ('EVALUATOR', line), ('MICROVM', line),
+    ]
+    out = run_scenario(f"""
+      const cases = {json.dumps(cases)};
+      const groups = {{ WEB, WORKFLOW, EVALUATOR, MICROVM }};
+      result(cases.map(([group, message], index) => {{
+        const event = fromCloudWatch(groups[group], cwEvent(index, 0, message));
+        return {{ tag: event.tag, text: event.text, raw: event.detail.raw }};
+      }}));
+    """)
+    assert [got['tag'] for got in out] == ['WEB', 'WORKFLOW', 'EVENT', 'MICROVM']
+    for got in out:
+        assert len(got['text']) == 200 and got['text'].startswith('Exception: ' + 'x' * 179 + 'a1b2c3d4…y')
+        assert receipt[:9] not in got['text'] and receipt[:9] not in got['raw'], 'cutting first would leave the front of the receipt'
+        assert got['text'].count('a1b2c3d4') == 1
+
+
+def hostile_hub():
+    cases = json.dumps([[GROUP_NAMES[kind], message] for kind, message, _ in HOSTILE])
+    return f"""
+      fill();
+      const hostile = {cases};
+      const byName = {{ WEB, WORKFLOW, EVALUATOR, MICROVM }};
+      hostile.forEach(([group, message], i) => aws.cw[byName[group]].push(cwEvent(`h${{i}}`, 1000 + i, message)));
+      aws.cw[EVALUATOR].push(cwEvent('vm', 2000, jline('VM', vmEntry())));
+      aws.items.set(`timeline#${{RUN}}`, timelineItem([...timelineLines(),
+        tl('surprise', 90000, 'GAME', 'info', 'An id nobody knows'), tl('plan-launch', 90000, 'GAME', 'info', 'Plan'),
+        tl('score-launch', 90000, 'DURABLE', 'fatal', 'Round scored')]));
+      const hub = hubFor();
+      await hub.poll();
+    """
+
+
+def test_the_page_and_the_server_share_one_vocabulary_and_no_line_is_ever_game_or_error():
+    page = (PAGE_DIR / 'logs.js').read_text()
+    known = re.findall(r"'([A-Z]+)'", re.search(r'const KNOWN_TAGS = \[([^\]]*)\]', page).group(1))
+    colours = re.findall(r'\b([A-Z]+):', re.search(r'const TAG_COLOURS = \{(.*?)\};', page, re.S).group(1))
+    levels = re.findall(r"'([a-z]+)'", re.search(r'const LEVELS = \[([^\]]*)\]', page).group(1))
+    out = run_scenario(hostile_hub() + r"""
+      const events = hub.eventsAfter(undefined, true);
+      result({ tags: [...TAGS], levels: [...LEVEL_LIST], frozen: Object.isFrozen(TAGS), shown: events.map(e => [e.tag, e.level, e.source]),
+               ids: events.filter(e => e.id.startsWith('tl:')).map(e => e.id) });
+    """)
+    assert out['tags'] == known == ['DURABLE', 'WORKFLOW', 'EVENT', 'MICROVM', 'VM', 'PHP', 'WEB', 'WATCH'] and out['frozen']
+    assert sorted(colours) == sorted(known), 'a colour for each tag and no other'
+    assert out['levels'] == levels == ['debug', 'info', 'warn', 'error']
+    assert not re.search(r'\b(GAME|ERROR|PLAYER)\b', page)
+    tags = {tag for tag, _, _ in out['shown']}
+    assert tags <= set(known) and tags >= {'WEB', 'WORKFLOW', 'EVENT', 'MICROVM', 'VM', 'PHP', 'DURABLE', 'WATCH'}
+    assert not tags & {'GAME', 'ERROR', 'PLAYER'}
+    assert all(level in levels for _, level, _ in out['shown'])
+    assert not [i for i in out['ids'] if i.endswith(('surprise', 'plan-launch', 'score-launch'))], 'lines with a bad id, tag or level are dropped'
 
 # ---------------------------------------------------------------- the hub
 
@@ -356,31 +588,101 @@ def test_timeline_durable_and_status_events_use_ids_taken_from_the_data():
       result({
         ids: events.map(event => event.id), status: hub.status,
         pick: Object.fromEntries(events.filter(e => /^(tl|du):/.test(e.id)).map(e => [e.id, [e.tag, e.level, e.text, e.ts - T, e.source]])),
-        detail: events.find(e => e.id === `tl:${RUN.slice(0, 8)}:launch`).detail,
-        tags: events.filter(e => e.id.startsWith('tl:') && ['EVENT', 'GAME'].includes(e.tag)).map(e => e.id),
+        detail: Object.fromEntries(events.filter(e => e.id.startsWith('tl:')).map(e => [e.id, e.detail])),
+        tags: events.filter(e => e.id.startsWith('tl:') && ['EVENT', 'GAME', 'ERROR'].includes(e.tag)).map(e => e.id),
         sorted: events.every((e, i) => !i || events[i - 1].ts <= e.ts),
       });
     """)
     assert out['status'] == {'run8': '01234567', 'phase': 'open', 'round': 'growth', 'players': 3, 'picked': 2}
+    wf = 'workflow'
     assert out['pick'] == {
-        'tl:01234567:launch': ['MICROVM', 'info', 'Launch shop (real MicroVM): checkout 200', -110000, 'workflow'],
-        'tl:01234567:migrate-careful': ['MICROVM', 'info', 'Careful (preserve, real): cart kept', -109000, 'workflow'],
-        'tl:01234567:compare-fast': ['MICROVM', 'warn', 'Fast (omit, recorded): cart LOST', -108000, 'workflow'],
+        'tl:01234567:registered': ['DURABLE', 'info', 'Execution registered', -120000, wf],
+        'tl:01234567:open-growth': ['DURABLE', 'info', 'Round 2 · Growth open', -100000, wf],
+        'tl:01234567:close-growth': ['DURABLE', 'info', 'Close received: 2/3 picked', -95000, wf],
+        'tl:01234567:plan-growth': ['DURABLE', 'info', 'Market draw 105%', -94000, wf],
+        'tl:01234567:score-growth': ['DURABLE', 'info', 'Round scored', -93000, wf],
+        'tl:01234567:results-growth': ['DURABLE', 'info', 'Results published', -92000, wf],
+        'tl:01234567:expire-christmas': ['DURABLE', 'warn', 'Close never arrived: the run expired', -91500, wf],
+        'tl:01234567:final': ['DURABLE', 'info', 'Final results published', -91000, wf],
+        'tl:01234567:launch': ['MICROVM', 'info', 'Launch shop (real MicroVM): checkout 200', -110000, wf],
+        'tl:01234567:migrate-careful': ['MICROVM', 'info', 'Careful migration done (real MicroVM)', -109000, wf],
+        'tl:01234567:compare-fast': ['DURABLE', 'warn', "Fast migration check (recorded): fumbled, Maya's cart lost (404)", -108000, wf],
         'tl:01234567:web-start': ['WEB', 'info', 'Presenter pressed Start: 3 players in the room', -125000, 'web'],
         'tl:01234567:web-close-growth': ['WEB', 'info', 'Presenter closed growth: 2 of 3 players picked', -96000, 'web'],
         'du:abcdefabcdef:1': ['DURABLE', 'info', 'execution started', -119000, 'durable'],
-        'du:abcdefabcdef:3': ['DURABLE', 'info', 'plan: step done 1.5 s', -116500, 'durable'],
-        'du:abcdefabcdef:4': ['DURABLE', 'info', 'close-growth: waiting for the presenter to Close', -100000, 'durable'],
-    }, 'the workflow round lines, the unknown id and the 25-minute-old line are dropped; the parallel branch and StepStarted are skipped'
-    assert out['tags'] == [], 'no timeline line is ever tagged EVENT or GAME'
-    assert out['detail'] == {'run_id': '01234567…', 'source': 'real', 'log_group': '/aws/lambda/black-friday-four-evaluator'}
-    assert not [key for key in out['pick'] if key.rsplit(':', 1)[1] in (
-        'registered', 'open-growth', 'close-growth', 'plan-growth', 'score-growth', 'results-growth', 'final', 'surprise')]
+        'du:abcdefabcdef:4': ['DURABLE', 'info', 'await-close-growth: waiting for the presenter to Close', -100000, 'durable'],
+        'du:abcdefabcdef:6': ['DURABLE', 'info', 'launch-shop: invoke Event judge (MicroVM)', -112000, 'durable'],
+        'du:abcdefabcdef:7': ['DURABLE', 'info', 'launch-shop: invoke done 3.0 s', -109000, 'durable'],
+    }, 'the 25-minute-old line, the parallel branch, StepStarted and the history twins of timeline lines are not shown'
+    assert out['tags'] == [], 'no timeline line is ever tagged EVENT, GAME or ERROR'
+    assert out['detail']['tl:01234567:launch'] == {
+        'charges': 1, 'checkout_status': 200, 'vm_id': 'vm-launch', 'source': 'real', 'log_group': '/aws/lambda/black-friday-four-evaluator', 'stage': 'launch'}
+    assert out['detail']['tl:01234567:compare-fast'] == {
+        'cart_status': 404, 'charges': 0, 'option': 'fast', 'source': 'recorded', 'log_group': '/aws/lambda/black-friday-four-workflow', 'stage': 'compare'}
+    assert out['detail']['tl:01234567:registered']['run_id'] == '01234567…'
+    assert out['detail']['tl:01234567:close-growth'] == {
+        'players': 3, 'picked': 2, 'round': 'growth', 'log_group': '/aws/lambda/black-friday-four-workflow'}
     assert out['sorted'] and len(out['ids']) == len(set(out['ids']))
     blob = json.dumps(out)
     for secret in ('Zelda', 'Yuri', 'Xena', 'ffffffff', 'token'):
         assert secret not in blob
 
+
+def test_the_fast_migration_fumble_is_shown_as_the_line_says_never_upgraded_to_an_error():
+    out = run_scenario(r"""
+      const lines = [
+        tl('compare-fast', 5000, 'MICROVM', 'info', "Fast migration check: fumbled, Maya's cart lost (404)", { cart_status: 404, charges: 0, option: 'fast', source: 'real' }, EVALUATOR),
+        tl('compare-careful', 4000, 'MICROVM', 'info', "Careful migration check: Maya's cart kept (200)", { cart_status: 200, charges: 1, option: 'careful', source: 'real' }, EVALUATOR),
+      ];
+      const events = fromTimeline(RUN, lines).events;
+      result(events.map(e => [e.tag, e.level, e.text]));
+    """)
+    assert out == [['MICROVM', 'info', "Fast migration check: fumbled, Maya's cart lost (404)"],
+                   ['MICROVM', 'info', "Careful migration check: Maya's cart kept (200)"]]
+
+
+def test_the_timeline_wins_over_durable_history_for_the_same_fact():
+    out = run_scenario(STORY_SEED + r"""
+      const hub = hubFor(() => T);
+      await hub.poll();
+      const events = hub.eventsAfter(undefined, true).filter(e => /^(tl|du):/.test(e.id));
+      result(events.map(e => [e.id.split(':')[0], e.text]));
+    """)
+    texts = [text for _, text in out]
+    assert not [text for text in texts if 'Close received after' in text or ': step done' in text], 'the history twins of Close received and the steps'
+    assert 'Close received: 3/3 picked' in texts and 'Results published' in texts and 'Round 1 · Launch open' in texts
+    assert any(kind == 'du' and text.startswith('await-close-launch: waiting') for kind, text in out), 'what only Durable knows stays'
+    assert any(kind == 'du' and text.startswith('launch-shop: invoke done') for kind, text in out)
+    assert sum(1 for text in texts if text.startswith('Close received')) == 2, 'launch and growth: once each'
+
+
+def test_a_timeline_line_with_a_bad_id_tag_level_source_or_field_is_dropped_and_counted_once():
+    out = run_scenario(r"""
+      const bad = [
+        tl('surprise', 90000, 'DURABLE', 'info', 'An id nobody knows'),
+        tl('plan-launch', 90000, 'GAME', 'info', 'Plan'),
+        tl('plan-nowhere', 90000, 'DURABLE', 'info', 'A round that does not exist'),
+        tl('score-launch', 90000, 'DURABLE', 'fatal', 'Round scored'),
+        tl('migrate-fast', 90000, 'MICROVM', 'warn', 'Fast: recorded evidence used', { option: 'fast', source: 'recorded' }),
+        tl('launch', 90000, 'DURABLE', 'info', 'Launch shop', { source: 'real' }),
+        tl('compare-careful', 90000, 'MICROVM', 'info', 'No source at all'),
+        tl('web-close-launch', 90000, 'DURABLE', 'info', 'The web function never writes DURABLE'),
+        { ...tl('open-launch', 90000, 'DURABLE', 'info', 'Round 1 open'), extra: 1 },
+        { ...tl('results-launch', 90000, 'DURABLE', 'info', 'Results'), t: 'soon' },
+      ];
+      const item = timelineItem([...timelineLines(), ...bad]);
+      item.lines.L.push(s('{broken'));
+      aws.items.set(`timeline#${RUN}`, item);
+      const hub = hubFor();
+      await hub.poll(); await hub.poll();
+      const events = hub.eventsAfter(undefined, true);
+      result({ count: bad.length + 1, watch: events.filter(e => e.tag === 'WATCH').map(e => [e.id, e.level, e.detail]),
+               ids: events.filter(e => e.id.startsWith('tl:')).map(e => e.id.slice(12)), direct: fromTimeline(RUN, [bad[1], bad[4], timelineLines()[0]]) });
+    """)
+    assert out['watch'] == [[f'wt:dropped:{out["count"]}', 'warn', {'dropped': out['count'], 'timeline': out['count']}]]
+    assert not {'surprise', 'plan-launch', 'plan-nowhere', 'score-launch', 'migrate-fast', 'compare-careful', 'open-launch', 'results-launch'} & set(out['ids'])
+    assert out['ids'].count('launch') == 1
+    assert len(out['direct']['invalid']) == 2 and len(out['direct']['lines']) == 1 and len(out['direct']['events']) == 1
 
 def test_two_pollers_on_the_same_data_produce_identical_ids_and_times():
     out = run_scenario(r"""
@@ -417,7 +719,7 @@ def test_backfill_then_steady_state_reads_overlap_and_pages_are_capped():
 def test_debug_events_are_capped_at_the_newest_3000_and_old_events_expire():
     out = run_scenario(r"""
       aws.cw[WEB] = Array.from({ length: 3500 }, (_, i) => cwEvent(`d${i}`, 800000 - i * 100, access('/api/state', 200, 'debug')));
-      aws.cw[EVALUATOR] = [cwEvent('late', 900000 - 1, '[EVENT] a b: x')];
+      aws.cw[EVALUATOR] = [cwEvent('late', 900000 - 1, jline('EVENT', eventEntry('x')))];
       const hub = hubFor(() => T);
       await hub.poll();
       const debug = hub.eventsAfter(undefined, true).filter(e => e.level === 'debug');
@@ -694,9 +996,9 @@ def test_the_stream_pings_and_keeps_new_events_flowing():
       const stream = await open('/stream?debug=1');
       await stream.until(text => text.includes('event: status'));
       const before = stream.events().length;
-      aws.cw[EVALUATOR].push(cwEvent('fresh', 0, '[EVENT] judge x: new line'));
+      aws.cw[EVALUATOR].push(cwEvent('fresh', 0, jline('EVENT', eventEntry('new line', { t: Date.now() }))));
       aws.cw[EVALUATOR].at(-1).timestamp = Date.now();
-      await stream.until(text => text.includes('judge x: new line'));
+      await stream.until(text => text.includes('compare-careful: new line'));
       result({ before, after: stream.events().length, fresh: stream.events().filter(e => e.id === cwId(EVALUATOR, aws.cw[EVALUATOR].at(-1))).length });
     """)
     assert out['after'] == out['before'] + 1 and out['fresh'] == 1
@@ -739,7 +1041,7 @@ def test_live_tail_session_uses_the_log_group_arns_and_pushes_events_before_the_
       // Live Tail results carry no event id: a line is told apart by group, timestamp and message.
       const at = Date.now();
       got.length = 0;
-      const live = tailResult(EVALUATOR, 0, '[EVENT] judge x: live line');
+      const live = tailResult(EVALUATOR, 0, jline('EVENT', eventEntry('live line', { t: Date.now() })));
       aws.tails[0].push([live, tailResult(EVALUATOR, 0, 'START RequestId: abc'),
         { ...tailResult(WEB, 0, access('/api/join')), logGroupIdentifier: arnOf(WEB + '.local') }]);
       for (let i = 0; i < 60 && got.length === 0; i++) await sleep(5);
@@ -749,7 +1051,7 @@ def test_live_tail_session_uses_the_log_group_arns_and_pushes_events_before_the_
       const sameLine = { eventId: 'filter-id-differs', timestamp: live.timestamp, message: live.message, logStreamName: 'x' };
       aws.cw[EVALUATOR].push(sameLine);
       await hub.poll();
-      const lines = hub.eventsAfter(undefined, true).filter(event => event.text === 'judge x: live line');
+      const lines = hub.eventsAfter(undefined, true).filter(event => event.text === 'compare-careful: live line');
       result({ started, groups, polls, latency, count: pushed.ids.length, status: pushed.status, pollsAfter: hub.polls,
                lines: lines.length, sameId: lines[0].id === cwId(EVALUATOR, sameLine) && pushed.ids[0] === lines[0].id });
       release();
@@ -823,7 +1125,8 @@ def test_live_tail_lines_reach_sse_clients_immediately_not_on_the_next_poll():
       await stream.until(text => text.includes('event: status'));
       const before = { reads: aws.cwDone, statuses: stream.statuses(), tails: aws.tails.length };
       const at = Date.now();
-      const live = tailResult(EVALUATOR, 0, '[EVENT] judge x: live over sse');
+      const stamp = Date.now();
+      const live = { ...tailResult(EVALUATOR, 0, jline('EVENT', eventEntry('live over sse', { t: stamp }))), timestamp: stamp };
       aws.tails[0].push([live]);
       await stream.until(text => text.includes('live over sse'), 2000);
       const message = stream.messages().find(m => m.data && m.data.includes('live over sse'));
@@ -832,7 +1135,7 @@ def test_live_tail_lines_reach_sse_clients_immediately_not_on_the_next_poll():
     """)
     assert out['latency'] < 1000, 'the next poll is 5 s away'
     assert out['before'] == out['after'] and out['before']['tails'] == 1
-    assert out['idIsTs'] and out['event']['tag'] == 'EVENT' and out['event']['text'] == 'judge x: live over sse'
+    assert out['idIsTs'] and out['event']['tag'] == 'EVENT' and out['event']['text'] == 'compare-careful: live over sse'
 
 
 # ---------------------------------------------------------------- story, follow and the roster
@@ -865,8 +1168,11 @@ Object.assign(aws.items.get('arena'), {
   evidence_data: s(JSON.stringify({ careful: { source: 'real', cart_kept: true }, fast: { source: 'real', cart_kept: false } })),
 });
 const extraLines = [
-  { id: 'web-start', t: base - 5000, tag: 'WEB', text: 'Presenter pressed Start: 3 players in the room', detail: { players: 3 } },
-  { id: 'web-close-launch', t: base + 39900, tag: 'WEB', text: 'closed', detail: { round: 'launch', picked: 3, players: 3 } },
+  { id: 'web-start', t: base - 5000, tag: 'WEB', level: 'info', text: 'Presenter pressed Start: 3 players in the room', detail: { players: 3 } },
+  { id: 'web-close-launch', t: base + 39900, tag: 'WEB', level: 'info', text: 'closed', detail: { round: 'launch', picked: 3, players: 3 } },
+  { id: 'open-launch', t: base - 4000, tag: 'DURABLE', level: 'info', text: 'Round 1 · Launch open', detail: { round: 'launch' } },
+  { id: 'close-launch', t: base + 40000, tag: 'DURABLE', level: 'info', text: 'Close received: 3/3 picked', detail: { players: 3, picked: 3, round: 'launch' } },
+  { id: 'results-launch', t: base + 40600, tag: 'DURABLE', level: 'info', text: 'Results published', detail: { round: 'launch' } },
 ];
 aws.items.get(`timeline#${RUN}`).lines.L.push(...extraLines.map(line => s(JSON.stringify(line))));
 """
@@ -890,7 +1196,7 @@ def test_story_cards_say_what_the_system_is_doing_with_numbers_taken_from_the_da
     assert cards['migrations']['text'] == ('Two Event judges, two MicroVMs in parallel: careful copies every table, '
                                            'fast skips the carts (11.4 s / 11.6 s).')
     assert cards['checks']['text'] == ("Two fresh VMs restore each database and look for Maya's cart: "
-                                       'careful KEPT it, fast LOST it.')
+                                       'careful kept it, fast fumbled it (carts skipped by design).')
     assert cards['close-launch']['text'] == ("Close woke the workflow: it drew the market (112%), rolled everyone's dice, "
                                              'scored 3 players and published, in 0.6 s. Then it went back to sleep.')
     assert cards['open-launch']['text'].startswith('Round 1 was open: 3/3 picked.')
@@ -949,7 +1255,8 @@ def test_follow_lines_come_from_picks_and_result_rows_and_use_no_gendered_pronou
     """)
     assert out['growth']['t1'] == {
         'lines': ["Zelda Zebra picked Careful migration: their shop is the real VM that kept Maya's cart."], 'pick': 'careful'}
-    assert out['growth']['t3']['lines'] == ["Xena Xerus picked Fast migration: their shop is the real VM that lost Maya's cart."]
+    assert out['growth']['t3']['lines'] == [
+        'Xena Xerus picked Fast migration: their shop is the real VM that fumbled the migration, skipping the carts by design.']
     assert 't2' not in out['growth'], 'nobody who has not picked has a pick line'
     assert out['launch']['t1']['lines'] == [
         "Zelda Zebra rolled 12 against Medium server's 35: Demand was normal this round.",
@@ -962,20 +1269,49 @@ def test_follow_lines_come_from_picks_and_result_rows_and_use_no_gendered_pronou
                 assert not re.search(r"\b(his|her|hers|he|she|him)\b", line), line
 
 
-def test_launch_and_migration_log_lines_know_their_stage_and_option():
-    out = run_scenario(r"""
-      const lines = [
-        [EVALUATOR, '[EVENT] compare careful: VM running, endpoint ready in 3.21 s'],
-        [EVALUATOR, '[VM] 1a2b3c4d migrate fast: PHP shop ready in 1.92 s'],
-        [MICROVM, '[1a2b3c4d launch -] PHP shop ready in 1.92 s'],
-        [EVALUATOR, '[PHP] GET /cart 404 12 ms'],
+def test_story_lines_attach_to_their_card_by_stage_run_and_option_and_follow_filters_by_option():
+    page = (PAGE_DIR / 'logs.js').read_text()
+    out = run_scenario(STORY_SEED + f"""
+      const page = {json.dumps(page)};
+      const slice = page.slice(page.indexOf('function attached'), page.indexOf('function el('));
+      const consts = page.match(/^const (?:STAGE_CARD|VM_STAGES) = .*;$/gm).join('\\n');
+      const build = new Function('lineEvents', 'storyRun', 'followedOption', `${{consts}}\\n${{slice}}\\nreturn attached;`);
+      const run = RUN.slice(0, 8);
+      const vm = (seq, extra) => jline('VM', vmEntry({{ seq, run, t: T - 50000 + seq * 1000, ...extra }}));
+      aws.cw[EVALUATOR] = [
+        cwEvent('a', 40000, vm(0, {{ action: 'launch', option: null, msg: 'shop ready' }})),
+        cwEvent('b', 39000, vm(1, {{ action: 'migrate', option: 'careful', msg: 'dump copied' }})),
+        cwEvent('c', 38000, vm(2, {{ action: 'migrate', option: 'fast', msg: 'dump skipped' }})),
+        cwEvent('d', 37000, jline('VM', phpEntry({{ seq: 3, run, t: T - 37000, level: 'info', msg: 'GET /cart/cart-saved 200 5 ms', status: 200, ms: 5 }}))),
+        cwEvent('e', 36000, jline('VM', phpEntry({{ seq: 4, run, t: T - 36000, option: 'fast', msg: 'GET /cart/cart-saved 404 12 ms' }}))),
+        cwEvent('f', 35000, vm(5, {{ run: 'ffffffff', action: 'launch', option: null, msg: 'another run' }})),
+        cwEvent('g', 34000, jline('EVENT', eventEntry('check /health: HTTP 200 in 4 ms', {{ t: T - 34000, option: 'fast', step: 'compare-fast' }}))),
       ];
-      result(lines.map(([group, message], i) => fromCloudWatch(group, cwEvent(i, i, message)).detail));
+      const hub = hubFor(() => T);
+      await hub.poll();
+      const lineEvents = hub.eventsAfter(undefined, true).filter(e => e.detail && e.detail.stage);
+      const cards = hub.storyCards().filter(card => ['launch', 'migrations', 'checks'].includes(card.stage));
+      let mine = null;
+      const attached = build(lineEvents, run, () => mine);
+      const texts = {{}};
+      for (const who of [null, 'careful', 'fast']) {{
+        mine = who;
+        texts[who ?? 'nobody'] = Object.fromEntries(cards.map(card => [card.stage, attached(card).map(e => e.text)]));
+      }}
+      result(texts);
     """)
-    assert out[0] == {'stage': 'compare', 'option': 'careful'}
-    assert out[1] == {'stage': 'migrate', 'option': 'fast'}
-    assert out[2] == {'stage': 'launch'}
-    assert out[3] == {'method': 'GET', 'path': '/cart', 'status': 404, 'ms': 12}, 'a PHP line has no label: the page places it by time'
+    launch = ['Launch shop (real MicroVM): checkout 200', 'launch: shop ready']
+    careful_check = 'compare careful: GET /cart/cart-saved 200 5 ms'
+    fast_checks = ["Fast migration check (recorded): fumbled, Maya's cart lost (404)", 'compare fast: GET /cart/cart-saved 404 12 ms',
+                   'compare-fast: check /health: HTTP 200 in 4 ms']
+    assert out['nobody'] == {
+        'launch': launch,
+        'migrations': ['Careful migration done (real MicroVM)', 'migrate careful: dump copied', 'migrate fast: dump skipped'],
+        'checks': [fast_checks[0], careful_check, *fast_checks[1:]],
+    }, 'by stage, oldest first; the other run (ffffffff) is left out'
+    assert out['careful'] == {'launch': launch, 'migrations': ['Careful migration done (real MicroVM)', 'migrate careful: dump copied'],
+                              'checks': [careful_check]}
+    assert out['fast'] == {'launch': launch, 'migrations': ['migrate fast: dump skipped'], 'checks': fast_checks}
 
 
 def test_roster_diffing_joins_renames_picks_changes_and_removals():
@@ -1010,7 +1346,7 @@ def test_roster_diffing_joins_renames_picks_changes_and_removals():
     assert changed[2] == 'Ann changed their pick in Growth from Careful migration to Fast migration'
     assert out['removed'] == [['b:rm', 'info', 'Bob was removed (1 players left)']]
     assert out['sameIds'], 'the same change gets the same id wherever it is seen'
-    assert out['detail'] == {'player': 'a', 'round': 'growth', 'option': 'careful'} and out['tag'] == 'PLAYER'
+    assert out['detail'] == {'player': 'a', 'round': 'growth', 'option': 'careful'} and out['tag'] == 'WEB'
     assert 'token' not in out['text'] and 'ffffffff' not in out['text']
 
 
@@ -1031,7 +1367,7 @@ def test_the_hub_follows_the_roster_over_time_and_serves_players_without_tokens(
       await hub.poll();
       set([{ id: 'a', name: 'Anna', picks: { launch: 'medium' } }]);
       await hub.poll();
-      const text = hub.eventsAfter(undefined, true).filter(e => e.tag === 'PLAYER').map(e => e.text);
+      const text = hub.eventsAfter(undefined, true).filter(e => e.source === 'arena').map(e => e.text);
       const card = hub.storyCards().at(-1);
       result({ text, players: hub.players, card: [card.stage, card.text, card.numbers], blob: JSON.stringify([hub.eventsAfter(undefined, true), hub.storyCards(), hub.players]) });
     """)
@@ -1081,3 +1417,27 @@ def test_story_cards_stream_as_story_events_without_ids_and_are_replaced_when_nu
     assert out['hasId'] is False, 'story frames must not move the Last-Event-ID cursor'
     assert out['later'][0] == ['st:01234567:open-growth', 2] and out['later'][-1] == ['st:01234567:open-growth', 3]
     assert ['st:01234567:open-growth', 'open-growth'] in out['polled'], 'the polling fallback carries the same cards'
+
+
+def test_a_missing_after_is_the_start_of_the_window_never_the_cursor_zero():
+    out = run_scenario(r"""
+      fill(); await serve();
+      // A missing query parameter arrives as null, and Number(null) is 0.
+      const missing = [parseCursor(null), parseCursor(undefined, null, ''), parseCursor('   '), parseCursor('abc'), parseCursor('-5'), parseCursor(null, null)];
+      const given = { zero: parseCursor('0'), after: parseCursor(null, '1234'), header: parseCursor('99', '1234'), skipsBad: parseCursor('abc', '7') };
+      const hub = hubFor(() => T);
+      await hub.poll();
+      const everything = hub.eventsAfter(undefined, true).map(e => e.id);
+      const viaNull = hub.eventsAfter(parseCursor(null), true).map(e => e.id);
+      const ids = async path => (await call('GET', path, { headers: KEY })).body.events.map(e => e.id);
+      const none = await ids('/events?debug=1'), empty = await ids('/events?debug=1&after='), zero = await ids('/events?debug=1&after=0'), junk = await ids('/events?debug=1&after=abc');
+      const stream = await open('/stream?debug=1');
+      await stream.until(text => text.includes('event: status'));
+      result({ missing, given, same: JSON.stringify(everything) === JSON.stringify(viaNull),
+               http: [none.length > 30, JSON.stringify(none) === JSON.stringify(empty), JSON.stringify(none) === JSON.stringify(junk), JSON.stringify(none) === JSON.stringify(zero)],
+               stream: stream.events().length >= none.length });
+    """)
+    assert out['missing'] == [None] * 6
+    assert out['given'] == {'zero': 0, 'after': 1234, 'header': 99, 'skipsBad': 7}
+    assert out['same']
+    assert out['http'] == [True, True, True, True] and out['stream']
