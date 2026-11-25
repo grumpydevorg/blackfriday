@@ -177,8 +177,23 @@ the viewer page.
 Each environment runs one shared poller while someone is watching, so more
 viewers never mean more AWS reads. It reads the arena and timeline items and
 the current execution's Durable history every 2 s, and CloudWatch through one
-Live Tail session (lines within a few seconds). FilterLogEvents fills the last
-15 minutes on connect and any gaps every 10 s.
+Live Tail session. FilterLogEvents fills the last 15 minutes on connect and any
+gaps every 10 s.
+
+Measured in a 5-player game on 25 November 2026 (04:26 UTC), from the event's
+own timestamp to arrival in the browser stream:
+
+| Tag | Median | Max |
+|:--|--:|--:|
+| DURABLE | 1.0 s | 2.1 s |
+| MICROVM (evidence summary) | 0.4 s | 0.4 s |
+| WORKFLOW | 8.6 s | 10.3 s |
+| EVENT, VM, PHP | 9–10 s | 10.5 s |
+| WEB | 25 s | 35 s, one at 114 s |
+
+The CloudWatch delay is the log pipeline's own: a bare Live Tail session from a
+laptop showed the game Web Function's lines 8–35 s after their timestamps.
+Durable lines come straight from the history API.
 
 `GET /stream` is Server-Sent Events and streams unbuffered. Each connection
 lasts up to the 900-second timeout, then the browser reconnects with
