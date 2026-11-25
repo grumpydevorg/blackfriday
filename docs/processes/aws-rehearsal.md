@@ -167,10 +167,30 @@ against any account but the game's.
 |:--|:--|
 | `GAME` | The arena item, read every second: Reset, phase and round changes, joins, picks so far, and each round's results (market draw, best option, top player). |
 | `DURABLE` | The execution's history, read every 2 s: each operation once (steps, invokes, the parallel migrations and checks, callbacks waiting and Closes received), with elapsed time, and each suspension between invocations. |
-| `MICROVM` | Inside each VM, from `/aws/lambda-microvms/<prefix>-shop`: one timed line per stage (setup received, initdb, PostgreSQL start, `migrate.php` or `pg_restore`, PHP shop ready, each checkout with status and ms, Maya's saved cart, artifact exported, shutdown), labelled with the run prefix, action and option. Plus the Launch, careful and fast results once the workflow publishes them. The evaluator runs every VM with CloudWatch logging to that group (the VM still has no AWS role); `vm_runtime.py` never prints a payment URL, receipt, token or full run id, and drops PHP's per-request access lines while keeping its warnings and errors. |
-| `EVENT`, `WORKFLOW` | Event judge and Durable invocation durations and cold starts. |
-| `WEB` | Requests per minute, environments, peak concurrency, cold starts and errors, summed each minute from the Web Function's `platform.invokeSummary` records. |
+| `MICROVM` | The Launch, careful and fast results once the workflow publishes them. |
+| `VM`, `PHP` | Inside each VM: one timed line per stage (setup received, initdb, PostgreSQL start, `migrate.php` or `pg_restore`, PHP shop ready, Maya's saved cart, artifact exported, shutdown) and one line per shop request (`GET /cart/cart-saved 404 3 ms`), labelled with the run prefix, action and option. |
+| `EVENT` | The Event judge's sub-steps (VM requested, endpoint ready, setup sent, each shop check with status and ms, artifact saved, VM terminated) and its duration and cold start. |
+| `WORKFLOW` | One line per Durable step (market draw, bots, best option, leader's total) and each invocation's duration. |
+| `WEB` | One access line per request (route template, status, ms, phase and round; polls are `debug`), and each minute a summary: requests per minute, environments, peak concurrency, cold starts and errors from `platform.invokeSummary`. |
 | `ERROR` | Error lines, trimmed, from any of those sources. |
+
+**VM logs reach CloudWatch through the judge.** RunMicrovm refuses CloudWatch
+logging without an `executionRoleArn`, and the VM keeps no AWS role, so runs use
+`logging={disabled}`. `vm_runtime.py` keeps its last 500 lines in memory; the
+evaluator reads them from `GET /control/log` before it terminates the VM (also
+after a failure) and prints them as `[VM]` and `[PHP]` lines in its own log
+group. Neither prints a payment URL, receipt, token or full run id, and the
+evaluator replaces any URL- or receipt-shaped text again.
+
+The room screen (stdout) leaves out `debug` events and routine `WEB` access
+lines. Every event, including those, also goes to `~/bf-watch.jsonl`
+(`{ts, tag, level, source, text, detail}`; player names are left out).
+
+**Filterable viewer.** `python3 aws/watch_web.py` serves the JSONL on
+<http://127.0.0.1:7682/> (loopback only): the last 2,000 events and then a live
+stream. In the browser you can toggle tags and levels (`debug` is hidden by
+default), search (optionally with a regex), pause, and expand a line. Filters
+live in the URL hash, and the page keeps 10,000 lines.
 
 Logs come from CloudWatch Logs Live Tail, which reconnects when a session ends
 (sessions last at most 3 hours) or drops. When the SSO session expires it prints
@@ -360,3 +380,23 @@ then a game Reset mid-Growth, then a fresh full game:
 In the three completed games both migrations' evidence was `real`: careful kept
 Maya's cart (200), fast lost it (404), as expected. The two executions left
 waiting by the Resets were stopped afterwards.
+
+**Second run, the build with the timeline and logs (commit 928bc61), 03:46–03:50
+UTC.** It used the same script and the same games, and also checked the
+timeline. Every evidence source was `real` in all three completed games.
+
+| Check | Pass mark | Measured |
+|:--|:--|:--|
+| Presenter errors | 0 | 0 |
+| Phone 5xx and 429 | < 1% | 0 in 8,509 requests |
+| Start → Round 1 open | — | 22.8–25.6 s |
+| Close → results on `/api/state` | p95 ≤ 2 s | median 0.58 s, p95 0.85 s |
+| Largest DynamoDB item | < 200 KB | 47.0 KB (arena) |
+| `cumulative_cents` vs offline replay | equal | 3 games × 402 rows, 0 mismatches |
+| Timeline: every expected line once per game, nothing secret | exact | 33 lines per game, 0 missing, duplicated or extra, 0 secret-looking details |
+| `/api/host/timeline` without sign-in | 403 | 403 |
+
+Before this run, one 5-player game's logs in all five `fourround` log groups were
+searched for `php:`, `receipt`, `token`, `pay_url`, `X-Amz-`, `Signature`,
+`cookie`, the passphrase and the presenter key. The only hit was the apt
+package name `tokenizer.ini` in the image build log.

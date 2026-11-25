@@ -5,7 +5,10 @@
 """Live log of the fourround game for the room: game state, Durable operations and Lambda logs.
 
 Read-only: DynamoDB GetItem, Durable execution history, CloudWatch Logs Live Tail.
-Run: cd demo && BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/watch.py
+Run: cd demo && BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/watch.py | tee -a ~/bf-watch.log
+
+Every event is also appended as one JSON line to ~/bf-watch.jsonl (env BF_WATCH_JSONL overrides),
+which aws/watch_web.py serves as a filterable live viewer. Debug events go only to the JSONL.
 """
 
 import json
@@ -15,7 +18,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -42,7 +45,17 @@ LOG_GROUPS = {
     '/aws/lambda-microvms/black-friday-four-shop': 'MICROVM',
 }
 COLOURS = {'GAME': '1;32', 'DURABLE': '1;35', 'EVENT': '1;33', 'MICROVM': '1;36', 'WEB': '1;34',
-           'WORKFLOW': '1;95', 'ERROR': '1;31', 'WATCH': '1;37'}
+           'WORKFLOW': '1;95', 'VM': '1;36', 'PHP': '1;96', 'ERROR': '1;31', 'WATCH': '1;37'}
+DEFAULT_SOURCE = {'GAME': 'arena', 'MICROVM': 'arena', 'DURABLE': 'durable', 'WEB': 'web'}
+HEX32 = re.compile(r'\b[0-9a-fA-F]{32}\b')
+SIGNED_URL = re.compile(r'https?://\S*(?:X-Amz-|Signature=|[Pp]ay)\S*')
+
+
+def scrub(text) -> str:
+    """Last line of defence: no pre-signed or payment links, no full 32-hex run id (8-char prefix stays)."""
+    return HEX32.sub(lambda m: m.group(0)[:8] + '…', SIGNED_URL.sub('[link redacted]', str(text)))
+
+
 SSO_LINE = 'AWS SSO expired: run aws sso login --sso-session rick-personal --use-device-code'
 CREDENTIAL_CODES = {'ExpiredToken', 'ExpiredTokenException', 'UnrecognizedClientException',
                     'InvalidClientTokenId', 'UnauthorizedException', 'AccessDeniedException'}
@@ -60,8 +73,39 @@ def short_title(round_id: str | None) -> str:
     return title.split('·')[-1].strip()
 
 
-def emit(tag: str, text: str, colour: str | None = None) -> None:
-    """One line: local time, fixed-width coloured tag, text cut to fit WIDTH."""
+def jsonl_path() -> Path:
+    return Path(os.environ.get('BF_WATCH_JSONL') or Path.home() / 'bf-watch.jsonl')
+
+
+def event_record(tag: str, level: str, source: str, text: str, detail: dict | None = None,
+                 now: datetime | None = None) -> dict:
+    """The JSONL shape: one dict per event, timestamps in UTC."""
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return {'ts': stamp.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), 'tag': tag, 'level': level,
+            'source': source, 'text': ' '.join(str(text).split()), 'detail': detail or {}}
+
+
+def write_jsonl(record: dict) -> None:
+    line = json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n'
+    try:
+        with _print_lock, open(jsonl_path(), 'a', encoding='utf-8') as handle:
+            handle.write(line)
+    except OSError as error:   # a full disk must not stop the room screen
+        print(f'watch: cannot write {jsonl_path()}: {error}', file=sys.stderr, flush=True)
+
+
+def emit(tag: str, text: str, colour: str | None = None, *, level: str | None = None,
+         source: str | None = None, detail: dict | None = None, public: str | None = None) -> None:
+    """One event. Stdout: local time, fixed-width coloured tag, text cut to fit WIDTH (not for debug).
+    JSONL: always, with `public` as the text when the screen line shows more than the file may (names)."""
+    level = level or ('error' if (colour or tag) == 'ERROR' else 'info')
+    text = scrub(text)
+    write_jsonl(event_record(tag, level, source or DEFAULT_SOURCE.get(tag, 'watch'),
+                             text if public is None else scrub(public), detail))
+    # The room screen stays as it was: polls, and routine per-request WEB access lines (100 phones joining and
+    # picking), go to the JSONL viewer only; a 4xx/5xx access line still shows.
+    if level == 'debug' or (tag == 'WEB' and detail and 'route' in detail and level == 'info'):
+        return
     stamp = datetime.now(ZONE).strftime('%H:%M:%S')
     label = f'[{tag}]'.ljust(10)
     text = ' '.join(str(text).split())
@@ -218,7 +262,7 @@ def evidence_lines(launch: dict | None, evidence: dict | None) -> list[str]:
     return lines
 
 
-def results_line(data: dict) -> str:
+def results_line(data: dict, names: bool = True) -> str:
     round_id = data.get('round')
     market = data.get('market')
     unit = ROUND.get(round_id, {}).get('market', {}).get('unit', '')
@@ -228,7 +272,8 @@ def results_line(data: dict) -> str:
     best_text = (f'best {OPTION.get((round_id, best[0]), best[0])} (mean {dollars(best[1].get("mean_profit_cents"))}, '
                  f'{best[1].get("players")} players)') if best else 'no picks'
     rows = data.get('rows') or []
-    top = f'top {rows[0].get("name")} {dollars(rows[0].get("cumulative_cents"))}' if rows else ''
+    top = (f'top {rows[0].get("name") if names else "player"} {dollars(rows[0].get("cumulative_cents"))}'
+           if rows else '')
     return f'{short_title(round_id)} results: market {market}{unit} · {best_text} · {top}'
 
 
@@ -276,7 +321,8 @@ def watch_game(table: str) -> None:
             left = len(before - after)
             if joined:
                 names = ', '.join(joined[:3]) + (f' +{len(joined) - 3} more' if len(joined) > 3 else '')
-                emit('GAME', f'+{len(joined)} joined ({plural(len(players), "player")}): {names}')
+                emit('GAME', f'+{len(joined)} joined ({plural(len(players), "player")}): {names}',
+                     public=f'+{len(joined)} joined ({plural(len(players), "player")})')
             if left:
                 emit('GAME', f'-{left} removed ({plural(len(players), "player")})')
 
@@ -309,7 +355,8 @@ def watch_game(table: str) -> None:
             if result:
                 shown_results.add(key)
                 try:
-                    emit('GAME', results_line(json.loads(result['data']['S'])))
+                    data = json.loads(result['data']['S'])
+                    emit('GAME', results_line(data), public=results_line(data, names=False))
                 except (KeyError, ValueError):
                     emit('GAME', f'{short_title(done)} results published')
         last = {'run_id': run_id, 'phase': phase, 'round': round_id, 'players': players}
@@ -432,17 +479,143 @@ class WebStats:
                 minutes = max((time.monotonic() - self.since) / 60, 1 / 60)
                 emit('WEB', f'{self.requests / minutes:,.0f} req/min · {len(self.instances)} environment(s) · '
                             f'max {self.concurrency} concurrent · {self.cold} cold start(s) · {self.errors} error(s)',
-                     'ERROR' if self.errors else None)
+                     'ERROR' if self.errors else None, source='web',
+                     detail={'requests': self.requests, 'environments': len(self.instances),
+                             'max_concurrent': self.concurrency, 'cold_starts': self.cold, 'errors': self.errors})
             self.reset()
 
 
 WEB = WebStats()
 
 
-def handle_log(tag: str, message: str) -> None:
+CONTRACT = re.compile(r'(?:^|\s)\[(EVENT|VM|PHP|WORKFLOW)\] ?(.*)$', re.S)
+PHP_ACCESS = re.compile(r'^([A-Z]+) (\S+) (\d{3}) ([\d.]+) ms\b')
+STAGE_LINE = re.compile(r'^(\S+) (\S+): ')
+STEP_LINE = re.compile(r'^([^\s:]+): ')
+WARNISH = re.compile(r'\b(WARN|WARNING|warn|warning|retry|retrying|fallback)\b')
+ACCESS_KEYS = ('method', 'route', 'status', 'ms', 'phase', 'round')   # the only fields that may leave the log line
+ACCESS_IN_TEXT = re.compile(r'\{[^{}]*"bf"\s*:\s*"access"[^{}]*\}')
+LEVEL_NAMES = {'DEBUG': 'debug', 'INFO': 'info', 'WARN': 'warn', 'WARNING': 'warn', 'ERROR': 'error',
+               'CRITICAL': 'error', 'FATAL': 'error'}
+
+
+def access_level(status, given=None) -> str:
+    if isinstance(given, str) and given.lower() in LEVEL_NAMES.values():
+        return given.lower()
+    status = status if isinstance(status, int) else 0
+    return 'error' if status >= 500 else 'warn' if status >= 400 else 'info'
+
+
+def parse_access(message, depth: int = 0) -> dict | None:
+    """The web access record in a log message, or None. It may be the whole message, nested in the `message` or
+    `record` field of a JSON log record, or embedded in a plain console line. Only ACCESS_KEYS are kept."""
+    found = None
+    if isinstance(message, str):
+        text = message.strip()
+        if text.startswith('{'):
+            try:
+                found = parse_access(json.loads(text), depth + 1) if depth < 3 else None
+            except ValueError:
+                found = None
+        if found is None:
+            match = ACCESS_IN_TEXT.search(text)
+            if match:
+                try:
+                    found = parse_access(json.loads(match.group(0)), depth + 1)
+                except ValueError:
+                    found = None
+        return found
+    if not isinstance(message, dict) or depth > 3:
+        return None
+    if message.get('bf') == 'access':
+        out = {key: message[key] for key in ACCESS_KEYS if isinstance(message.get(key), (str, int, float))}
+        out['level'] = access_level(out.get('status'), message.get('level'))
+        return out
+    for key in ('message', 'record'):
+        found = parse_access(message.get(key), depth + 1)
+        if found:
+            return found
+    return None
+
+
+def access_text(access: dict) -> str:
+    text = f'{access.get("method", "?")} {access.get("route", "?")} {access.get("status", "?")} {access.get("ms", "?")} ms'
+    extra = ' '.join(str(access[k]) for k in ('phase', 'round') if access.get(k))
+    return f'{text} · {extra}' if extra else text
+
+
+def contract_level(tag: str, text: str, hint: str | None = None) -> str:
+    if tag == 'PHP':
+        match = PHP_ACCESS.match(text)
+        if match:
+            status = int(match.group(3))
+            return 'error' if status >= 500 else 'warn' if status >= 400 else 'info'
+    if hint:
+        return hint
+    if ERRORISH.search(text) or ' failed' in text:
+        return 'error'
+    return 'warn' if WARNISH.search(text) else 'info'
+
+
+def parse_contract(message: str) -> dict | None:
+    """`[EVENT] ...`, `[VM] ...`, `[PHP] ...` or `[WORKFLOW] ...` (also inside a JSON record's `message`).
+    Returns {'tag', 'level', 'text', 'detail'} or None."""
+    hint = None
+    message = message.strip()
+    if message.startswith('{'):
+        try:
+            record = json.loads(message)
+        except ValueError:
+            record = None
+        if isinstance(record, dict) and isinstance(record.get('message'), str):
+            message = record['message'].strip()
+            hint = LEVEL_NAMES.get(str(record.get('level', '')).upper())
+    match = CONTRACT.search(message)
+    if not match:
+        return None
+    tag, text = match.group(1), ' '.join(match.group(2).split())
+    detail: dict = {}
+    if tag == 'PHP':
+        php = PHP_ACCESS.match(text)
+        if php:
+            detail = {'method': php.group(1), 'path': php.group(2), 'status': int(php.group(3)),
+                      'ms': float(php.group(4))}
+    elif tag == 'EVENT':
+        stage = STAGE_LINE.match(text)
+        if stage:
+            detail = {'stage': stage.group(1), 'option': None if stage.group(2) == '-' else stage.group(2)}
+    elif tag == 'WORKFLOW':
+        step = STEP_LINE.match(text)
+        if step:
+            detail = {'step': step.group(1)}
+    return {'tag': tag, 'level': contract_level(tag, text, hint), 'text': text, 'detail': detail}
+
+
+def handle_access(access: dict, source: str) -> None:
+    level = access['level']
+    with WEB.lock:
+        if level == 'error':
+            WEB.errors += 1
+    emit('WEB', access_text(access), 'ERROR' if level == 'error' else None, level=level, source=source,
+         detail=access)
+
+
+def handle_log(tag: str, message: str, source: str | None = None) -> None:
     message = message.strip()
     if not message:
         return
+    source = source or tag.lower()
+    if tag == 'WEB':
+        access = parse_access(message)
+        if access:
+            handle_access(access, source)
+            return
+    else:
+        line = parse_contract(message)
+        if line:
+            emit(line['tag'], line['text'], 'ERROR' if line['level'] == 'error' else None, level=line['level'],
+                 source=source, detail=line['detail'])
+            return
     record = None
     if message.startswith('{'):
         try:
@@ -463,7 +636,7 @@ def handle_log(tag: str, message: str) -> None:
                 WEB.errors += 1
         if record.get('level') == 'ERROR' or ERRORISH.search(str(record.get('message', ''))):
             WEB.errors += 1
-            emit('ERROR', f'web: {record.get("message") or message}')
+            emit('ERROR', f'web: {record.get("message") or message}', source=source)
         return
     if tag == 'WORKFLOW' and isinstance(record, dict):
         if record.get('type') == 'platform.report':
@@ -471,23 +644,25 @@ def handle_log(tag: str, message: str) -> None:
             cold = f' (cold start {metrics["initDurationMs"] / 1000:.1f} s)' if metrics.get('initDurationMs') else ''
             status = (record.get('record') or {}).get('status')
             emit('WORKFLOW', f'Durable invocation {metrics.get("durationMs", 0) / 1000:.2f} s{cold}'
-                             + ('' if status == 'success' else f' · {status}'), None if status == 'success' else 'ERROR')
+                             + ('' if status == 'success' else f' · {status}'), None if status == 'success' else 'ERROR',
+                 source=source)
         elif record.get('level') in ('ERROR', 'CRITICAL') or ERRORISH.search(str(record.get('message', ''))):
-            emit('ERROR', f'workflow: {record.get("message") or message}')
+            emit('ERROR', f'workflow: {record.get("message") or message}', source=source)
         elif 'fallback' in record:
-            emit('ERROR', f'workflow fell back to recorded evidence: {record.get("fallback")} · {record.get("error")}')
+            emit('ERROR', f'workflow fell back to recorded evidence: {record.get("fallback")} · {record.get("error")}',
+                 source=source)
         return
     if tag == 'EVENT':
         match = REPORT.search(message)
         if match:
             cold = f' (cold start {float(match.group(2)) / 1000:.1f} s)' if match.group(2) else ''
-            emit('EVENT', f'Event judge done in {float(match.group(1)) / 1000:.1f} s{cold}')
+            emit('EVENT', f'Event judge done in {float(match.group(1)) / 1000:.1f} s{cold}', source=source)
         elif message.startswith(('START', 'END', 'INIT_START')):
             return
         elif ERRORISH.search(message):
-            emit('ERROR', f'event: {message}')
+            emit('ERROR', f'event: {message}', source=source)
         else:
-            emit('EVENT', message)
+            emit('EVENT', message, source=source)
         return
     if tag == 'MICROVM':
         if isinstance(record, dict):   # a structured wrapper: show the line it carries
@@ -496,10 +671,18 @@ def handle_log(tag: str, message: str) -> None:
             return   # image build output
         # vm_runtime.py lines look like "[1a2b3c4d migrate careful] PHP shop ready in 1.92 s".
         bad = ERRORISH.search(message) or ' failed with code ' in message or 'php: PHP ' in message
-        emit('ERROR' if bad else 'MICROVM', message)
+        emit('ERROR' if bad else 'MICROVM', message, source=source)
         return
     if ERRORISH.search(message):
-        emit('ERROR', f'{tag.lower()}: {message}')
+        emit('ERROR', f'{tag.lower()}: {message}', source=source)
+
+
+def log_source(identifier: str) -> str:
+    """Short log group name: /aws/lambda/web/black-friday-four → web/black-friday-four. Live Tail reports the
+    group as an ARN or as '<account>:<group>'."""
+    group = identifier.split('log-group:', 1)[-1].removesuffix(':*')
+    group = re.sub(r'^\d{12}:', '', group)
+    return group.removeprefix('/aws/lambda-microvms/').removeprefix('/aws/lambda/') or 'logs'
 
 
 def watch_logs(account: str) -> None:
@@ -527,7 +710,7 @@ def watch_logs(account: str) -> None:
                         recent_set.discard(recent[0])
                     recent.append(key)
                     recent_set.add(key)
-                    handle_log(tag, result.get('message') or '')
+                    handle_log(tag, result.get('message') or '', log_source(identifier))
             emit('WATCH', 'Live Tail session ended; reconnecting')
         except (ClientError, BotoCoreError) as error:
             time.sleep(min(AWS.failed(error, 'live tail'), 30))
