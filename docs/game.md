@@ -67,7 +67,7 @@ Sign in on `/host` (or run `operate.py present`), then:
 2. **Close round N**: freezes the picks, scores the round, publishes its results
    and opens the next round. After Round 4 the game is final.
 3. **Reset**: throws every player and score away and returns to a fresh lobby.
-   Works in any phase; the page asks first unless the game is waiting or over.
+   Works in any phase; the page asks first unless the game is waiting or final.
 4. **Remove**: takes a player off the roster (a squatted or rude name); that
    phone can join again while joining is open. The presenter page offers it
    only while joining is open.
@@ -84,11 +84,13 @@ Real, once after **Start** and before Round 1 opens, in disposable MicroVMs:
   *careful* copies every table to PostgreSQL (carts preserved), *fast* omits the
   carts table. The check asks whether the saved cart survived.
 
-No MicroVM runs after that. If any real step fails, the workflow uses the
+No MicroVM runs after that. If a real step fails, the workflow uses the
 `recorded_evidence` in `rounds.json` (careful keeps the cart, fast loses it) and
-carries on; the failing option alone is recorded. Every result row carries an
-`evidence` badge: `real` or `recorded` for the careful and fast rows, and
-`modelled` for everything else. The presenter page shows the evidence, including Launch's.
+carries on; only the failing option is recorded (if Launch fails, both). Every
+result row carries an `evidence` badge, `real` or `recorded` for the careful and
+fast rows and `modelled` for everything else, and an `outcome` (`held`, `hit` or
+`lost_carts`) that decides its colour. The presenter page shows the evidence,
+including Launch's.
 
 Everything else is modelled in [`model.py`](../demo/aws/model.py): demand,
 capacity, costs, Black Friday, Christmas and the dice. The prices are in
@@ -127,7 +129,7 @@ is by cumulative profit; equal profit shares a rank, then name, then id.
 | Growth | Careful | $140.89 once, +$22.90 per week for the shared database. The shop then runs at 120% of its server's capacity and cost. Carts are lost only if the real check shows they were. |
 | Growth | Fast | $38.40 once, +$1.86 per week. Same 120% as Careful. Carts are lost when the dice hit (roll under 38) and the real check shows the omitted carts table lost the cart. A lost cart counts the previous round's customers as lost. |
 | Black Friday | Ride | Keeps the capacity it has. |
-| Black Friday | Autoscale | Capacity follows demand; cost is $4.51 per added unit of capacity per week. Under 35 it scales late: the first 60% of the period runs at the old capacity. |
+| Black Friday | Autoscale | Capacity follows demand; cost is $4.51 per added unit of capacity per week, **billed twice**: once as the ramp and once in the new running cost. So the real price is about double the listed one when it scales on time, and between 1× and 2× when the dice hit. `rounds.json` is tuned to this: billing it once makes the balance check fail (autoscale on the best path in 93% of worlds). Under 35 it scales late: the first 60% of the period runs at the old capacity. |
 | Black Friday | Queue | $11.85 per week plus $3.62 per queued checkout, rising with queue depth. Nobody fails; queued checkouts are slow sales. Under 21 retries double-charge 36% of them and each is refunded $36. |
 | Christmas | Keep | Black Friday capacity. |
 | Christmas | Down | Capacity capped at 90 per week, cost scaled to match. |
@@ -176,31 +178,35 @@ migrations sit.
 
 ## Five Lambda choices
 
-| Choice | In BLACK FRIDAY |
-|:--|:--|
-| Web Functions | Serve the player and presenter pages and the API |
-| Durable Functions | Run the game: the real stage, then one wait, plan, score and publish per round |
-| Event Functions | Run one real stage (Launch, a migration or a check) |
-| MicroVMs | Run the shop for each real stage, separately from the judge |
-| Managed Instances | Alternative capacity for the same trusted judges when work is steady (described only, not measured) |
+The five kinds of Lambda and what each does in BLACK FRIDAY are in the
+[README](../README.md#black-friday); Managed Instances is priced in Christmas's
+`commit` option, modelled, not measured.
 
 ## What exists today, and what is proposed
 
 Exists and has been run:
 
-- **The four-round game** (above) in Sydney as the `fourround` deployment: a
-  public player page and a keyed presenter page on one Web Function, a
-  version-pinned Durable game, and the real Launch and growth stages in
-  MicroVMs. Go/no-go numbers for this game:
+- **The four-round game** (above) in Sydney as the `fourround` deployment, the
+  only deployment now present: a public player page and a keyed presenter page
+  on one Web Function (`black-friday-four`), a version-pinned Durable game, and
+  the real Launch and growth stages in MicroVMs. Up to 100 audience players, the
+  house and bots. Go/no-go numbers for this game:
   [AWS game and rehearsal](processes/aws-rehearsal.md#gono-go-measurements).
-- **The one-round game** it replaced, frozen at tag `round-fallback-2026-11-25`
-  as the `round` deployment: up to 200 teams picked one of three migration paths
-  in a single Growth round. It was measured in Sydney on 24 Nov 2026 (Launch
-  9–11 s, Close 10–14 s, shoppers about 11 s, 40 teams a full round, 200 joins
-  in 7.1 s). Those numbers belong to that game, not the four-round one.
+  Tonight's rollback tag is `fourround-live-2026-11-25`.
+- **The live log**, a second, presenter-only Web Function
+  (`black-friday-four-logs`) that streams the game's Durable history, timeline
+  and CloudWatch lines to a viewer with Story and Follow modes; read-only, and
+  separate from the game. See [architecture.md](architecture.md#the-logs-function).
+- **The one-round game** it replaced, the `round` deployment, frozen at tag
+  `round-fallback-2026-11-25`: up to 200 teams picked one of three migration
+  paths in a single Growth round. It was measured in Sydney on 24 Nov 2026
+  (Launch 9–11 s, Close 10–14 s, shoppers about 11 s, 40 teams a full round, 200
+  joins in 7.1 s). Those numbers belong to that game, not the four-round one.
+  Destroyed on 25 Nov 2026, artifacts bucket kept; redeploy it from the tag.
 - An AWS rehearsal (Oregon, then Sydney since 23 Nov 2026), frozen at tag
   `rehearsal-fallback-2026-11-24b`: from one Launch checkpoint, two Growth
-  migrations both passed `/health`; only one kept a saved cart.
+  migrations both passed `/health`; only one kept a saved cart. Destroyed on
+  25 Nov 2026, artifacts bucket kept; redeploy it from the tag.
 - Git submission intake: push to `submit/round-1`, signed webhook, exact SHA
   queued, archive pinned and hashed, frozen export.
 - One reviewed PHP fixture at a frozen commit ran in a real MicroVM and earned

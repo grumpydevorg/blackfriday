@@ -16,8 +16,8 @@ is where the five kinds of Lambda come in:
 
 | Lambda | In BLACK FRIDAY |
 |:--|:--|
-| Web Functions | Serve the player and presenter pages and the API |
-| Durable Functions | Run the game: the real stage, then wait for each round to close, plan, score and publish |
+| Web Functions | Serve the player and presenter pages and the API; a second streams the presenter's live log |
+| Durable Functions | Run the game: the five real stages (Launch, two migrations, two checks), then wait for each round to close, plan, score and publish |
 | Event Functions | Run one real stage: Launch, a migration or a check |
 | MicroVMs | Run the shop for each real stage, separately from the judge |
 | Managed Instances | Priced in Christmas's `commit` option; modelled, not measured |
@@ -25,15 +25,19 @@ is where the five kinds of Lambda come in:
 ## Status
 
 This is a working prototype, not a hosted tournament. The four-round game can
-be played live in AWS (the `fourround` deployment): up to 100 audience players
-join on their phones, with or without a name, and pick one option per round while
-the presenter runs the rounds. Only Launch (one real MicroVM sale) and the two
-growth migrations (careful and fast, each checked in its own MicroVM) are real;
-they run once after Start, before Round 1 opens. Demand, capacity, costs, Black
-Friday and Christmas are modelled, and Christmas `commit` is Managed
-Instances-like pricing that is modelled, not measured. The earlier one-round game
-and the rehearsal stay frozen as fallbacks. What has been run, and with what
-limits, is recorded in [`docs/game.md`](docs/game.md#what-exists-today-and-what-is-proposed).
+be played live in AWS (the `fourround` deployment, the only one now present): up
+to 100 audience players join on their phones, with or without a name, and pick
+one of three options per round, each with their own dice roll, while the presenter
+runs the rounds. A House player and labelled bots fill the board. Only Launch
+(one real MicroVM sale) and the two growth migrations (careful and fast, each
+checked in its own MicroVM) are real; they run once after Start, before Round 1
+opens. Demand, capacity, costs, Black Friday and Christmas are modelled, and
+Christmas `commit` is Managed Instances-like pricing that is modelled, not
+measured. The earlier one-round game and the rehearsal were destroyed on
+25 November 2026 and can be redeployed from their tags
+([how](docs/processes/aws-rehearsal.md#the-frozen-deployments)). What has been
+run, and with what limits, is recorded in
+[`docs/game.md`](docs/game.md#what-exists-today-and-what-is-proposed).
 Players only pick; no outside or audience code has been run, and [what that
 would need](docs/processes/running-outside-code.md) is written down.
 

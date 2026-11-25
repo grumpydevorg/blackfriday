@@ -6,8 +6,9 @@ Run one frozen Git commit in a real Lambda MicroVM. This is a manual proof for a
 
 Prerequisite: a frozen export from [git-submissions.md](git-submissions.md), and
 the account and profile from [AWS prerequisites](README.md#aws-prerequisites).
-The [AWS rehearsal](aws-rehearsal.md) stack must already be deployed: this runner
-reuses its build role and private bucket and does not redeploy it.
+The [AWS rehearsal](aws-rehearsal.md) stack must already be deployed (it was
+destroyed on 25 November 2026; [redeploy it from its tag](aws-rehearsal.md#the-frozen-deployments)):
+this runner reuses its build role and private bucket and does not redeploy it.
 
 ## Run the reviewed Git fixture in Lambda
 

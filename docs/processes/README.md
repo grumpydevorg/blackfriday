@@ -7,7 +7,7 @@ a file says otherwise; code is in [`demo/`](../../demo/). Background:
 | Runbook | What it covers | Needs AWS |
 |:--|:--|:--|
 | [local-play.md](local-play.md) | The local two-migration demo and the Virtual RDS scoring round | No |
-| [aws-rehearsal.md](aws-rehearsal.md) | Run the four-round audience game, the frozen one-round game and the frozen rehearsal in Sydney; tear them down | Yes |
+| [aws-rehearsal.md](aws-rehearsal.md) | Run the four-round audience game (deployed), and redeploy the destroyed one-round game and rehearsal from their tags; tear them down | Yes |
 | [launch-wave.md](launch-wave.md) | Fan out one game-release wave across Event Lambda workers | Yes |
 | [git-submissions.md](git-submissions.md) | Submit a release with Git; run the intake receiver | No |
 | [microvm-submission.md](microvm-submission.md) | Run one reviewed frozen commit in a MicroVM; stock AWS Emulator proofs | Yes |
@@ -25,5 +25,6 @@ aws sso login --profile "$BLACK_FRIDAY_AWS_PROFILE"
 ```
 
 The Region is fixed at Sydney (`ap-southeast-2`). Use a sandbox account you are
-content to run rehearsal stacks in. Measurements recorded in these runbooks were
-taken in Oregon (`us-west-2`) before the move on 23 November 2026.
+content to run rehearsal stacks in. Launch-wave and MicroVM-submission
+measurements were taken in Oregon (`us-west-2`) before 23 November 2026; the
+`fourround` go/no-go and live-log numbers in Sydney on 25 November 2026.
