@@ -1156,6 +1156,8 @@ def teardown_session(logs):
 GROUPS = {
     '/aws/lambda/web/black-friday-four': {'retentionInDays': 3},
     '/aws/lambda/web/black-friday-four/revision': {},
+    '/aws/lambda/web/black-friday-four.local': {},
+    '/aws/lambda/web/black-friday-four-logs.local': {},
     '/aws/lambda/web/black-friday-four-logs': {'retentionInDays': 3},
     '/aws/lambda/web/black-friday-fourth': {},
 }
@@ -1165,7 +1167,9 @@ def test_destroy_deletes_the_game_log_groups_and_not_the_log_viewers(monkeypatch
     operate = load_operate(monkeypatch, 'fourround')
     logs = FakeLogs(GROUPS)
     operate.remove_web(teardown_session(logs), 'black-friday-four')
-    assert sorted(logs.deleted) == ['/aws/lambda/web/black-friday-four', '/aws/lambda/web/black-friday-four/revision']
+    assert sorted(logs.deleted) == [
+        '/aws/lambda/web/black-friday-four', '/aws/lambda/web/black-friday-four.local',
+        '/aws/lambda/web/black-friday-four/revision']
     assert '/aws/lambda/web/black-friday-four-logs' not in logs.deleted
 
 
@@ -1173,7 +1177,7 @@ def test_destroy_logs_deletes_only_the_viewers_group(monkeypatch):
     operate = load_operate(monkeypatch, 'fourround')
     logs = FakeLogs(GROUPS)
     operate.remove_web(teardown_session(logs), operate.LOGS_FUNCTION)
-    assert logs.deleted == ['/aws/lambda/web/black-friday-four-logs']
+    assert sorted(logs.deleted) == ['/aws/lambda/web/black-friday-four-logs', '/aws/lambda/web/black-friday-four-logs.local']
 
 
 def test_retention_is_set_on_the_functions_own_log_groups_only(monkeypatch):
@@ -1181,4 +1185,32 @@ def test_retention_is_set_on_the_functions_own_log_groups_only(monkeypatch):
     logs = FakeLogs(GROUPS)
     operate.retain_web_logs(teardown_session(logs), 'black-friday-four')
     assert sorted(logs.retained) == [
-        ('/aws/lambda/web/black-friday-four', 7), ('/aws/lambda/web/black-friday-four/revision', 7)]
+        ('/aws/lambda/web/black-friday-four', 7), ('/aws/lambda/web/black-friday-four.local', 7),
+        ('/aws/lambda/web/black-friday-four/revision', 7)]
+
+
+def test_destroy_stops_waiting_games_before_deleting_the_stack(monkeypatch):
+    operate = load_operate(monkeypatch, 'fourround')
+    steps = []
+    running = 'arn:aws:lambda:ap-southeast-2:1:function:black-friday-four-workflow:5/durable-execution/abc/def'
+
+    class Lambda:
+        def get_paginator(self, name):
+            assert name == 'list_durable_executions_by_function'
+            return type('Pages', (), {'paginate': lambda self, **kw: steps.append(('list', kw)) or [
+                {'DurableExecutions': [{'DurableExecutionArn': running}]}]})()
+
+        def stop_durable_execution(self, **kw):
+            steps.append(('stop', kw['DurableExecutionArn']))
+
+    session = type('Session', (), {'client': lambda self, name: Lambda()})()
+    monkeypatch.setattr(operate, 'account_session', lambda: session)
+    monkeypatch.setattr(operate, 'remove_web', lambda session: None)
+    monkeypatch.setattr(operate, 'stack_exists', lambda session, stack: stack == operate.STACK)
+    monkeypatch.setattr(operate, 'stack_outputs', lambda session, stack: {
+        'WorkflowVersion': 'arn:aws:lambda:ap-southeast-2:1:function:black-friday-four-workflow:5'})
+    monkeypatch.setattr(operate, 'delete_stack', lambda session, stack: steps.append(('delete', stack)))
+    operate.destroy()
+    assert steps == [
+        ('list', {'FunctionName': 'black-friday-four-workflow', 'Statuses': ['RUNNING']}),
+        ('stop', running), ('delete', 'BlackFridayFourRound')]

@@ -396,13 +396,7 @@ The one-round game's rules and runbook are in its own tag's copy of this file.
 
 ## Teardown
 
-When no run should resume, stop the presenter. A game waiting for a Close or a
-Reset keeps its Durable execution running for up to 23 h, and CloudFormation
-cannot delete the workflow version under it, so stop those first
-(`aws lambda list-durable-executions-by-function --function-name
-black-friday-four-workflow --statuses RUNNING`, then `aws lambda
-stop-durable-execution --durable-execution-arn …` for each). Then, for one
-deployment:
+When no run should resume, for one deployment:
 
 ```sh
 BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy-logs         # the live log first: its function, log groups, stack and bucket
@@ -412,11 +406,15 @@ BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy --artifacts  # a
 
 Use `BLACK_FRIDAY_DEPLOYMENT=round` or `rehearsal` (the default) for the others.
 `destroy` deletes in the only safe order: the Web Function first, because
-CloudFormation does not own it, then the stacks. It deletes only the game
-function's own log groups (`web_log_groups` matches the exact name or a child of
-it); `black-friday-four-logs` has a name that starts the same way, and `destroy`
-no longer removes its log group (it did before 25 November 2026). It still never
-removes the logs function, stack or bucket, so run `destroy-logs` for those.
+CloudFormation does not own it, then the stacks. Before the main stack it stops
+every RUNNING Durable execution: a game waiting for a Close or a Reset keeps
+running for up to 23 h, and on 25 November 2026 the workflow version's delete
+failed NotStabilized ("Exceeded attempts to wait") until the two waiting games
+were stopped. It deletes only the game function's own log groups
+(`web_log_groups` matches the exact name, a child of it, or the `.local` sibling
+that Lambda Web creates); `black-friday-four-logs` has a name that starts the
+same way, and `destroy` does not remove its log group. It never removes the
+logs function, stack or bucket, so run `destroy-logs` for those.
 Without `--artifacts` it keeps the artifacts stack and its bucket, with the
 packages and run evidence. With it, the stack goes before the bucket it retains,
 then the bucket is found by name and emptied, so a re-run finishes an
@@ -544,6 +542,7 @@ talk.
 
 - Add a failure-injection hook to the go/no-go harness and force one stage
   failure in AWS; the recorded-evidence fallback has only run in unit tests.
-- Old games in the run table never expire: add a TTL.
+- The run table has no TTL, so old games accumulate until the stack is
+  destroyed: add one before the next deployment.
 - The `four-round` commits made on rick-dev are unsigned: re-sign or
   squash-merge into `main`.

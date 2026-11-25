@@ -296,14 +296,15 @@ def deploy_web(
 
 
 def web_log_groups(logs, function: str) -> list[dict]:
-    """The Web Function's own log groups. A name prefix alone also matches another function that starts with this
-    name (`black-friday-four` and `black-friday-four-logs`), so the match is the exact name or a child of it."""
+    """The Web Function's own log groups: the exact name, a child of it, or the `.local` sibling Lambda Web creates
+    beside it. A name prefix alone also matches another function that starts with this name (`black-friday-four`
+    and `black-friday-four-logs`), so nothing else matches."""
     name = f'/aws/lambda/web/{function}'
     return [
         group
         for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=name)
         for group in page['logGroups']
-        if group['logGroupName'] == name or group['logGroupName'].startswith(name + '/')
+        if group['logGroupName'] in (name, name + '.local') or group['logGroupName'].startswith(name + '/')
     ]
 
 
@@ -355,6 +356,18 @@ def artifact_buckets(session) -> list[str]:
     return [b['Name'] for b in session.client('s3').list_buckets()['Buckets'] if b['Name'].startswith(prefix)]
 
 
+def stop_running_games(session) -> None:
+    """A game waiting for a Close or a Reset keeps its Durable execution running for up to 23 h, and while it runs
+    CloudFormation's delete of the workflow version fails NotStabilized (seen 25 Nov 2026). Stop them first."""
+    workflow = stack_outputs(session, STACK)['WorkflowVersion'].split(':')[6]
+    lambda_ = session.client('lambda')
+    pages = lambda_.get_paginator('list_durable_executions_by_function').paginate(
+        FunctionName=workflow, Statuses=['RUNNING'])
+    for execution in (e for page in pages for e in page['DurableExecutions']):
+        lambda_.stop_durable_execution(DurableExecutionArn=execution['DurableExecutionArn'])
+        print(f'Stopped game {execution["DurableExecutionArn"].rsplit("/", 2)[-2]}', flush=True)
+
+
 def destroy(*, artifacts: bool = False) -> None:
     """Tear down in the one safe order. Re-runnable after a partial teardown.
 
@@ -367,6 +380,7 @@ def destroy(*, artifacts: bool = False) -> None:
     session = account_session()
     remove_web(session)
     if stack_exists(session, STACK):
+        stop_running_games(session)
         delete_stack(session, STACK)
     if not artifacts:
         print(f'Kept {ARTIFACTS} and its bucket (packages and run evidence); '
