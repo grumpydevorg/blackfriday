@@ -727,6 +727,12 @@ def migrate_event(kind, **extra):
             'input': sqlite, **extra}
 
 
+def test_the_vm_and_the_judge_share_one_level_and_action_vocabulary(runtime, evaluator):
+    # The judge drops any VM entry outside its sets, so a drift here silently empties the VM log.
+    vm_runtime, _ = runtime
+    assert (vm_runtime.LEVELS, vm_runtime.ACTIONS) == (evaluator.LEVELS, evaluator.ACTIONS)
+
+
 @pytest.mark.parametrize('kind', ['preserve', 'omit'])
 def test_the_runtime_migrates_both_kinds(runtime, kind):
     vm_runtime, instance = runtime

@@ -515,7 +515,7 @@ class Gateway(Handler):
 
 
 def shutdown(signum, frame) -> None:
-    log_stage(f'shutdown ({signal.Signals(signum).name})')
+    # No log call here: log_stage takes the journal lock, which the interrupted thread may hold.
     sys.exit(0)
 
 

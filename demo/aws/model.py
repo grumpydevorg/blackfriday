@@ -38,6 +38,9 @@ ALL_OPTION_IDS = {option for options in _OPTIONS.values() for option in options}
 REAL_OPTIONS: dict[str, str] = {opt['id']: rnd['id'] for rnd in ROUNDS for opt in rnd['options']
                                 if opt['evidence'] == 'real'}
 EVIDENCE_SOURCES = ('real', 'recorded', 'modelled')
+# An option declares how it is judged: really in a MicroVM, or by the model. 'recorded' is only ever a fallback.
+if any(opt['evidence'] not in ('real', 'modelled') for rnd in ROUNDS for opt in rnd['options']):
+    raise ValueError('rounds.json: every option evidence must be "real" or "modelled"')
 if set(REAL_OPTIONS) != set(RECORDED):
     raise ValueError('rounds.json: recorded_evidence must name exactly the options whose evidence is real')
 

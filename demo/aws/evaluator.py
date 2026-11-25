@@ -92,7 +92,8 @@ def vm_entry(raw: object) -> dict | None:
     valid = (
         number(raw['seq']) and number(raw['t']) and raw['kind'] in ('stage', 'php') and raw['level'] in LEVELS
         and isinstance(run, str) and re.fullmatch(r'[0-9a-f]{8}', run) and raw['action'] in ACTIONS
-        and (option is None or option in OPTIONS) and isinstance(message, str) and len(message) <= 200
+        and (option is None or (isinstance(option, str) and option in OPTIONS)) and isinstance(message, str)
+        and len(message) <= 200
         and number(raw.get('ms', 0))
     )
     if valid and php:
@@ -103,7 +104,7 @@ def vm_entry(raw: object) -> dict | None:
         )
     if not valid:
         return None
-    entry = {**raw, 'msg': SECRET.sub('<redacted>', message)}
+    entry = {**raw, 'msg': SECRET.sub('<redacted>', message)[:200]}
     if php:
         entry['path'] = SECRET.sub('<redacted>', raw['path'])
     return entry if entry != raw else raw
@@ -156,7 +157,7 @@ class Store:
     def require(self, key: str) -> bytes:
         result = self.get(key)
         if result is None:
-            raise RuntimeError(f'Missing prerequisite: {key}')
+            raise RuntimeError(f'Missing prerequisite: {key.split("/", 2)[-1]}')  # without the run id
         return result
 
     def put_once(self, key: str, body: bytes, content_type: str) -> None:
@@ -332,7 +333,7 @@ class Rehearsal:
             raise ValueError(f'Invalid log level {level}')
         entry = {
             't': round(time() * 1000), 'level': level, 'action': self.action, 'option': self.team or None,
-            'step': self.step, 'msg': msg, **({} if ms is None else {'ms': ms}),
+            'step': self.step, 'msg': msg[:200], **({} if ms is None else {'ms': ms}),
         }
         print(f'[EVENT] {json.dumps(entry, separators=(",", ":"))}', flush=True)
 
@@ -488,12 +489,16 @@ def handler(event: dict, context) -> dict:
     key = stage.result_key(stage.step)
     candidate = store.get(key)
     if candidate is None:
-        data = stage.setup(store, fleet, work_deadline)
-        if stage.action == 'launch' or (stage.action == 'compare' and stage.kind == 'preserve'):
-            phase = stage.team or stage.action
-            data.update(store.payment_capability(stage.ledger_key(phase), stage.receipt(phase)))
-        request_budget(work_deadline, 1)
-        vm = fleet.run(f'{stage.id}-{stage.step}')
+        try:
+            data = stage.setup(store, fleet, work_deadline)
+            if stage.action == 'launch' or (stage.action == 'compare' and stage.kind == 'preserve'):
+                phase = stage.team or stage.action
+                data.update(store.payment_capability(stage.ledger_key(phase), stage.receipt(phase)))
+            request_budget(work_deadline, 1)
+            vm = fleet.run(f'{stage.id}-{stage.step}')
+        except Exception as error:
+            stage.event(f'stage failed before a VM started: {type(error).__name__}', 'error')
+            raise
         vm_id = vm['microvmId']
         requested = monotonic()
         stage.event(f'VM requested: {vm_id} (run {stage.id[:8]})')
