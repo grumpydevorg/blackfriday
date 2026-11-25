@@ -383,10 +383,16 @@ const detailValue = value => (value !== null && typeof value === 'object' ? JSON
 let behindTimer, behindInflight = false, behindGeneration = 0, behindSignature = '';
 const behindOpen = new Set();
 let behindLines = [];
+// Client-side filter: it only hides rows. Hidden tags and the search text never reach the poll or the open-line set.
+const behindHidden = new Set();
+let behindQuery = '';
+const behindCounts = {};
+const lineTag = line => (TAGS.includes(line.tag) ? line.tag : 'EVENT');
+const lineHaystack = line => [clock.format(new Date(line.t)), lineTag(line), line.text, ...Object.values(line.detail ?? {}).map(detailValue)].join('\n').toLowerCase();
 
 function behindLine(line) {
   const open = behindOpen.has(line.id);
-  const tag = TAGS.includes(line.tag) ? line.tag : 'EVENT';
+  const tag = lineTag(line);
   const item = make('div', '', `bline${open ? ' open' : ''}`);
   item.dataset.id = line.id;
   const head = make('div', '', 'bhead');
@@ -416,15 +422,45 @@ function behindLine(line) {
 }
 function renderBehind(lines) {
   const box = $('behind-log');
-  const signature = JSON.stringify([lines, [...behindOpen]]);
+  const signature = JSON.stringify([lines, [...behindOpen], [...behindHidden], behindQuery]);
   if (signature === behindSignature) return;
   behindSignature = signature;
   behindLines = lines;
+  const needle = behindQuery.trim().toLowerCase();
+  const matching = needle ? lines.filter(line => lineHaystack(line).includes(needle)) : lines;
+  const counts = Object.fromEntries(TAGS.map(tag => [tag, 0]));
+  for (const line of matching) counts[lineTag(line)] += 1;
+  for (const tag of TAGS) if (behindCounts[tag]) behindCounts[tag].textContent = String(counts[tag]);
+  const shown = matching.filter(line => !behindHidden.has(lineTag(line)));
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
   const top = box.scrollTop;
-  box.replaceChildren(...lines.map(behindLine));
+  box.replaceChildren(...shown.map(behindLine));
   box.scrollTop = atBottom ? box.scrollHeight : top;
-  $('behind-status').textContent = lines.length ? '' : 'Nothing yet. Lines appear as the game runs.';
+  $('behind-status').textContent = !lines.length ? 'Nothing yet. Lines appear as the game runs.'
+    : !shown.length ? `No lines match the filter (${plural(lines.length, 'line')} hidden).`
+      : shown.length < lines.length ? `Showing ${shown.length} of ${lines.length} lines.` : '';
+}
+function buildBehindFilter() {
+  const group = $('behind-tags');
+  for (const tag of TAGS) {
+    const chip = make('button', '', `bchip btag-${tag.toLowerCase()}`);
+    chip.type = 'button';
+    chip.dataset.tag = tag;
+    chip.setAttribute('aria-pressed', 'true');
+    const count = make('span', '0', 'bcount');
+    behindCounts[tag] = count;
+    chip.append(make('span', tag), count);
+    group.append(chip);
+  }
+  group.addEventListener('click', event => {
+    const chip = event.target.closest('.bchip');
+    if (!chip) return;
+    const tag = chip.dataset.tag;
+    if (!behindHidden.delete(tag)) behindHidden.add(tag);
+    chip.setAttribute('aria-pressed', String(!behindHidden.has(tag)));
+    renderBehind(behindLines);
+  });
+  $('behind-search').addEventListener('input', event => { behindQuery = event.target.value; renderBehind(behindLines); });
 }
 async function behindPoll() {
   clearTimeout(behindTimer);
@@ -451,6 +487,7 @@ function toggleBehindLine(head) {
 }
 
 if (host) {
+  buildBehindFilter();
   $('login').addEventListener('submit', async event => {
     event.preventDefault();
     await act(async () => { await api('host/login', { body: { passphrase: $('passphrase').value } }); $('passphrase').value = ''; }, 'login-error');

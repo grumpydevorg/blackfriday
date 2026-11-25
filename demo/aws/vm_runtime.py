@@ -10,11 +10,12 @@ import signal
 import sqlite3
 import subprocess
 import sys
+from collections import deque
 from contextlib import closing
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from time import monotonic, sleep
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
@@ -34,15 +35,27 @@ Team = re.compile(r'[a-z0-9]{3,16}')
 # PHP's built-in server logs every request to stderr; those lines carry nothing the room needs.
 PHP_ACCESS = re.compile(r'(\d{1,3}\.){3}\d{1,3}:\d+ (Accepted|Closing|\[\d{3}\]:)|Development Server .* started')
 
-# Everything this process prints goes to the image's CloudWatch log group (when the run enables it), so it
-# prints only timed stage lines: never the payment URL, the receipt, a token, or the full run id.
+# MicroVM logging to CloudWatch is not possible, so nothing here reaches CloudWatch by itself. Every line goes to
+# stdout and to this buffer, which the evaluator reads over GET /control/log and relays before it terminates the
+# VM. So it holds only timed stage lines and access lines: never the payment URL, the receipt, a token, a request
+# body or the full run id.
 _label = 'vm'
 _run_id = ''
+_lines: deque[str] = deque(maxlen=500)
+_lines_lock = Lock()
 
 
 def say(message: str) -> None:
     text = message.replace(_run_id, _run_id[:8]) if _run_id else message
-    print(f'[{_label}] {text[:200]}', flush=True)
+    line = f'[{_label}] {text[:200]}'
+    with _lines_lock:
+        _lines.append(line)
+    print(line, flush=True)
+
+
+def buffered_lines() -> list[str]:
+    with _lines_lock:
+        return list(_lines)
 
 
 def timed(started: float) -> str:
@@ -104,6 +117,7 @@ class Payment:
     def __init__(self, scope: str, launching: bool, url: str, receipt: str) -> None:
         self.url = url
         self.receipt = receipt
+        self.last_status = ''  # 'PUT' outcome of the latest charge, for the log
         self.drop_next = launching
         self.expected = {
             'scope': scope, 'customer_id': 'maya', 'amount_cents': 2500,
@@ -121,12 +135,14 @@ class Payment:
             with S3_HTTP.open(request, timeout=2.5) as response:
                 if response.status != 200:
                     raise RuntimeError('Unexpected ledger PUT status')
+                self.last_status = '200'
         except HTTPError as error:
             # 412 means the exact key already has a receipt. Its content is verified
             # independently in S3 by the evaluator; the checksum binds this PUT.
             with error:
                 if error.code != 412:
                     raise
+                self.last_status = '412 already paid'
         drop = self.drop_next
         self.drop_next = False
         # A rebuilt Launch VM still demonstrates a real lost response. Its first
@@ -158,9 +174,10 @@ class Runtime:
             if self.shop.poll() is not None:
                 raise RuntimeError(f'PHP shop exited before readiness with code {self.shop.returncode}')
             try:
-                status, _, _ = shop_request('GET', '/health')
+                status, _, elapsed = shop_request('GET', '/health')
                 if status != 200:
                     raise RuntimeError('PHP shop could not read the database')
+                say(f'php GET /health {status} {elapsed} ms')
                 say(f'PHP shop ready in {timed(started)}')
                 return
             except ConnectionRefusedError:
@@ -324,12 +341,23 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class PaymentHandler(Handler):
+    @staticmethod
+    def charge(payment: Payment) -> bool:
+        started = monotonic()
+        try:
+            dropped = payment.charge()
+        except BaseException:
+            say(f'payment ledger PUT failed in {round((monotonic() - started) * 1000)} ms')
+            raise
+        say(f'payment ledger PUT {payment.last_status} in {round((monotonic() - started) * 1000)} ms')
+        return dropped
+
     def do_POST(self) -> None:
         try:
             payment = self.runtime.payment
             if self.path != '/payments' or payment is None or self.read_json(1024) != payment.expected:
                 raise BadRequest('Payment does not match the scenario')
-            if payment.charge():
+            if self.charge(payment):
                 # Close the response stream without writing any HTTP response at all.
                 self.close_connection = True
             else:
@@ -371,6 +399,9 @@ class Gateway(Handler):
                 runtime.setup(self.read_json(2 * MAX_ARTIFACT))
                 self.send_json(200, {'status': 'configured'})
                 return
+            case ('GET', '/control/log'):
+                self.send_json(200, {'lines': buffered_lines()})
+                return
             case ('GET', '/control/artifact'):
                 value = runtime.export()
                 if len(value) > MAX_ARTIFACT:
@@ -408,6 +439,7 @@ class Gateway(Handler):
             return
         status, payload, elapsed = shop_request(method, self.path, body, intention)
         dropped = drop_pending and payment is not None and not payment.drop_next
+        say(f'php {method} {urlsplit(self.path).path} {status} {elapsed} ms')
         if self.path == '/checkout':
             say(f'checkout {status} in {elapsed} ms'
                 + (' · reply dropped on purpose (a lost response; the retry must not charge twice)' if dropped else ''))

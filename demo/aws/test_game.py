@@ -6,6 +6,7 @@ match its values, as DynamoDB does. The Durable workflow is played by the tests,
 `open` phase, round, callback id and results items the way workflow.py does.
 """
 
+import json
 import socket
 import subprocess
 from pathlib import Path
@@ -93,12 +94,15 @@ function applyUpdate(expression, item, values) {
     }
   }
 }
+const RESERVED = new Set(['COUNT', 'DATA', 'DATE', 'DAY', 'HOUR', 'KEY', 'LEVEL', 'LINES', 'MINUTE', 'MONTH', 'NAME', 'OWNER',
+  'REGION', 'ROLE', 'SECOND', 'SIZE', 'STATE', 'STATUS', 'TIMESTAMP', 'TYPE', 'USER', 'VALUE', 'VALUES', 'YEAR', 'ZONE']);
 export const items = new Map();
 export const log = { invokes: [], callbacks: [], results_reads: 0 };
 export const aws = {
   status: 'RUNNING', callbackError: undefined,
   async send(command) {
-    const { input } = command, name = command.constructor.name;
+    let { input } = command;
+    const name = command.constructor.name;
     if (aws.failTimeline && name === 'UpdateItemCommand' && input.Key.pk.S.startsWith('timeline#')) throw Object.assign(new Error('x'), { name: 'ProvisionedThroughputExceededException' });
     if (name === 'InvokeCommand') { log.invokes.push(input); return { DurableExecutionArn: 'arn:aws:lambda:ap-southeast-2:1:function:wf:1/durable-execution/run/abc' }; }
     if (name === 'GetDurableExecutionCommand') return { Status: aws.status };
@@ -111,7 +115,17 @@ export const aws = {
     const pk = (input.Key ?? input.Item).pk.S, current = items.get(pk);
     if (name === 'GetItemCommand') { if (pk.startsWith('results#')) log.results_reads++; return { Item: current && structuredClone(current) }; }
     const values = input.ExpressionAttributeValues ?? {};
-    const text = `${input.ConditionExpression ?? ''} ${input.UpdateExpression ?? ''}`;
+    const names = input.ExpressionAttributeNames ?? {};
+    const raw = `${input.ConditionExpression ?? ''} ${input.UpdateExpression ?? ''}`;
+    // DynamoDB refuses a reserved word used as a bare attribute name (a function call such as size( is fine),
+    // an undefined #name, and a #name that is defined but never used.
+    for (const word of raw.match(/(?<![:#\w])[A-Za-z_]\w*(?!\w)(?!\s*\()/g) ?? []) {
+      if (RESERVED.has(word.toUpperCase())) throw new Error(`Invalid expression: Attribute name is a reserved keyword; reserved keyword: ${word}`);
+    }
+    assert.deepEqual([...new Set(raw.match(/#\w+/g) ?? [])].sort(), Object.keys(names).sort(), 'name placeholders must match names');
+    const text = raw.replace(/#\w+/g, placeholder => names[placeholder]);
+    const rewrite = expression => expression && expression.replace(/#\w+/g, placeholder => names[placeholder]);
+    input = { ...input, ConditionExpression: rewrite(input.ConditionExpression), UpdateExpression: rewrite(input.UpdateExpression) };
     assert.deepEqual([...new Set(text.match(/:\w+/g) ?? [])].sort(), Object.keys(values).sort(), 'placeholders must match values');
     if (input.ConditionExpression && !condition(input.ConditionExpression, current ?? {}, values)) {
       throw Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' });
@@ -179,7 +193,7 @@ await state();   // creates the arena item
 """
 
 
-def scenario(source):
+def run_scenario(source):
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
@@ -189,6 +203,14 @@ def scenario(source):
     )
     assert done.returncode == 0, done.stdout + done.stderr
     return done.stdout
+
+
+ACCESS = '{"bf":"access"'
+
+
+def scenario(source):
+    """The scenario's own output: the Web Function's access lines are asserted separately."""
+    return ''.join(line + '\n' for line in run_scenario(source).splitlines() if not line.startswith(ACCESS))
 
 
 def test_generated_names_are_unique_and_never_a_bot_and_the_101st_join_is_refused():
@@ -658,3 +680,72 @@ def test_pages_ask_for_assets_by_content_hash_and_the_url_serves_them():
       assert.equal((await fetched('/round.js?v=anything')).response.status, 200);
       assert.equal((await fetched('/nope.js?v=1')).response.status, 404);
     """)
+
+
+def test_the_fake_table_refuses_a_reserved_word_used_as_a_bare_attribute_name():
+    scenario(r"""
+      const { UpdateItemCommand } = await import('@aws-sdk/client-dynamodb');
+      const update = input => aws.send(new UpdateItemCommand({ TableName: 'runs', Key: { pk: s('probe') }, ...input }));
+      for (const word of ['lines', 'data', 'name', 'status', 'count', 'size']) {
+        await assert.rejects(update({ UpdateExpression: `SET ${word} = :v`, ExpressionAttributeValues: { ':v': s('x') } }), /reserved keyword/, word);
+        await update({ UpdateExpression: 'SET #w = :v', ExpressionAttributeNames: { '#w': word }, ExpressionAttributeValues: { ':v': s('x') } });
+      }
+      await update({ UpdateExpression: 'SET round = :v, phase = :v', ConditionExpression: 'attribute_not_exists(round) OR size(#l) < :v', ExpressionAttributeNames: { '#l': 'lines' }, ExpressionAttributeValues: { ':v': { N: '5' } } }).catch(error => assert.notEqual(error.name, 'Error'));
+      await assert.rejects(update({ UpdateExpression: 'SET #unused = :v', ExpressionAttributeValues: { ':v': s('x') } }), /name placeholders/);
+    """)
+
+
+def test_the_timeline_write_uses_a_name_placeholder_for_lines_and_lands():
+    scenario(r"""
+      const seen = [];
+      const send = aws.send;
+      aws.send = async function (command) {
+        if (command.constructor.name === 'UpdateItemCommand' && command.input.Key.pk.S.startsWith('timeline#')) seen.push(command.input);
+        return send.call(this, command);
+      };
+      assert.equal((await hostPost('start')).status, 200);
+      assert.equal(seen.length, 1);
+      assert.deepEqual(seen[0].ExpressionAttributeNames, { '#lines': 'lines' });
+      assert.ok(!/(^|[^#\w])lines\b/.test(`${seen[0].UpdateExpression} ${seen[0].ConditionExpression}`));
+      assert.equal(items.get(`timeline#${arena().run_id.S}`).lines.L.length, 1);
+    """)
+
+
+def test_every_request_prints_exactly_one_access_line_and_nothing_secret():
+    out = run_scenario(r"""
+      const ana = await join('Zelda Quokka');
+      await hostPost('start');
+      openRound('launch');
+      assert.equal((await pick(ana, 'launch', 'large')).status, 200);
+      assert.equal((await state(ana)).status, 200);
+      assert.equal((await call('GET', '/api/state?player=Zelda%20Quokka&token=' + ana.token)).status, 404);
+      assert.equal((await call('GET', '/api/host/state', { headers: PRESENTER })).status, 200);
+      assert.equal((await call('GET', '/api/host/timeline', { headers: PRESENTER })).status, 200);
+      assert.equal((await call('GET', '/api/host/timeline')).status, 403);
+      assert.equal((await call('GET', '/')).status, 200);
+      assert.equal((await call('GET', '/round.js?v=abc')).status, 200);
+      assert.equal((await call('GET', `/nope/${ana.id}?token=${ana.token}`)).status, 404);
+      assert.equal((await pick(ana, 'growth', 'large')).status, 409);
+      console.log('SECRETS ' + [ana.id, ana.token, ana.run_id, 'Zelda', 'Quokka', 'k'.repeat(64)].join(' '));
+    """)
+    secrets = next(line for line in out.splitlines() if line.startswith('SECRETS ')).split()[1:]
+    lines = [line for line in out.splitlines() if not line.startswith('SECRETS ')]
+    assert all(line.startswith('{"bf":"access"') for line in lines), out
+    assert not any(secret in out.replace(next(l for l in out.splitlines() if l.startswith('SECRETS ')), '') for secret in secrets)
+    entries = [json.loads(line) for line in lines]
+    assert all(set(entry) <= {'bf', 'level', 'method', 'route', 'status', 'ms', 'phase', 'round'} for entry in entries)
+    assert all({'bf', 'level', 'method', 'route', 'status', 'ms'} <= set(entry) for entry in entries)
+    assert all(isinstance(entry['ms'], int) and entry['ms'] >= 0 for entry in entries)
+    summary = [(e['method'], e['route'], e['status'], e['level']) for e in entries]
+    assert summary.count(('POST', '/api/join', 200, 'info')) == 1
+    assert summary.count(('POST', '/api/pick', 200, 'info')) == 1
+    assert summary.count(('POST', '/api/pick', 409, 'warn')) == 1
+    assert summary.count(('POST', '/api/host/start', 200, 'info')) == 1
+    assert summary.count(('GET', '/api/state', 200, 'debug')) == 2
+    assert summary.count(('GET', '/api/host/timeline', 200, 'debug')) == 1
+    assert summary.count(('GET', '/api/host/timeline', 403, 'warn')) == 1
+    assert summary.count(('GET', '/', 200, 'info')) == 1
+    assert summary.count(('GET', '/round.js', 200, 'info')) == 1
+    assert summary.count(('GET', 'other', 404, 'warn')) == 2, 'unknown paths and API paths with a query are "other"'
+    open_state = [e for e in entries if e['route'] == '/api/state' and e.get('phase') == 'open']
+    assert open_state and all(e['round'] == 'launch' for e in open_state)

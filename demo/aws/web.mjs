@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -58,8 +59,10 @@ async function timeline(runId, line) {
   try {
     await db.send(new UpdateItemCommand({
       TableName: table, Key: { pk: s(`timeline#${runId}`) },
-      UpdateExpression: 'SET run_id = :run, lines = list_append(if_not_exists(lines, :empty), :new)',
-      ConditionExpression: 'attribute_not_exists(lines) OR size(lines) < :cap',
+      // `lines` is a DynamoDB reserved word: it must go through a name placeholder.
+      UpdateExpression: 'SET run_id = :run, #lines = list_append(if_not_exists(#lines, :empty), :new)',
+      ConditionExpression: 'attribute_not_exists(#lines) OR size(#lines) < :cap',
+      ExpressionAttributeNames: { '#lines': 'lines' },
       ExpressionAttributeValues: {
         ':run': s(runId), ':cap': n(TIMELINE_CAP), ':empty': { L: [] },
         ':new': { L: [s(JSON.stringify({
@@ -141,6 +144,7 @@ class ActionConflict extends Error {
 
 async function stored() {
   const { Item } = await db.send(new GetItemCommand({ TableName: table, Key: key, ConsistentRead: true }));
+  note(Item?.phase?.S, Item?.round?.S);
   return Item;
 }
 
@@ -335,6 +339,32 @@ async function close(token, round, row, state) {
   await releaseClose(rosterStore, row, lease);
 }
 
+// One structured access line per request: a fixed route template, status, duration and the phase and round of the
+// state this request already loaded. Never ids, names, tokens, bodies, query strings or headers.
+const requestLog = new AsyncLocalStorage();
+function note(phase, round) {
+  const entry = requestLog.getStore();
+  if (entry && phase) { entry.phase = phase; entry.round = round ?? undefined; }
+}
+const POLLS = new Set(['/api/state', '/api/host/state', '/api/host/timeline']);
+const API_ROUTES = new Set([
+  'GET /api/state', 'GET /api/host/state', 'GET /api/host/timeline', 'GET /api/host/qr.svg',
+  'POST /api/join', 'POST /api/rename', 'POST /api/pick', 'POST /api/host/remove',
+  'POST /api/host/login', 'POST /api/host/logout', 'POST /api/host/start', 'POST /api/host/close', 'POST /api/host/reset',
+]);
+function routeTemplate(method, url) {
+  if (API_ROUTES.has(`${method} ${url}`)) return url;
+  const path = url.split('?', 1)[0];
+  return method === 'GET' && staticFiles.has(path) ? path : 'other';
+}
+function accessLine(entry, status) {
+  const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : POLLS.has(entry.route) ? 'debug' : 'info';
+  return JSON.stringify({
+    bf: 'access', level, method: entry.method, route: entry.route, status, ms: Date.now() - entry.start,
+    ...(entry.phase && { phase: entry.phase }), ...(entry.round && { round: entry.round }),
+  });
+}
+
 function send(response, code, type, body, extra = {}) {
   const headers = { 'Content-Type': type, 'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
@@ -414,6 +444,7 @@ async function view(row, headers, hostView = false, mode) {
   const players = playersOf(row);
   const { phase } = state;
   const round = ['open', 'closing'].includes(phase) ? row.round?.S ?? null : phase === 'final' ? ROUND_IDS.at(-1) : null;
+  note(phase, round);
   const own = hostView ? null : me(players, headers['x-team-id'], headers['x-team-token']);
   const result = {
     mode: 'aws', id: state.id, phase, round, round_number: round ? ROUND_IDS.indexOf(round) + 1 : 0, rounds,
@@ -525,7 +556,10 @@ if (!host || separator < 1 || !Number.isInteger(port) || port < 1 || port > 6553
   throw new Error('AWS_LAMBDA_HTTP_ENDPOINT must be host:port');
 }
 createServer((request, response) => {
-  route(request, response).catch(error => {
+  const entry = { method: request.method, route: routeTemplate(request.method, request.url), start: Date.now() };
+  // 'close' fires once per response, finished or cut off by the client (499).
+  response.on('close', () => console.log(accessLine(entry, response.writableFinished ? response.statusCode : 499)));
+  requestLog.run(entry, () => route(request, response)).catch(error => {
     if (error instanceof ActionConflict) return json(response, 409, { error: error.message });
     if (error instanceof RequestError) return json(response, error.status, { error: error.message });
     console.error('Arena request failed', request.headers['lambda-web-request-id'], error.name);

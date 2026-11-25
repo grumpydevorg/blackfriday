@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -96,6 +97,28 @@ def compare_result(option, cart_kept):
             'health_status': 200, 'history_status': 200, 'vm_id': f'vm-{option}', 'vm_state': 'terminated'}
 
 
+# DynamoDB reserved words that name attributes in this table's items; a bare use in an expression is a ValidationException.
+RESERVED = frozenset(('lines', 'data', 'size', 'name', 'status', 'count'))
+
+
+def reject_reserved_words(kwargs):
+    """What DynamoDB does: a reserved word used as an attribute path (not as a function name) must go through
+    ExpressionAttributeNames, and every `#name` used must be defined (and every defined name used)."""
+    names = kwargs.get('ExpressionAttributeNames', {})
+    used = set()
+    for key in ('UpdateExpression', 'ConditionExpression'):
+        expression = kwargs.get(key, '')
+        used |= set(re.findall(r'#\w+', expression))
+        for word in re.findall(r'(?<![:#\w])([A-Za-z_]\w*)(?!\w|\s*\()', expression):
+            if word.lower() in RESERVED:
+                raise ClientError({'Error': {'Code': 'ValidationException', 'Message':
+                                  f'Invalid {key}: Attribute name is a reserved keyword; reserved keyword: {word}'}},
+                                  'UpdateItem')
+    if used != set(names):
+        raise ClientError({'Error': {'Code': 'ValidationException', 'Message':
+                          f'Invalid expression: names used {sorted(used)} but defined {sorted(names)}'}}, 'UpdateItem')
+
+
 class FakeDB:
     """Records every UpdateItem; `fail` conditional-fails the arena writes whose phase matches.
     Timeline writes are kept apart in `timeline_calls`, with whether a step was running when each arrived."""
@@ -105,6 +128,7 @@ class FakeDB:
         self.timeline_calls, self.timeline_error, self.context = [], None, None
 
     def update_item(self, **kwargs):
+        reject_reserved_words(kwargs)
         if kwargs['Key']['pk']['S'].startswith('timeline#'):
             self.timeline_calls.append({**kwargs, 'in_step': self.context.in_step if self.context else None})
             if self.timeline_error:
@@ -443,8 +467,10 @@ def test_timeline_lines_are_appended_only_inside_steps_with_the_contract_express
     assert db.timeline_calls and all(call['in_step'] is True for call in db.timeline_calls)
     for call in db.timeline_calls:
         assert call['Key'] == {'pk': {'S': f'timeline#{RUN}'}}
-        assert call['UpdateExpression'] == 'SET run_id = :run, lines = list_append(if_not_exists(lines, :empty), :new)'
-        assert call['ConditionExpression'] == 'attribute_not_exists(lines) OR size(lines) < :cap'
+        assert call['UpdateExpression'] == (
+            'SET run_id = :run, #lines = list_append(if_not_exists(#lines, :empty), :new)')
+        assert call['ConditionExpression'] == 'attribute_not_exists(#lines) OR size(#lines) < :cap'
+        assert call['ExpressionAttributeNames'] == {'#lines': 'lines'}
         assert call['ExpressionAttributeValues'][':cap'] == {'N': '300'}
         assert call['ExpressionAttributeValues'][':empty'] == {'L': []}
         assert call['ExpressionAttributeValues'][':run'] == {'S': RUN}
@@ -569,3 +595,96 @@ def test_a_line_that_cannot_be_built_is_swallowed_too(workflow, monkeypatch):
     assert len(db.results()) == 4
     assert sorted(item['id'] for item in db.timeline_lines()) == sorted(
         ['registered', *[f'open-{r}' for r in ROUND_IDS], 'final'])
+
+
+# ---- The `[WORKFLOW] <step>: <text>` log lines -----------------------------------------------------------------
+
+STEP_LINE = re.compile(r'\[WORKFLOW\] ([a-z0-9-]+): (.+)')
+STEP_NAMES = {'register-execution', 'timeline-evidence', 'publish-final',
+              *[f'{kind}-{round_id}' for round_id in ROUND_IDS for kind in ('publish-open', 'plan', 'score', 'publish-results')]}
+
+
+def capture_prints(workflow, monkeypatch, db):
+    """Every print the workflow makes, with whether a durable step was running when it was made."""
+    printed = []
+    monkeypatch.setattr(workflow, 'print', lambda *args: printed.append((' '.join(map(str, args)), db.context.in_step)),
+                        raising=False)
+    return printed
+
+
+def workflow_lines(printed):
+    return [(text, in_step) for text, in_step in printed if text.startswith('[WORKFLOW]')]
+
+
+def test_the_fake_rejects_bare_reserved_words_and_unused_or_missing_names():
+    for word in ('lines', 'data', 'size', 'name', 'status', 'count'):
+        with pytest.raises(ClientError, match=f'reserved keyword: {word}'):
+            reject_reserved_words({'UpdateExpression': f'SET {word} = :x'})
+        with pytest.raises(ClientError, match=f'reserved keyword: {word}'):
+            reject_reserved_words({'ConditionExpression': f'attribute_not_exists({word}) OR size({word}) < :c'})
+    reject_reserved_words({'UpdateExpression': 'SET #lines = :x', 'ConditionExpression': 'size(#lines) < :c',
+                           'ExpressionAttributeNames': {'#lines': 'lines'}})
+    with pytest.raises(ClientError, match='names used'):
+        reject_reserved_words({'UpdateExpression': 'SET #lines = :x'})
+    with pytest.raises(ClientError, match='names used'):
+        reject_reserved_words({'UpdateExpression': 'SET x = :x', 'ExpressionAttributeNames': {'#lines': 'lines'}})
+
+
+def test_every_dynamodb_write_in_a_run_avoids_bare_reserved_words(workflow, monkeypatch):
+    _, db, _ = run(workflow, monkeypatch)
+    assert db.timeline_calls and db.calls and all(call['in_step'] is True for call in db.timeline_calls)
+
+
+def test_each_step_prints_exactly_one_workflow_line_and_only_inside_the_step(workflow, monkeypatch):
+    db = FakeDB()
+    printed = capture_prints(workflow, monkeypatch, db)
+    run(workflow, monkeypatch, db=db)
+    lines = workflow_lines(printed)
+    assert all(in_step is True for _, in_step in lines)
+    steps = [STEP_LINE.fullmatch(text).group(1) for text, _ in lines]
+    assert sorted(steps) == sorted(STEP_NAMES)
+    texts = dict((STEP_LINE.fullmatch(text).groups()) for text, _ in lines)
+    assert texts['timeline-evidence'] == 'launch real, careful real (cart kept), fast real (cart lost)'
+    assert texts['publish-open-growth'] == 'round open'
+    assert re.fullmatch(r'market \d+, 0 bots, 2 players', texts['plan-launch'])
+
+
+def test_a_recorded_fallback_is_named_in_the_evidence_line(workflow, monkeypatch):
+    db = FakeDB()
+    printed = capture_prints(workflow, monkeypatch, db)
+    run(workflow, monkeypatch, db=db, launch_fails=True, fail={('migrate', 'fast')})
+    texts = dict(STEP_LINE.fullmatch(text).groups() for text, _ in workflow_lines(printed))
+    assert texts['timeline-evidence'] == 'launch recorded, careful real (cart kept), fast recorded (cart lost)'
+
+
+def test_an_expired_close_prints_its_step_line(workflow, monkeypatch):
+    db = FakeDB()
+    printed = capture_prints(workflow, monkeypatch, db)
+    expired = workflow.CallbackTimeoutError('timed out')
+    with pytest.raises(workflow.CallbackTimeoutError):
+        run(workflow, monkeypatch, db=db, rooms={**rooms_for(), 'launch': expired})
+    assert [text for text, in_step in workflow_lines(printed) if in_step and 'expire-close-launch' in text] == [
+        '[WORKFLOW] expire-close-launch: close callback timed out, run expired']
+
+
+def test_a_full_replay_prints_no_workflow_lines(workflow, monkeypatch):
+    checkpoints = {}
+    db = FakeDB()
+    printed = capture_prints(workflow, monkeypatch, db)
+    run(workflow, monkeypatch, checkpoints=checkpoints, db=db)
+    assert workflow_lines(printed)
+    printed.clear()
+    run(workflow, monkeypatch, checkpoints=checkpoints, db=FakeDB())
+    assert printed == []
+
+
+def test_workflow_lines_never_carry_secrets_ids_or_names(workflow, monkeypatch):
+    db = FakeDB()
+    printed = capture_prints(workflow, monkeypatch, db)
+    rooms = rooms_for([{**ROOM[0], 'token': 'secret-token', 'action_token': 'act', 'passphrase': 'pp'}, *ROOM[1:]])
+    run(workflow, monkeypatch, db=db, rooms=rooms)
+    blob = '\n'.join(text for text, _ in workflow_lines(printed))
+    assert blob
+    for word in ('token', 'secret', 'cb-await', 'callback', RUN, RUN[:8], 'arn:', 'Ada', 'Grace', 'adabyron', 'House'):
+        assert word not in blob
+    assert re.search(r'[0-9a-f]{32}', blob) is None

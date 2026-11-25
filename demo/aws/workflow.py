@@ -77,8 +77,9 @@ def timeline(run_id: str, make) -> None:
         DB.update_item(
             TableName=TABLE,
             Key={'pk': {'S': f'timeline#{run_id}'}},
-            UpdateExpression='SET run_id = :run, lines = list_append(if_not_exists(lines, :empty), :new)',
-            ConditionExpression='attribute_not_exists(lines) OR size(lines) < :cap',
+            UpdateExpression='SET run_id = :run, #lines = list_append(if_not_exists(#lines, :empty), :new)',
+            ConditionExpression='attribute_not_exists(#lines) OR size(#lines) < :cap',
+            ExpressionAttributeNames={'#lines': 'lines'},
             ExpressionAttributeValues={
                 ':run': {'S': run_id}, ':cap': {'N': str(TIMELINE_CAP)}, ':empty': {'L': []},
                 ':new': {'L': [{'S': json.dumps(item, separators=(',', ':'))} for item in lines]},
@@ -89,6 +90,43 @@ def timeline(run_id: str, make) -> None:
             print(json.dumps({'timeline_error': repr(error)}))
     except Exception as error:  # noqa: BLE001 - the timeline never fails the game
         print(json.dumps({'timeline_error': repr(error)}))
+
+
+def say(step: str, make) -> None:
+    """One `[WORKFLOW] <step>: <text>` log line. Called only inside a checkpointed step, so a replay never
+    repeats it. Text is counts, labels and statuses only; it never carries ids, names, tokens or links.
+    Nothing here may change the game: a failure to build the text is swallowed."""
+    try:
+        print(f'[WORKFLOW] {step}: {make()}')
+    except Exception:  # noqa: BLE001 - logging never fails the game
+        pass
+
+
+def market_text(round_id: str, market: Any) -> str:
+    unit = next((rnd['market'].get('unit', '') for rnd in getattr(model, 'ROUNDS', ()) if rnd.get('id') == round_id), '')
+    return f'{market}{unit}'
+
+
+def evidence_text(launch_data: dict[str, Any], evidence: dict[str, Any]) -> str:
+    parts = [f'launch {launch_data.get("source", "recorded")}']
+    for option in MIGRATIONS:
+        result = evidence[option]
+        kept = result.get('cart_kept')
+        parts.append(f'{option} {result.get("source", "recorded")} (cart {"kept" if kept else "lost"})')
+    return ', '.join(parts)
+
+
+def plan_text(round_id: str, plan: dict[str, Any]) -> str:
+    rows = [row for row in plan.get('players') or [] if isinstance(row, dict)]
+    bots = sum(1 for row in rows if row.get('bot') is True)
+    humans = sum(1 for row in rows if not row.get('house') and row.get('bot') is not True)
+    return f'market {market_text(round_id, plan["market"])}, {bots} bots, {humans} players'
+
+
+def score_text(round_id: str, scored: dict[str, Any]) -> str:
+    best, _, total = score_parts(round_id, scored)
+    return ', '.join(([f'best option {option_label(round_id, best)}'] if best else []) + (
+        [f'leader {total}'] if total else [])) or 'round scored'
 
 
 def round_title(round_id: str) -> str:
@@ -156,6 +194,16 @@ def evidence_lines(launch_data: dict[str, Any], evidence: dict[str, Any], notes:
     return out
 
 
+def score_parts(round_id: str, scored: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    """(best option id, leader name, leader's total) of a scored round."""
+    options = (scored.get('summary') or {}).get('options') or {}
+    played = {key: value for key, value in options.items()
+              if isinstance(value, dict) and value.get('players') and isinstance(value.get('mean_profit_cents'), int)}
+    best = max(played, key=lambda key: played[key]['mean_profit_cents']) if played else None
+    leader, total = leader_of(scored)
+    return best, leader, total
+
+
 def results_lines(round_id: str, closed: dict[str, Any], scored: dict[str, Any]) -> list[dict[str, Any]]:
     humans = [row for row in closed.get('players') or [] if isinstance(row, dict) and not row.get('house')]
     picked = sum(1 for row in humans if row.get('option'))
@@ -166,11 +214,7 @@ def results_lines(round_id: str, closed: dict[str, Any], scored: dict[str, Any])
     out.append(line(f'plan-{round_id}', 'GAME',
                     f'Market draw {scored["market"]}{unit}' + (f'; bots: {", ".join(bots)}' if bots else ''),
                     {'round': round_id, 'market': scored['market'], 'bots': bots}))
-    options = (scored.get('summary') or {}).get('options') or {}
-    played = {key: value for key, value in options.items()
-              if isinstance(value, dict) and value.get('players') and isinstance(value.get('mean_profit_cents'), int)}
-    best = max(played, key=lambda key: played[key]['mean_profit_cents']) if played else None
-    leader, total = leader_of(scored)
+    best, leader, total = score_parts(round_id, scored)
     parts = ([f'Best option {option_label(round_id, best)}'] if best else []) + (
         [f'leader {leader}' + (f' {total}' if total else '')] if leader else [])
     out.append(line(f'score-{round_id}', 'GAME', '; '.join(parts) or 'Round scored',
@@ -200,6 +244,7 @@ def register_step(run_id: str, arn: str) -> None:
     register(run_id, arn)
     timeline(run_id, lambda: [line('registered', 'DURABLE', 'Execution registered',
                                    {'execution_arn': arn, 'run_id': run_id})])
+    say('register-execution', lambda: 'execution registered')
 
 
 def publish(
@@ -248,11 +293,13 @@ def publish(
 def publish_results_step(run_id: str, round_id: str, closed: dict[str, Any], scored: dict[str, Any]) -> None:
     publish_results(run_id, round_id, scored)
     timeline(run_id, lambda: results_lines(round_id, closed, scored))
+    say(f'publish-results-{round_id}', lambda: 'results saved')
 
 
 def publish_final_step(run_id: str, arn: str, last_round: str, scored: dict[str, Any]) -> None:
     publish(run_id, arn, ('closing',), 'final', {'results_round': last_round}, expect_round=last_round)
     timeline(run_id, lambda: [line('final', 'GAME', 'Final results published', {'leader': leader_of(scored)[0]})])
+    say('publish-final', lambda: 'final results published')
 
 
 def publish_open_step(run_id: str, arn: str, round_id: str, previous: dict[str, Any] | None,
@@ -263,6 +310,30 @@ def publish_open_step(run_id: str, arn: str, round_id: str, previous: dict[str, 
         expect_round=None if previous is None else previous['round'],
     )
     timeline(run_id, lambda: [line(f'open-{round_id}', 'GAME', f'{round_title(round_id)} open', {'round': round_id})])
+    say(f'publish-open-{round_id}', lambda: 'round open')
+
+
+def expire_step(run_id: str, arn: str, round_id: str) -> None:
+    publish(run_id, arn, ('open', 'closing'), 'expired', {'expired_action': 'close'}, expect_round=round_id)
+    say(f'expire-close-{round_id}', lambda: 'close callback timed out, run expired')
+
+
+def evidence_step(run_id: str, launch_data: dict[str, Any], evidence: dict[str, Any], notes: dict[str, Any]) -> None:
+    timeline(run_id, lambda: evidence_lines(launch_data, evidence, notes))
+    say('timeline-evidence', lambda: evidence_text(launch_data, evidence))
+
+
+def plan_step(round_id: str, players: Any, previous: dict[str, Any] | None) -> dict[str, Any]:
+    plan = model.plan(round_id, model.validate_players(players), previous, secrets.randbelow)
+    say(f'plan-{round_id}', lambda: plan_text(round_id, plan))
+    return plan
+
+
+def score_step(round_id: str, plan: dict[str, Any], previous: dict[str, Any] | None,
+               evidence: dict[str, Any]) -> dict[str, Any]:
+    scored = model.score(round_id, plan, previous, evidence)
+    say(f'score-{round_id}', lambda: score_text(round_id, scored))
+    return scored
 
 
 def publish_results(run_id: str, round_id: str, scored: dict[str, Any]) -> None:
@@ -355,11 +426,7 @@ def wait_for_close(context: DurableContext, run_id: str, arn: str, round_id: str
     try:
         value = callback.result()
     except CallbackTimeoutError:
-        context.step(
-            lambda _: publish(run_id, arn, ('open', 'closing'), 'expired', {'expired_action': 'close'},
-                              expect_round=round_id),
-            name=f'expire-close-{round_id}',
-        )
+        context.step(lambda _: expire_step(run_id, arn, round_id), name=f'expire-close-{round_id}')
         raise
     if isinstance(value, (str, bytes, bytearray)):
         value = json.loads(value)
@@ -377,8 +444,7 @@ def handler(event: dict[str, Any], context: DurableContext) -> dict[str, str]:
     context.step(lambda _: register_step(run_id, arn), name='register-execution')
     # Every MicroVM runs here, once, before Round 1 opens. Nothing after this line creates one.
     launch_data, evidence, notes = real_evidence(run_id, context)
-    context.step(lambda _: timeline(run_id, lambda: evidence_lines(launch_data, evidence, notes)),
-                 name='timeline-evidence')
+    context.step(lambda _: evidence_step(run_id, launch_data, evidence, notes), name='timeline-evidence')
     scored = None
     previous_round = None
     for round_id in model.ROUND_IDS:
@@ -390,11 +456,8 @@ def handler(event: dict[str, Any], context: DurableContext) -> dict[str, str]:
         players = closed.get('players')
         # The one place randomness enters a round. A durable step is checkpointed, so a replay
         # gets the recorded draws back and never draws again.
-        plan = context.step(
-            lambda _: model.plan(round_id, model.validate_players(players), scored, secrets.randbelow),
-            name=f'plan-{round_id}',
-        )
-        scored = context.step(lambda _: model.score(round_id, plan, scored, evidence), name=f'score-{round_id}')
+        plan = context.step(lambda _: plan_step(round_id, players, scored), name=f'plan-{round_id}')
+        scored = context.step(lambda _: score_step(round_id, plan, scored, evidence), name=f'score-{round_id}')
         context.step(lambda _: publish_results_step(run_id, round_id, closed, scored),
                      name=f'publish-results-{round_id}')
         previous_round = round_id

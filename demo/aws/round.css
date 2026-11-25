@@ -156,6 +156,12 @@ body[data-host] .evidence-card .option-label{font-size:.95rem}
 .behind summary{cursor:pointer;font-weight:750;color:#ffd3ab}
 .behind[open] summary{margin-bottom:.4rem}
 .behind-note{font-size:.85rem;margin:.2em 0 .5rem}
+.behind-filter{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:0 0 .5rem}
+.behind-tags{display:flex;flex-wrap:wrap;gap:.35rem}
+.bchip{width:auto;margin:0;display:inline-flex;gap:.45em;align-items:baseline;background:#0a111d;border:1px solid;border-radius:.25rem;padding:.15em .55em;font:800 .72rem/1.4 ui-monospace,monospace;letter-spacing:.04em;cursor:pointer}
+.bchip[aria-pressed=false]{opacity:.4;text-decoration:line-through}
+.bchip .bcount{font-weight:600;color:#b9c7dc}
+.behind-search{flex:1 1 12rem;width:auto;min-width:0;margin:0;font:.82rem/1.4 ui-monospace,monospace}
 .behind-log{max-height:24rem;overflow-y:auto;background:#0a111d;border:1px solid #263449;border-radius:.4rem;padding:.2rem 0;font:.82rem/1.4 ui-monospace,monospace}
 .behind-log:empty{display:none}
 .bline{margin:0;padding:0;border-bottom:1px solid #1a2638}

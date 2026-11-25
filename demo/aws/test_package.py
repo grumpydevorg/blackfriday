@@ -411,6 +411,15 @@ def test_a_charge_the_omit_shop_should_not_have_made_is_an_error(evaluator):
         stage.growth(store, shop)
 
 
+VM_LINES = [
+    '[aaaaaaaa compare careful] setup received: compare (preserve), 0 KB input',
+    '[aaaaaaaa compare careful] php GET /health 200 4 ms',
+    '[aaaaaaaa compare careful] php GET /cart/cart-saved 200 12 ms',
+    '[aaaaaaaa compare careful] php: PHP Warning:  fopen(https://bucket.s3.amazonaws.com/x?X-Amz-Signature=s) failed',
+    '[aaaaaaaa compare careful] schema bf_' + 'b' * 32 + '_careful',
+]
+
+
 def run_handler(evaluator, monkeypatch, option, *, cart):
     """The whole handler for one compare event, against fakes for S3 and the MicroVM fleet."""
     stage, store, shop = growth_world(evaluator, option, cart=cart)
@@ -434,6 +443,8 @@ def run_handler(evaluator, monkeypatch, option, *, cart):
                 if path == '/control/setup':
                     setups.append(body)
                     return reply(evaluator, 200)
+                if path == '/control/log':
+                    return reply(evaluator, 200, {'lines': VM_LINES})
                 return real(path, body, intention, timeout)
 
             shop.request = request
@@ -519,29 +530,171 @@ def test_omit_compare_takes_no_payment_capability_and_preserve_compare_requires_
 # --- MicroVM logs ---------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('group, expected', [
-    ('/aws/lambda-microvms/black-friday-four-shop', {'cloudWatch': {'logGroup': '/aws/lambda-microvms/black-friday-four-shop'}}),
-    (None, {'disabled': {}}),
-])
-def test_vm_logs_go_to_the_image_log_group_only_when_the_template_names_it(evaluator, monkeypatch, group, expected):
+def test_vm_logging_is_disabled_and_the_vm_has_no_execution_role(evaluator, monkeypatch):
+    # RunMicrovm: "Logging cannot be enabled without providing executionRoleArn", and the VM must keep no AWS role.
     monkeypatch.setenv('IMAGE_ARN', 'arn:aws:lambda:ap-southeast-2:123456789012:microvm-image:shop')
     monkeypatch.setenv('IMAGE_VERSION', '1.0')
-    if group:
-        monkeypatch.setenv('VM_LOG_GROUP', group)
-    else:
-        monkeypatch.delenv('VM_LOG_GROUP', raising=False)
     calls = []
     monkeypatch.setattr(evaluator.boto3, 'client', lambda *a, **k: type('C', (), {
         'run_microvm': lambda self, **kw: calls.append(kw) or {'microvmId': 'vm-1'}})())
     evaluator.Fleet('ap-southeast-2').run('run-step')
-    assert calls[0]['logging'] == expected
-    assert 'executionRoleArn' not in calls[0], 'the VM keeps no AWS role'
+    assert calls[0]['logging'] == {'disabled': {}}
+    assert 'executionRoleArn' not in calls[0]
 
 
-def test_the_template_names_the_vm_log_group_and_lets_the_worker_write_it():
+def test_the_template_has_no_vm_log_group_variable_or_worker_grant_for_it():
     template = (Path(__file__).with_name('rehearsal.yaml')).read_text()
-    assert 'VM_LOG_GROUP: !Ref ImageLogs' in template
-    assert 'Resource: !GetAtt ImageLogs.Arn' in template
+    assert 'VM_LOG_GROUP' not in template
+    assert template.count('!GetAtt ImageLogs.Arn') == 1, 'only the image build role writes the image log group'
+
+
+@pytest.fixture
+def gateway(runtime, monkeypatch):
+    from http.server import HTTPServer
+    vm_runtime, instance = runtime
+    monkeypatch.setattr(vm_runtime, 'APP', Path(__file__).resolve().parent.parent)   # demo/schema.sql
+    vm_runtime.Gateway.runtime = vm_runtime.PaymentHandler.runtime = instance
+    server = HTTPServer(('127.0.0.1', 0), vm_runtime.Gateway)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def get(path):
+        connection = HTTPConnection('127.0.0.1', server.server_port, timeout=5)
+        connection.request('GET', path)
+        response = connection.getresponse()
+        return response.status, response.read()
+
+    yield vm_runtime, instance, get
+    server.shutdown()
+    server.server_close()
+
+
+def test_control_log_returns_the_buffered_lines_without_secrets(gateway, monkeypatch):
+    vm_runtime, instance, get = gateway
+    pay_url = 'https://bucket.s3.amazonaws.com/x?X-Amz-Signature=secret'
+    monkeypatch.setattr(vm_runtime, 'ledger_url', lambda value: value)
+    instance.setup({'id': RUN, 'action': 'launch', 'pay_url': pay_url, 'receipt': 'c' * 32})
+    vm_runtime.say(f'schema bf_{RUN}_careful')
+    status, body = get('/control/log')
+    lines = json.loads(body)['lines']
+    assert status == 200 and lines == vm_runtime.buffered_lines()
+    assert all(line.startswith(f'[{RUN[:8]} launch] ') for line in lines)
+    assert any('setup received: launch' in line for line in lines)
+    text = body.decode()
+    assert pay_url not in text and 'X-Amz' not in text and 'c' * 32 not in text and RUN not in text
+
+
+def test_the_log_buffer_keeps_the_newest_500_lines(runtime):
+    vm_runtime, _ = runtime
+    for number in range(600):
+        vm_runtime.say(f'line {number}')
+    lines = vm_runtime.buffered_lines()
+    assert len(lines) == 500 and lines[0].endswith('line 100') and lines[-1].endswith('line 599')
+
+
+def test_every_proxied_shop_request_logs_a_php_access_line(gateway, monkeypatch):
+    vm_runtime, instance, get = gateway
+    monkeypatch.setattr(vm_runtime, 'ledger_url', lambda value: value)
+    instance.setup({'id': RUN, 'action': 'launch', 'pay_url': 'https://x/y', 'receipt': 'c' * 32})
+    instance.shop = object()
+    answers = {'/product': (200, b'{}', 5), '/cart/cart-saved': (404, b'{}', 12)}
+    monkeypatch.setattr(vm_runtime, 'shop_request', lambda method, path, body=None, intention='': answers[path])
+    assert get('/cart/cart-saved')[0] == 404 and get('/product')[0] == 200
+    lines = json.loads(get('/control/log')[1])['lines']
+    assert f'[{RUN[:8]} launch] php GET /cart/cart-saved 404 12 ms' in lines
+    assert f'[{RUN[:8]} launch] php GET /product 200 5 ms' in lines
+    assert any("Maya's saved cart: 404" in line for line in lines)
+
+
+def test_the_payment_line_names_the_ledger_outcome_and_no_url(runtime):
+    from urllib.error import HTTPError
+    vm_runtime, _ = runtime
+    url = 'https://bucket.s3.amazonaws.com/x?X-Amz-Signature=secret'
+    payment = vm_runtime.Payment(f'{RUN}:careful', False, url, 'c' * 32)
+
+    class Ledger:
+        def __init__(self, outcome):
+            self.outcome = outcome
+
+        def open(self, request, timeout):
+            raise self.outcome
+
+    vm_runtime.S3_HTTP = Ledger(HTTPError(url, 412, 'Precondition Failed', {}, io.BytesIO()))
+    assert vm_runtime.PaymentHandler.charge(payment) is False
+    vm_runtime.S3_HTTP = Ledger(HTTPError(url, 403, 'Forbidden', {}, io.BytesIO()))
+    with pytest.raises(HTTPError):
+        vm_runtime.PaymentHandler.charge(payment)
+    lines = vm_runtime.buffered_lines()
+    assert re.fullmatch(r'\[vm\] payment ledger PUT 412 already paid in \d+ ms', lines[0])
+    assert re.fullmatch(r'\[vm\] payment ledger PUT failed in \d+ ms', lines[1])
+    assert all('X-Amz' not in line and 'https' not in line for line in lines)
+
+
+def test_the_handler_prints_event_substeps_and_relays_vm_and_php_lines(evaluator, monkeypatch, capsys):
+    run_handler(evaluator, monkeypatch, 'careful', cart=True)
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    expected = [
+        '[EVENT] compare careful: VM requested: vm-compare (run aaaaaaaa)',
+        '[PHP] GET /health 200 4 ms',
+        '[PHP] GET /cart/cart-saved 200 12 ms',
+        '[VM] aaaaaaaa compare careful: setup received: compare (preserve), 0 KB input',
+    ]
+    for line in expected:
+        assert line in lines
+    assert lines.index(expected[0]) < lines.index(expected[1])
+    assert lines[-1].startswith('[EVENT] compare careful: VM terminated in '), 'the VM log is read before termination'
+    for prefix in (
+        '[EVENT] compare careful: VM running, endpoint ready in ',
+        '[EVENT] compare careful: setup sent, VM configured in ',
+        '[EVENT] compare careful: check /health: HTTP 200 in ',
+        '[EVENT] compare careful: check /cart/cart-saved: HTTP 200 in ',
+        '[EVENT] compare careful: check /checkout: HTTP 200 in ',
+        '[EVENT] compare careful: VM terminated in ',
+    ):
+        assert any(line.startswith(prefix) for line in lines), prefix
+    assert all(re.fullmatch(r'\[(EVENT|VM|PHP)\] .+', line) for line in lines)
+    assert not any('/control/' in line for line in lines if line.startswith('[EVENT]'))
+    stage = evaluator.Rehearsal.parse({'id': RUN, 'action': 'compare', 'option': 'careful'})
+    for secret in (
+        RUN, 'b' * 32, stage.receipt('careful').decode(), stage.receipt('launch').decode(), 'token',
+        'https://', 'X-Amz', 'amazonaws.com',
+    ):
+        assert secret not in out, secret
+    assert '<redacted>' in out
+
+
+def test_a_failed_stage_still_relays_the_vm_log_before_terminating(evaluator, monkeypatch, capsys):
+    with pytest.raises(RuntimeError, match='cart/cart-saved returned HTTP 200'):
+        run_handler(evaluator, monkeypatch, 'fast', cart=True)
+    lines = capsys.readouterr().out.splitlines()
+    assert '[EVENT] compare fast: stage failed: RuntimeError' in lines
+    assert '[PHP] GET /health 200 4 ms' in lines
+    assert lines.index('[EVENT] compare fast: stage failed: RuntimeError') < lines.index('[PHP] GET /health 200 4 ms')
+    assert lines[-1].startswith('[EVENT] compare fast: VM terminated in ')
+
+
+def test_an_unreadable_vm_log_never_raises_and_names_no_detail(evaluator, capsys):
+    stage = evaluator.Rehearsal.parse({'id': RUN, 'action': 'launch'})
+
+    class Broken:
+        def log(self):
+            raise ConnectionError('https://secret.example/?token=abc')
+
+    stage.relay(Broken())
+    assert capsys.readouterr().out == '[EVENT] launch -: VM log not read: ConnectionError\n'
+
+
+def test_a_saved_artifact_is_reported_in_kb(evaluator, capsys):
+    stage, store, shop = growth_world(evaluator, 'careful', cart=True)
+    stage = evaluator.Rehearsal.parse({'id': RUN, 'action': 'migrate', 'option': 'careful'})
+    real = shop.request
+    shop.request = lambda path, body=None, intention='', timeout=7: (
+        reply(evaluator, 200, b'PGDMP' + b'\0' * 2048) if path == '/control/artifact'
+        else real(path, body, intention, timeout))
+    stage.growth(store, shop)
+    assert '[EVENT] migrate careful: artifact saved: 2 KB (pg_dump)' in capsys.readouterr().out.splitlines()
+
+
 
 
 def test_vm_stage_lines_shorten_the_run_id_and_never_carry_the_payment_capability(runtime, capsys, monkeypatch):

@@ -99,11 +99,9 @@ Resources:
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt WorkerLogs.Arn
-              # RunMicrovm sends the VM's stdout/stderr to the image's log group on the caller's behalf.
-              # A log group's Arn attribute already ends in :* and so covers its streams.
-              - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
-                Resource: !GetAtt ImageLogs.Arn
+              # No logs permission for the VM's own log group: RunMicrovm cannot enable VM logging (CloudWatch
+              # logging needs an executionRoleArn, and the VM keeps no AWS role). The evaluator fetches the VM's
+              # buffered log over /control/log and prints it to its own log group (WorkerLogs) instead.
   Evaluator:
     Type: AWS::Lambda::Function
     Properties:
@@ -120,7 +118,6 @@ Resources:
           IMAGE_ARN: !Ref ShopImage
           IMAGE_VERSION: !GetAtt ShopImage.LatestActiveImageVersion
           RELEASE_ID: !Ref ReleaseId
-          VM_LOG_GROUP: !Ref ImageLogs
       MemorySize: 512
       Timeout: 300
       ReservedConcurrentExecutions: 10

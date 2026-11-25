@@ -45,6 +45,21 @@ def pause(deadline: float) -> None:
     sleep(request_budget(deadline, 0.4))
 
 
+def seconds(started: float) -> str:
+    return f'{monotonic() - started:.2f} s'
+
+
+def relay_line(line: object) -> str:
+    """One VM log line as an evaluator log line. The VM already prints no capability, receipt or full run id;
+    this drops anything URL- or receipt-shaped again, in case a PHP warning quotes one."""
+    text = re.sub(r'https?://\S+|[0-9a-f]{32}', '<redacted>', ' '.join(str(line).split()))[:240]
+    match = re.fullmatch(r'\[([^\]]*)\] (.*)', text)
+    if match is None:
+        return f'[VM] {text}'
+    label, rest = match.groups()
+    return f'[PHP] {rest[4:]}' if rest.startswith('php ') else f'[VM] {label}: {rest}'
+
+
 @dataclass(frozen=True)
 class Reply:
     status: int
@@ -112,11 +127,6 @@ class Fleet:
         self.client = boto3.client('lambda-microvms', region_name=region, config=AWS_CONFIG)
         self.image = os.environ['IMAGE_ARN']
         self.version = os.environ['IMAGE_VERSION']
-        # The VM's stdout/stderr go to the image's log group so the room can watch inside it. vm_runtime.py prints
-        # only timed stage lines and never a payment URL, receipt or token; PHP's request log is filtered there.
-        # Without the variable (older templates) logging stays off.
-        group = os.environ.get('VM_LOG_GROUP')
-        self.logging = {'cloudWatch': {'logGroup': group}} if group else {'disabled': {}}
         self.connector = f'arn:{self.image.split(":")[1]}:lambda:{region}:aws:network-connector:aws-network-connector:'
 
     def run(self, identity: str) -> dict:
@@ -127,7 +137,9 @@ class Fleet:
             clientToken=f'{identity}-{uuid4().hex}', maximumDurationInSeconds=VM_LIFESPAN,
             ingressNetworkConnectors=[self.connector + 'HTTP_INGRESS'],
             egressNetworkConnectors=[self.connector + 'INTERNET_EGRESS'],
-            logging=self.logging,
+            # VM logging to CloudWatch is not possible: RunMicrovm refuses it without an executionRoleArn, and the VM
+            # must keep no AWS role. The VM keeps its own log and the evaluator relays it (Rehearsal.relay).
+            logging={'disabled': {}},
         )
 
     def get(self, vm_id: str) -> dict:
@@ -183,10 +195,11 @@ class Fleet:
 
 
 class Shop:
-    def __init__(self, endpoint: str, token: str, deadline: float) -> None:
+    def __init__(self, endpoint: str, token: str, deadline: float, emit=None) -> None:
         self.base = endpoint.rstrip('/')
         self.token = token
         self.deadline = deadline
+        self.emit = emit  # called with one text line per shop check; never given a body or a header
 
     def request(self, path: str, body: dict | None = None, intention: str = '', timeout: float = 7) -> Reply:
         headers = {'X-aws-proxy-auth': self.token, 'X-aws-proxy-port': '8080'}
@@ -210,7 +223,20 @@ class Shop:
             )
 
     def check(self, path: str, status: int = 200, **kwargs) -> Reply:
-        return self.request(path, **kwargs).expect(status, path)
+        started = monotonic()
+        reply = self.request(path, **kwargs)
+        if self.emit and not path.startswith('/control/'):
+            self.emit(f'check {path}: HTTP {reply.status} in {round((monotonic() - started) * 1000)} ms'
+                      + ('' if reply.status == status else f' (expected {status})'))
+        return reply.expect(status, path)
+
+    def log(self) -> list[str]:
+        """The VM's own log. Best effort after the work deadline: the VM must be read before it is terminated."""
+        self.deadline = max(self.deadline, monotonic() + 6)
+        lines = self.request('/control/log', timeout=5).expect(200, '/control/log').json()['lines']
+        if not isinstance(lines, list):
+            raise ValueError('Unexpected VM log')
+        return lines
 
     def cart(self, cart: str) -> Reply:
         return self.check('/cart', body={'cart_id': cart, 'sku': 'cloud-mug'})
@@ -241,6 +267,17 @@ class Rehearsal:
         if action in ('migrate', 'compare') and set(event) == {'id', 'action', 'option'} and option in OPTIONS:
             return cls(run_id, action, option, OPTIONS[option])
         raise ValueError('Invalid action, option or unexpected event field')
+
+    def event(self, text: str) -> None:
+        print(f'[EVENT] {self.action} {self.team or "-"}: {text}', flush=True)
+
+    def relay(self, shop: Shop) -> None:
+        """Print the VM's buffered log lines (MicroVM logging to CloudWatch is not possible). Never raises."""
+        try:
+            for line in shop.log()[-500:]:
+                print(relay_line(line), flush=True)
+        except Exception as error:
+            self.event(f'VM log not read: {type(error).__name__}')
 
     @property
     def root(self) -> str:
@@ -293,7 +330,9 @@ class Rehearsal:
                 else (f'migrate-{self.team}', 'dump', 'branch.dump')
             )
             prior = json.loads(store.require(self.result_key(step)))
+            started = monotonic()
             fleet.finish(prior['vm_id'], deadline)
+            self.event(f'previous stage VM terminated in {seconds(started)}')
             digest = prior[field]
             artifact = store.require(self.artifact_key(step, digest, filename))
             if sha256(artifact).hexdigest() != digest:
@@ -322,6 +361,7 @@ class Rehearsal:
         order = self.verify_order(store, shop, 'launch')
         digest = sha256(artifact).hexdigest()
         store.put_once(self.artifact_key(self.step, digest, 'checkpoint.sqlite'), artifact, 'application/octet-stream')
+        self.event(f'artifact saved: {len(artifact) // 1024} KB (SQLite checkpoint)')
         return {'checkpoint': digest, 'launch': {
             'checkout_statuses': [lost.status, retry.status], 'charges_before_retry': charged,
             'charges': self.observe_charge(store, 'launch'), 'verified_sales': 1, 'cart_status': cart.status,
@@ -337,6 +377,7 @@ class Rehearsal:
             artifact = shop.check('/control/artifact').body
             digest = sha256(artifact).hexdigest()
             store.put_once(self.artifact_key(self.step, digest, 'branch.dump'), artifact, 'application/octet-stream')
+            self.event(f'artifact saved: {len(artifact) // 1024} KB (pg_dump)')
             return {
                 'option': self.team, 'kind': self.kind, 'schema': f'bf_{self.id}_{self.team}', 'database': 'pgsql',
                 'health_status': health.status, 'history_status': history.status, 'dump': digest,
@@ -382,15 +423,29 @@ def handler(event: dict, context) -> dict:
         request_budget(work_deadline, 1)
         vm = fleet.run(f'{stage.id}-{stage.step}')
         vm_id = vm['microvmId']
+        requested = monotonic()
+        stage.event(f'VM requested: {vm_id} (run {stage.id[:8]})')
+        shop = None
         try:
             shop = fleet.connect(vm, work_deadline)
+            shop.emit = stage.event
+            stage.event(f'VM running, endpoint ready in {seconds(requested)}')
+            sent = monotonic()
             shop.check('/control/setup', body=data, timeout=35)
+            stage.event(f'setup sent, VM configured in {seconds(sent)}')
             result = stage.launch(store, shop) if stage.action == 'launch' else stage.growth(store, shop)
             # Persist the evaluated candidate before termination. A retry can finish
             # cleanup and return it without doing a new checkout or a new migration.
             store.put_once(key, json.dumps({**result, 'vm_id': vm_id}).encode(), 'application/json')
+        except Exception as error:
+            stage.event(f'stage failed: {type(error).__name__}')
+            raise
         finally:
+            if shop is not None:
+                stage.relay(shop)
+            terminating = monotonic()
             fleet.finish(vm_id, cleanup_deadline)
+            stage.event(f'VM terminated in {seconds(terminating)}')
         candidate = store.require(key)
         result = json.loads(candidate)
         if result['vm_id'] != vm_id:
@@ -398,5 +453,6 @@ def handler(event: dict, context) -> dict:
     else:
         result = json.loads(candidate)
         fleet.finish(result['vm_id'], cleanup_deadline)
+        stage.event('result already saved, VM terminated')
     result.pop('dump', None)  # The workflow exposes the branch result, not its storage details.
     return {**result, 'vm_state': 'terminated'}
