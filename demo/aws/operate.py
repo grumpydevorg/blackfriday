@@ -225,8 +225,9 @@ def wait_web(web, *, revision: str | None = None, endpoint: bool = False, functi
 # simultaneous requests got HTTP 429 from the endpoint while it scaled (24 Nov
 # 2026); 10 environments served 24 at once. The throttle was not the limit.
 ENDPOINT_LIMITS = {'scalingConfig': {'maxEnvironments': 10}, 'throttleConfig': {'rateLimit': 100}}
-# The live log is read by one presenter: few environments, but each holds many open streams.
-LOGS_ENDPOINT_LIMITS = {'scalingConfig': {'maxEnvironments': 3}, 'throttleConfig': {'rateLimit': 20}}
+# The live log is read by one presenter: few environments, but each holds many open streams. Web Functions accept
+# only rate limits of 0 or multiples of 100 (CreateWebFunction refused 20), so 100 is the smallest throttle.
+LOGS_ENDPOINT_LIMITS = {'scalingConfig': {'maxEnvironments': 3}, 'throttleConfig': {'rateLimit': 100}}
 
 
 def deploy_web(
@@ -482,6 +483,7 @@ def deploy_logs(*, keep_failed: bool = False) -> None:
                 f'/aws/lambda/{WEB_FUNCTION}-evaluator', f'/aws/lambda-microvms/{WEB_FUNCTION}-shop',
             ]),
             'PRESENTER_PARAMETER': PRESENTER_PARAMETER, 'PASSPHRASE_PARAMETER': PASSPHRASE_PARAMETER,
+            'AWS_ACCOUNT_ID': ACCOUNT,  # for Live Tail's log group ARNs
         },
         timeout=900, concurrency=64, limits=LOGS_ENDPOINT_LIMITS,
     )

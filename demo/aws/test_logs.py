@@ -23,7 +23,7 @@ const STUB = `
 export const sdk = () => globalThis.__aws;
 ${['DynamoDBClient', 'LambdaClient', 'SSMClient', 'CloudWatchLogsClient']
   .map(name => `export class ${name} { send(command, options) { return sdk().send(command, options); } }`).join('\n')}
-${['GetItemCommand', 'GetDurableExecutionHistoryCommand', 'FilterLogEventsCommand', 'GetParametersCommand']
+${['GetItemCommand', 'GetDurableExecutionHistoryCommand', 'FilterLogEventsCommand', 'StartLiveTailCommand', 'GetParametersCommand']
   .map(name => `export class ${name} { constructor(input) { this.input = input; } }`).join('\n')}
 `;
 registerHooks({
@@ -47,8 +47,8 @@ const access = (route, status = 200, level = 'info') => JSON.stringify({ bf: 'ac
 
 const aws = {
   items: new Map(), history: [], cw: Object.fromEntries(GROUPS.map(group => [group, []])),
-  calls: { arena: 0, timeline: 0, history: 0, cw: {}, starts: {} }, cwDone: 0, delay: 0, pageSize: Infinity,
-  async send(command) {
+  calls: { arena: 0, timeline: 0, history: 0, cw: {}, starts: {} }, cwDone: 0, delay: 0, pageSize: Infinity, tails: [],
+  async send(command, options) {
     const name = command.constructor.name, input = command.input;
     if (name === 'GetItemCommand') {
       const pk = input.Key.pk.S;
@@ -71,6 +71,28 @@ const aws = {
       const events = all.slice(from, from + aws.pageSize);
       aws.cwDone++;
       return { events, ...(from + aws.pageSize < all.length && { nextToken: String(from + aws.pageSize) }) };
+    }
+    if (name === 'StartLiveTailCommand') {
+      // A Live Tail session: an async iterable of sessionStart then sessionUpdate; the test pushes, ends or fails it.
+      const queue = [];
+      let wake, ended = false, error;
+      const tail = {
+        input, aborted: false,
+        push: results => { queue.push({ sessionUpdate: { sessionResults: results } }); wake?.(); },
+        end: () => { ended = true; wake?.(); },
+        fail: failure => { error = failure; wake?.(); },
+      };
+      options?.abortSignal?.addEventListener('abort', () => { tail.aborted = true; error = Object.assign(new Error('aborted'), { name: 'AbortError' }); wake?.(); });
+      aws.tails.push(tail);
+      return { responseStream: (async function* () {
+        yield { sessionStart: {} };
+        for (;;) {
+          if (error) throw error;
+          if (queue.length) { yield queue.shift(); continue; }
+          if (ended) return;
+          await new Promise(resolve => { wake = resolve; });
+        }
+      })() };
     }
     if (name === 'GetParametersCommand') return { Parameters: [{ Name: 'p-key', Value: 'k'.repeat(64) }, { Name: 'p-pass', Value: 'a long passphrase' }] };
     throw new Error(`unexpected ${name}`);
@@ -115,17 +137,21 @@ const fill = () => {
   aws.cw[EVALUATOR] = [cwEvent('v1', 80000, '[EVENT] compare careful: VM running'), cwEvent('v2', 70000, '[PHP] GET /cart 404 12 ms')];
   aws.cw[MICROVM] = [cwEvent('m1', 60000, '[1a2b3c4d migrate careful] PHP shop ready in 1.92 s')];
 };
-const { createHub, fromCloudWatch, redact, snapshot } = await import('./logs.mjs');
+const { createHub, fromCloudWatch, cloudWatchId, redact, snapshot } = await import('./logs.mjs');
+const cwId = (group, event) => cloudWatchId(group, event);
+const arnOf = group => `arn:aws:logs:ap-southeast-2:1:log-group:${group}`;
+const tailResult = (group, ago, message) => ({ logGroupIdentifier: arnOf(group), logStreamName: 'x', timestamp: Date.now() - ago, ingestionTime: Date.now(), message });
 const sdkClients = { db: aws, lambda: aws, logs: aws };
 const hubFor = (clock = () => T, extra = {}) => createHub({ ...sdkClients, table: 'runs', groups: GROUPS, workflowFunction: 'black-friday-four-workflow', now: clock, ...extra });
 const result = value => console.log('RESULT:' + JSON.stringify(value));
 
 // ---- the real server, for the HTTP scenarios
 const PORT = __PORT__;
-const serve = async () => {
+const serve = async (extra = {}) => {
   Object.assign(process.env, {
     RUN_TABLE: 'runs', WORKFLOW_FUNCTION: 'black-friday-four-workflow', LOG_GROUPS: GROUPS.join(','), POLL_MS: '150',
     AWS_LAMBDA_HTTP_ENDPOINT: `127.0.0.1:${PORT}`, PUBLIC_HOST: 'logs.example.test', PRESENTER_PARAMETER: 'p-key', PASSPHRASE_PARAMETER: 'p-pass',
+    ...extra,
   });
   await import('./logs_web.mjs');
 };
@@ -289,7 +315,7 @@ def test_every_cloudwatch_line_type_gets_its_tag_level_and_text():
             assert got is None, LINES[index]
             continue
         assert (got['tag'], got['level'], got['text']) == expected, LINES[index]
-        assert got['id'] == f'cw:e{index}' and got['ts'] == -1000 * index
+        assert re.fullmatch(r'cw:[0-9a-f]{16}', got['id']) and got['ts'] == -1000 * index
     assert out[0]['source'] == 'web/black-friday-four'
     assert out[18]['source'] == 'black-friday-four-evaluator'
     assert out[29]['source'] == 'black-friday-four-shop'
@@ -347,14 +373,15 @@ def test_two_pollers_on_the_same_data_produce_identical_ids_and_times():
 def test_backfill_then_steady_state_reads_overlap_and_pages_are_capped():
     out = run_scenario(r"""
       fill();
+      const webIds = new Set(aws.cw[WEB].map(event => cwId(WEB, event)));
       aws.pageSize = 3;
       const hub = hubFor(() => T);
       await hub.poll();
       const first = { calls: aws.calls.cw[WEB], start: T - aws.calls.starts[WEB][0],
-                      count: hub.eventsAfter(undefined, true).filter(e => e.id.startsWith('cw:ew')).length };
+                      count: hub.eventsAfter(undefined, true).filter(e => webIds.has(e.id)).length };
       await hub.poll();
       result({ first, secondStart: T - aws.calls.starts[WEB].at(-1),
-               count: hub.eventsAfter(undefined, true).filter(e => e.id.startsWith('cw:ew')).length });
+               count: hub.eventsAfter(undefined, true).filter(e => webIds.has(e.id)).length });
     """)
     # Thirty web events need ten pages of three: the first poll reads five (15 events) from now - 15 min.
     assert out['first'] == {'calls': 5, 'start': 15 * 60000, 'count': 15}
@@ -373,8 +400,8 @@ def test_debug_events_are_capped_at_the_newest_3000_and_old_events_expire():
       const debug = hub.eventsAfter(undefined, true).filter(e => e.level === 'debug');
       const noDebug = hub.eventsAfter(undefined, false);
       const ids = new Set(debug.map(e => e.id));
-      result({ debug: debug.length, noDebug: noDebug.some(e => e.level === 'debug'), hasNewest: ids.has('cw:ed3499'), hasOldest: ids.has('cw:ed0'),
-               late: noDebug.some(e => e.id === 'cw:elate') });
+      result({ debug: debug.length, noDebug: noDebug.some(e => e.level === 'debug'), hasNewest: ids.has(cwId(WEB, aws.cw[WEB][3499])), hasOldest: ids.has(cwId(WEB, aws.cw[WEB][0])),
+               late: noDebug.some(e => e.id === cwId(EVALUATOR, aws.cw[EVALUATOR][0])) });
     """)
     assert out == {'debug': 3000, 'noDebug': False, 'hasNewest': True, 'hasOldest': False, 'late': True}
 
@@ -644,7 +671,7 @@ def test_the_stream_pings_and_keeps_new_events_flowing():
       aws.cw[EVALUATOR].push(cwEvent('fresh', 0, '[EVENT] judge x: new line'));
       aws.cw[EVALUATOR].at(-1).timestamp = Date.now();
       await stream.until(text => text.includes('judge x: new line'));
-      result({ before, after: stream.events().length, fresh: stream.events().filter(e => e.id === 'cw:efresh').length });
+      result({ before, after: stream.events().length, fresh: stream.events().filter(e => e.id === cwId(EVALUATOR, aws.cw[EVALUATOR].at(-1))).length });
     """)
     assert out['after'] == out['before'] + 1 and out['fresh'] == 1
 
@@ -671,3 +698,112 @@ def test_page_has_no_inline_script_or_style_and_builds_dom_with_text_content():
 @pytest.mark.parametrize('name', ['index.html', 'logs.js', 'logs.css', 'signin.html', 'signin.js', 'signin.css'])
 def test_page_files_exist(name):
     assert (PAGE_DIR / name).is_file()
+
+
+# ---------------------------------------------------------------- Live Tail
+
+def test_live_tail_session_uses_the_log_group_arns_and_pushes_events_before_the_next_poll():
+    out = run_scenario(r"""
+      fill();
+      const hub = hubFor(() => Date.now(), { accountId: '1', region: 'ap-southeast-2', pollMs: 60000, filterMs: 0 });
+      const got = [];
+      const release = hub.attach((added, status) => got.push({ ids: added.map(event => event.id), status }));
+      await sleep(100);
+      const started = aws.tails.length, groups = aws.tails[0].input.logGroupIdentifiers, polls = hub.polls;
+      // Live Tail results carry no event id: a line is told apart by group, timestamp and message.
+      const at = Date.now();
+      got.length = 0;
+      const live = tailResult(EVALUATOR, 0, '[EVENT] judge x: live line');
+      aws.tails[0].push([live, tailResult(EVALUATOR, 0, 'START RequestId: abc'),
+        { ...tailResult(WEB, 0, access('/api/join')), logGroupIdentifier: arnOf(WEB + '.local') }]);
+      for (let i = 0; i < 60 && got.length === 0; i++) await sleep(5);
+      const latency = Date.now() - at;
+      const pushed = got[0];
+      // FilterLogEvents later returns the same line (with its own event id): it must not appear twice.
+      const sameLine = { eventId: 'filter-id-differs', timestamp: live.timestamp, message: live.message, logStreamName: 'x' };
+      aws.cw[EVALUATOR].push(sameLine);
+      await hub.poll();
+      const lines = hub.eventsAfter(undefined, true).filter(event => event.text === 'judge x: live line');
+      result({ started, groups, polls, latency, count: pushed.ids.length, status: pushed.status, pollsAfter: hub.polls,
+               lines: lines.length, sameId: lines[0].id === cwId(EVALUATOR, sameLine) && pushed.ids[0] === lines[0].id });
+      release();
+    """)
+    assert out['started'] == 1
+    assert out['groups'] == [f'arn:aws:logs:ap-southeast-2:1:log-group:{group}' for group in (
+        '/aws/lambda/web/black-friday-four', '/aws/lambda/black-friday-four-workflow',
+        '/aws/lambda/black-friday-four-evaluator', '/aws/lambda-microvms/black-friday-four-shop')]
+    assert out['polls'] >= 1 and out['pollsAfter'] == out['polls'] + 1
+    assert out['latency'] < 250 and out['count'] == 1, 'one event: noise and the .local group are dropped'
+    assert out.get('status') is None, 'a Live Tail push carries no status'
+    assert out['lines'] == 1 and out['sameId']
+
+
+def test_with_live_tail_the_group_reads_are_only_the_backfill_and_a_gap_filler_every_10_s():
+    out = run_scenario(r"""
+      fill();
+      const clock = { t: T };
+      const hub = hubFor(() => clock.t, { accountId: '1', region: 'ap-southeast-2', pollMs: 100000 });
+      await hub.touch();
+      const reads = () => ({ web: aws.calls.cw[WEB], evaluator: aws.calls.cw[EVALUATOR], arena: aws.calls.arena });
+      const first = reads();
+      await hub.poll(); clock.t += 2000;
+      await hub.poll(); clock.t += 2000;
+      const quiet = reads();
+      clock.t += 6000;                      // 10 s since the backfill
+      await hub.poll();
+      result({ first, quiet, filled: reads() });
+    """)
+    assert out['first'] == {'web': 1, 'evaluator': 1, 'arena': 1}
+    assert out['quiet'] == {'web': 1, 'evaluator': 1, 'arena': 3}, 'game state is still read every poll'
+    assert out['filled'] == {'web': 2, 'evaluator': 2, 'arena': 4}
+
+
+def test_live_tail_restarts_with_backoff_reports_failures_and_closes_when_idle():
+    out = run_scenario(r"""
+      fill();
+      const reports = [];
+      const hub = hubFor(() => Date.now(), { accountId: '1', region: 'ap-southeast-2', pollMs: 60000, tailIdleMs: 150, tailBackoffMs: 20,
+        report: (source, error) => reports.push([source, error?.name]) });
+      let release = hub.attach(() => {});
+      await sleep(80);
+      const first = aws.tails.length;
+      aws.tails[0].end();                      // the 3 hour cap: the session ends on its own
+      await sleep(120);
+      const afterEnd = aws.tails.length;
+      aws.tails[afterEnd - 1].fail(Object.assign(new Error('x'), { name: 'AccessDeniedException' }));
+      await sleep(200);
+      const afterFail = aws.tails.length;
+      const watch = hub.eventsAfter(undefined, true).filter(event => event.tag === 'WATCH').map(event => event.text);
+      release();
+      await sleep(600);
+      const stopped = { active: hub.tailActive, aborted: aws.tails.at(-1).aborted, count: aws.tails.length };
+      release = hub.attach(() => {});          // a new client starts a fresh session
+      await sleep(100);
+      result({ first, afterEnd, afterFail, reports, watch, stopped, restarted: aws.tails.length, active: hub.tailActive });
+      release();
+    """)
+    assert out['first'] == 1 and out['afterEnd'] == 2 and out['afterFail'] == 3
+    assert ['live tail', 'AccessDeniedException'] in out['reports']
+    assert out['watch'] == ['live tail unavailable: AccessDeniedException']
+    assert out['stopped'] == {'active': False, 'aborted': True, 'count': 3}
+    assert out['restarted'] == 4 and out['active'] is True
+
+
+def test_live_tail_lines_reach_sse_clients_immediately_not_on_the_next_poll():
+    out = run_scenario(r"""
+      fill();
+      await serve({ AWS_ACCOUNT_ID: '1', AWS_REGION: 'ap-southeast-2', POLL_MS: '5000' });
+      const stream = await open('/stream?debug=1');
+      await stream.until(text => text.includes('event: status'));
+      const before = { reads: aws.cwDone, statuses: stream.statuses(), tails: aws.tails.length };
+      const at = Date.now();
+      const live = tailResult(EVALUATOR, 0, '[EVENT] judge x: live over sse');
+      aws.tails[0].push([live]);
+      await stream.until(text => text.includes('live over sse'), 2000);
+      const message = stream.messages().find(m => m.data && m.data.includes('live over sse'));
+      result({ latency: Date.now() - at, before, after: { reads: aws.cwDone, statuses: stream.statuses(), tails: aws.tails.length },
+               idIsTs: message.id === String(live.timestamp), event: JSON.parse(message.data) });
+    """)
+    assert out['latency'] < 1000, 'the next poll is 5 s away'
+    assert out['before'] == out['after'] and out['before']['tails'] == 1
+    assert out['idIsTs'] and out['event']['tag'] == 'EVENT' and out['event']['text'] == 'judge x: live over sse'

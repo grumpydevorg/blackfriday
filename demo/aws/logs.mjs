@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { GetItemCommand } from '@aws-sdk/client-dynamodb';
 import { GetDurableExecutionHistoryCommand } from '@aws-sdk/client-lambda';
-import { FilterLogEventsCommand } from '@aws-sdk/client-cloudwatch-logs';
+import { FilterLogEventsCommand, StartLiveTailCommand } from '@aws-sdk/client-cloudwatch-logs';
 
 // The presenter's live log: one event model built from the game's own records. Every event is
 // {id, ts, tag, level, source, text, detail}; id and ts come from the data, never from the clock, so
@@ -262,12 +263,23 @@ export function classify(groupKind, rawMessage) {
   return undefined;
 }
 
-/** A CloudWatch event -> an event, or undefined when it is noise. Id and ts are the log event's own. */
+/**
+ * The id of a CloudWatch line: a hash of group, timestamp and message. Live Tail results carry no event id,
+ * so both sources (Live Tail and FilterLogEvents) derive it from the same three fields and agree on it.
+ */
+export function cloudWatchId(group, raw) {
+  return `cw:${createHash('sha1').update(`${group}\n${Number(raw.timestamp)}\n${raw.message}`).digest('hex').slice(0, 16)}`;
+}
+
+/** A CloudWatch event -> an event, or undefined when it is noise. Id and ts come from the log line itself. */
 export function fromCloudWatch(group, raw) {
   const line = classify(groupTag(group), raw.message);
   if (!line) return undefined;
-  return make(`cw:${raw.eventId}`, Number(raw.timestamp), line.tag, line.level, logSource(group), line.text, line.detail);
+  return make(cloudWatchId(group, raw), Number(raw.timestamp), line.tag, line.level, logSource(group), line.text, line.detail);
 }
+
+/** `arn:aws:logs:<region>:<account>:log-group:<name>[:*]` or `<account>:<name>` -> `<name>`. */
+export const groupOfIdentifier = identifier => String(identifier ?? '').split('log-group:').pop().replace(/:\*$/, '').replace(/^\d{12}:/, '');
 
 // ---------------------------------------------------------------- Durable history (ported from watch.py durable_line)
 
@@ -363,12 +375,22 @@ const byTime = (a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
  * asked for /events within `idleMs`; AWS calls never scale with viewers. `db`, `lambda` and `logs` are
  * SDK clients (anything with send(command)); `now` is the clock.
  */
-export function createHub({ db, lambda, logs, table, groups, workflowFunction, now = Date.now, pollMs = 2000, idleMs = 10_000, setTimer = setTimeout,
+export const TAIL_IDLE_MS = 60_000;       // Live Tail is closed after this long without a client
+export const FILTER_GAP_MS = 10_000;      // with Live Tail, FilterLogEvents only backfills and fills gaps this often
+
+export function createHub({ db, lambda, logs, table, groups, workflowFunction, accountId, region, now = Date.now, pollMs = 2000, idleMs = 10_000,
+  filterMs = FILTER_GAP_MS, tailIdleMs = TAIL_IDLE_MS, tailBackoffMs = 1000, setTimer = setTimeout,
   clearTimer = clearTimeout, report = () => {} }) {
   const known = groups.filter(group => group && !group.endsWith('.local'));
   const buffer = new Map();           // id -> event
-  const seenCloudWatch = new Map();   // every inspected CloudWatch event id (dropped ones too) -> ts
-  const groupMax = new Map();         // group -> newest timestamp seen
+  const seenCloudWatch = new Map();   // every inspected CloudWatch line id (dropped ones too) -> ts
+  const groupMax = new Map();         // group -> newest timestamp FilterLogEvents has returned
+  // Live Tail is the primary CloudWatch source when the account is known; otherwise FilterLogEvents polls alone.
+  const arns = new Map(groups.filter(group => group && !group.endsWith('.local'))
+    .map(group => [group, `arn:aws:logs:${region}:${accountId}:log-group:${group}`]));
+  const tailEnabled = Boolean(accountId && region);
+  const tail = { active: false, gen: 0, controller: undefined, check: undefined, sleep: undefined, wake: undefined };
+  let lastFilterAt = -Infinity;
   const listeners = new Set();
   const durable = new Map();          // arn -> complete history of a finished execution
   let sorted = [], dirty = false, status = snapshot(undefined);
@@ -449,9 +471,9 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, n
       }));
       for (const raw of reply.events ?? []) {
         newest = Math.max(newest ?? -Infinity, raw.timestamp);
-        const key = `${group}|${raw.eventId}`;
-        if (seenCloudWatch.has(key)) continue;
-        seenCloudWatch.set(key, raw.timestamp);
+        const id = cloudWatchId(group, raw);
+        if (seenCloudWatch.has(id)) continue;
+        seenCloudWatch.set(id, raw.timestamp);
         const event = fromCloudWatch(group, raw);
         if (event) out.push(event);
       }
@@ -468,8 +490,17 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, n
       `${source} unavailable: ${error?.name ?? 'Error'}`, {});
   }
 
+  function notify(added, snapshotNow) {
+    for (const listener of [...listeners]) {
+      try { listener(added, snapshotNow); } catch { listeners.delete(listener); }
+    }
+  }
+
   async function runPoll() {
-    const tasks = [['game', gameTask()], ...known.map(group => [logSource(group), groupTask(group)])];
+    // With Live Tail running, the group reads are only the backfill and a gap filler every `filterMs`.
+    const filterDue = !tailEnabled || now() - lastFilterAt >= filterMs;
+    if (filterDue) lastFilterAt = now();
+    const tasks = [['game', gameTask()], ...(filterDue ? known.map(group => [logSource(group), groupTask(group)]) : [])];
     const results = await Promise.allSettled(tasks.map(([, task]) => task));
     const events = [];
     results.forEach((result, index) => {
@@ -485,9 +516,77 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, n
     prune();
     polls++;
     lastDone = now();
-    for (const listener of [...listeners]) {
-      try { listener(added.filter(event => buffer.has(event.id)), status); } catch { listeners.delete(listener); }
+    notify(added.filter(event => buffer.has(event.id)), status);
+  }
+
+  // ---- Live Tail: one session per environment, results pushed to clients as they arrive
+  function pushLive(events) {
+    const added = [];
+    insert(events, added);
+    if (!added.length) return;
+    added.sort(byTime);
+    prune();
+    notify(added.filter(event => buffer.has(event.id)), undefined);
+  }
+  function takeTail(results) {
+    const events = [];
+    for (const raw of results ?? []) {
+      const group = groupOfIdentifier(raw.logGroupIdentifier);
+      if (!arns.has(group) || !Number.isFinite(Number(raw.timestamp))) continue;
+      const id = cloudWatchId(group, raw);
+      if (seenCloudWatch.has(id)) continue;
+      seenCloudWatch.set(id, Number(raw.timestamp));
+      const event = fromCloudWatch(group, raw);
+      if (event) events.push(event);
     }
+    pushLive(events);
+  }
+  const pause = delay => new Promise(resolve => { tail.wake = resolve; tail.sleep = setTimer(resolve, delay); });
+  async function tailLoop(generation) {
+    let failures = 0;
+    while (generation === tail.gen) {
+      const controller = new AbortController();
+      tail.controller = controller;
+      try {
+        const { responseStream } = await logs.send(new StartLiveTailCommand({ logGroupIdentifiers: [...arns.values()] }),
+          { abortSignal: controller.signal });
+        for await (const update of responseStream) {
+          if (generation !== tail.gen) return;
+          if (update.sessionStart) failures = 0;
+          if (update.sessionUpdate) takeTail(update.sessionUpdate.sessionResults);
+        }
+        failures = 0;   // the session ended on its own (the 3 hour cap): start the next one
+      } catch (error) {
+        if (generation !== tail.gen) return;
+        failures++;
+        report('live tail', error);
+        pushLive([failureEvent('live tail', error)]);
+      }
+      if (generation !== tail.gen) return;
+      await pause(Math.min(30_000, tailBackoffMs * 2 ** Math.max(0, failures - 1)));
+    }
+  }
+  function armTailCheck() {
+    clearTimer(tail.check);
+    const quiet = connections > 0 ? 0 : now() - lastTouch;
+    tail.check = setTimer(() => {
+      tail.check = undefined;
+      if (connections > 0 || now() - lastTouch < tailIdleMs) armTailCheck(); else stopTail();
+    }, connections > 0 ? tailIdleMs : Math.max(10, tailIdleMs - quiet));
+  }
+  function ensureTail() {
+    if (!tailEnabled || tail.active) return;
+    tail.active = true;
+    tailLoop(++tail.gen);
+    armTailCheck();
+  }
+  function stopTail() {
+    tail.active = false;
+    tail.gen++;
+    tail.controller?.abort();
+    clearTimer(tail.check);
+    clearTimer(tail.sleep);
+    tail.wake?.();
   }
 
   function poll() {
@@ -508,6 +607,7 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, n
     } finally { running = false; timer = undefined; }
   }
   function ensureRunning() {
+    ensureTail();
     if (!running) { loop(); }
   }
 
@@ -519,9 +619,11 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, n
       ensureRunning();
       if (!wasRunning || polls === 0 || now() - lastDone > pollMs * 1.5) await (inflight ?? poll());
     },
-    /** A connected client: events added by each poll go to `listener(added, status)`. Returns release(). */
+    /** A connected client: events added by a poll or by Live Tail go to `listener(added, status)`; status is
+     *  undefined for a Live Tail push. Returns release(). */
     attach(listener) {
       connections++;
+      lastTouch = now();
       listeners.add(listener);
       ensureRunning();
       let released = false;
@@ -529,7 +631,9 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, n
         if (released) return;
         released = true;
         connections--;
+        lastTouch = now();
         listeners.delete(listener);
+        if (tail.active && connections === 0) armTailCheck();
       };
     },
     /** Buffered events at or after cursor - 60 s (or all of them without a cursor). */
@@ -549,6 +653,7 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, n
     get polls() { return polls; },
     get active() { return running; },
     poll,
-    stop() { if (timer) clearTimer(timer); },
+    get tailActive() { return tail.active; },
+    stop() { clearTimer(timer); stopTail(); },
   };
 }

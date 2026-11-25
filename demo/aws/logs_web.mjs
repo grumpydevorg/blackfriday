@@ -21,6 +21,8 @@ const MAX_BACKLOG_BYTES = 2_000_000;
 const hub = createHub({
   db: new DynamoDBClient({}), lambda: new LambdaClient({}), logs: new CloudWatchLogsClient({}), table,
   groups: groupList.split(',').map(group => group.trim()).filter(Boolean), workflowFunction,
+  // Live Tail needs the log group ARNs; without the account the hub falls back to polling FilterLogEvents alone.
+  accountId: process.env.AWS_ACCOUNT_ID, region: process.env.AWS_REGION,
   pollMs: Number(process.env.POLL_MS) || 2000,
   report: (source, error) => console.error('Log source failed', source, error?.name),
 });
@@ -149,7 +151,7 @@ function stream(request, response, query) {
   if (hub.polls) write(statusMessage(hub.status));
   const release = hub.attach((added, status) => {
     const fresh = added.filter(event => debug || event.level !== 'debug');
-    write(fresh.map(event => message(event.ts, event)).join('') + statusMessage(status));
+    write(fresh.map(event => message(event.ts, event)).join('') + (status ? statusMessage(status) : ''));
   });
   const ping = setInterval(() => write(': ping\n\n'), PING_MS);
   const stop = setTimeout(() => response.end(), STREAM_SECONDS * 1000);

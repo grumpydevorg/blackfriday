@@ -275,7 +275,7 @@ def test_deploy_logs_deploys_its_own_stack_bucket_and_function_and_nothing_of_th
     [(bucket, key, web)] = seen['web']
     assert (bucket, web['function'], web['role']) == ('logs-bucket', 'black-friday-four-logs', 'role/logs')
     assert (web['timeout'], web['concurrency']) == (900, 64)
-    assert web['limits'] == {'scalingConfig': {'maxEnvironments': 3}, 'throttleConfig': {'rateLimit': 20}}
+    assert web['limits'] == {'scalingConfig': {'maxEnvironments': 3}, 'throttleConfig': {'rateLimit': 100}}
     environment = web['environment']
     assert environment['AWS_LAMBDA_NODEJS_ENTRYPOINT'] == 'index.mjs'
     assert environment['RUN_TABLE'] == 'tbl'
@@ -338,7 +338,7 @@ def test_logs_yaml_gives_the_role_only_the_contract_read_actions_and_leaves_the_
         if match and 'sts:AssumeRole' not in line:
             actions |= set(re.findall(r'[a-z0-9]+:[A-Za-z*]+', match.group(1)))
     assert actions == {
-        'logs:FilterLogEvents', 'lambda:GetDurableExecution', 'lambda:GetDurableExecutionHistory',
+        'logs:FilterLogEvents', 'logs:StartLiveTail', 'lambda:GetDurableExecution', 'lambda:GetDurableExecutionHistory',
         'dynamodb:GetItem', 'ssm:GetParameter', 'ssm:GetParameters', 'kms:Decrypt',
     }
     assert 'service-role/AWSLambdaBasicExecutionRole' in role

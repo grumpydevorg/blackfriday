@@ -75,7 +75,8 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: logs:FilterLogEvents
+                # Live Tail streams new lines within a second or two; FilterLogEvents backfills and fills gaps.
+                Action: [logs:FilterLogEvents, logs:StartLiveTail]
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WebLogGroup}:*'
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WorkflowLogGroup}:*'
