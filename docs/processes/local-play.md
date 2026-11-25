@@ -34,7 +34,7 @@ runs locally without fetching dependencies.
 
 The time and database operations are real; the costs and retention draw are
 game inputs. This is a local two-round rehearsal, not a MicroVM deployment or
-the scored four-round competition.
+the proposed Git-submitted four-round tournament.
 
 ## Play the Virtual RDS scoring round
 
@@ -74,4 +74,4 @@ the retry order again; this does not resume a live process or payment ledger.
 
 No PostgreSQL, Docker, AWS credentials or cloud services are required. This is
 one controlled scoring round with a trusted reference shop, not a SQL benchmark,
-a hosted contestant runner, or the four-round tournament.
+a hosted contestant runner, or the proposed Git-submitted four-round tournament.

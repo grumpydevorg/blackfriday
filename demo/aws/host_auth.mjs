@@ -98,10 +98,10 @@ export function memoryThrottle(now = Date.now) {
   };
 }
 
-/** Which routes need the presenter: everything that starts compute or shows private state. */
+/** Which routes need the presenter: everything under /api/host/ (state, QR code, start, close, reset, remove). */
 export function routeKind(method, url) {
   if (method === 'POST' && url === '/api/host/login') return 'login';
   if (method === 'POST' && url === '/api/host/logout') return 'logout';
-  if (url.startsWith('/api/host/') || (method === 'POST' && /^\/api\/(launch|migrate|compare|reset)$/.test(url))) return 'presenter';
+  if (url.startsWith('/api/host/')) return 'presenter';
   return 'public';
 }

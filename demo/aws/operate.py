@@ -41,15 +41,27 @@ DEMO = AWS_DIR.parent
 ACCOUNT = os.environ.get('BLACK_FRIDAY_AWS_ACCOUNT', '')
 REGION = 'ap-southeast-2'
 PROFILE = os.environ.get('BLACK_FRIDAY_AWS_PROFILE') or None
+DEPLOYMENTS = {
+    # name: (stack, web function). The artifacts stack is always '<stack>Artifacts'.
+    'rehearsal': ('BlackFridayRehearsal', 'black-friday-arena'),
+    'round': ('BlackFridayRound', 'black-friday-round'),
+    'fourround': ('BlackFridayFourRound', 'black-friday-four'),
+}
 DEPLOYMENT = os.environ.get('BLACK_FRIDAY_DEPLOYMENT', 'rehearsal')
-if DEPLOYMENT not in ('rehearsal', 'round'):
-    raise SystemExit('BLACK_FRIDAY_DEPLOYMENT must be rehearsal or round')
-STACK = 'BlackFridayRehearsal' if DEPLOYMENT == 'rehearsal' else 'BlackFridayRound'
+if DEPLOYMENT not in DEPLOYMENTS:
+    raise SystemExit('BLACK_FRIDAY_DEPLOYMENT must be rehearsal, round or fourround')
+STACK, WEB_FUNCTION = DEPLOYMENTS[DEPLOYMENT]
 ARTIFACTS = STACK + 'Artifacts'
-WEB_FUNCTION = 'black-friday-arena' if DEPLOYMENT == 'rehearsal' else 'black-friday-round'
+# The round and the four-round game share the presenter's key and passphrase.
 PRESENTER_PARAMETER = '/black-friday/round/presenter-key'
 PASSPHRASE_PARAMETER = '/black-friday/round/presenter-passphrase'
 WEB_ENDPOINT = 'stage'
+# The presenter-only live log is a second Web Function with its own stack and bucket, so the game's are never touched.
+LOGS_FUNCTION = 'black-friday-four-logs'
+LOGS_STACK = 'BlackFridayFourRoundLogs'
+# `deploy` builds and uploads exactly these; the logs package belongs to `deploy-logs`.
+GAME_PACKAGES = ('image', 'worker', 'workflow', 'web')
+LOGS_PACKAGES = ('logs',)
 TAILSCALE = shutil.which('tailscale') or '/usr/local/bin/tailscale'  # macOS app CLI is not always on PATH
 TAILNET_PORT = 8443
 LOGGER = logging.getLogger(__name__)
@@ -119,42 +131,52 @@ def python_dependencies(root: Path, *requirements: str) -> None:
     ], check=True)
 
 
-def packages(out: Path) -> dict[str, tuple[str, Path]]:
+def package_definitions(root: Path) -> dict[str, tuple[dict[str, Path], dict[str, Path]]]:
+    """Each archive's files (archive name -> source) and directory trees (prefix -> root). No I/O."""
+    return {
+        'image': ({
+            'Dockerfile': AWS_DIR / 'Microvm.Dockerfile',
+            'aws/vm_runtime.py': AWS_DIR / 'vm_runtime.py',
+            **{name: DEMO / name for name in ('schema.sql', 'db.php', 'shop.php', 'migrate.php')},
+        }, {}),
+        'worker': ({name: AWS_DIR / name for name in ('evaluator.py', 'rounds.json')}, {'': root / 'sdk'}),
+        'workflow': ({
+            name: AWS_DIR / name for name in ('workflow.py', 'model.py', 'rounds.json')
+        }, {'': root / 'sdk'}),
+        'web': ({
+            'index.mjs': AWS_DIR / 'web.mjs',
+            **{name: AWS_DIR / name for name in (
+                'game.mjs', 'host_auth.mjs', 'roster.mjs', 'rounds.json',
+                'player.html', 'host.html', 'round.js', 'round.css',
+            )},
+            'art/cloud-surge.jpg': AWS_DIR / 'art' / 'cloud-surge.jpg',  # derived from assets/cloud-surge.png
+        }, {'node_modules/': root / 'web' / 'node_modules'}),
+        'logs': ({
+            'index.mjs': AWS_DIR / 'logs_web.mjs',
+            **{name: AWS_DIR / name for name in ('logs.mjs', 'host_auth.mjs', 'game.mjs', 'rounds.json')},
+            **{f'logs_page/{name}': AWS_DIR / 'logs_page' / name for name in (
+                'signin.html', 'signin.js', 'signin.css', 'index.html', 'logs.js', 'logs.css',
+            )},
+        }, {'node_modules/': root / 'web' / 'node_modules'}),
+    }
+
+
+def packages(out: Path, kinds: tuple[str, ...] = GAME_PACKAGES) -> dict[str, tuple[str, Path]]:
+    """Build the named archives into `out`. Only what the kinds need is installed."""
     out.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix='black-friday-package-') as work:
         root = Path(work)
-        python_dependencies(root / 'sdk', 'boto3==1.44.9', 'aws-durable-execution-sdk-python==3.1.0')
+        if {'worker', 'workflow'} & set(kinds):
+            python_dependencies(root / 'sdk', 'boto3==1.44.9', 'aws-durable-execution-sdk-python==3.1.0')
         web = root / 'web'
         web.mkdir()
         for name in ('package.json', 'package-lock.json'):
             (web / name).write_bytes((AWS_DIR / name).read_bytes())
         subprocess.run(['npm', 'ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], cwd=web, check=True)
-        definitions = {
-            'image': ({
-                'Dockerfile': AWS_DIR / 'Microvm.Dockerfile',
-                'aws/vm_runtime.py': AWS_DIR / 'vm_runtime.py',
-                **{name: DEMO / name for name in ('schema.sql', 'db.php', 'shop.php', 'migrate.php')},
-            }, {}),
-            'worker': ({
-                'evaluator.py': AWS_DIR / 'evaluator.py', 'scoring.py': AWS_DIR / 'scoring.py',
-                'options.json': AWS_DIR / 'options.json',
-                'virtual_rds.py': DEMO / 'virtual_rds.py', 'arena.py': DEMO / 'arena.py',
-            }, {'': root / 'sdk'}),
-            'workflow': ({
-                'workflow.py': AWS_DIR / 'workflow.py', 'scoring.py': AWS_DIR / 'scoring.py',
-                'options.json': AWS_DIR / 'options.json',
-            }, {'': root / 'sdk'}),
-            'web': ({
-                'index.mjs': AWS_DIR / 'web.mjs',
-                **{name: AWS_DIR / name for name in (
-                    'game.mjs', 'host_auth.mjs', 'roster.mjs', 'options.json',
-                    'player.html', 'host.html', 'round.js', 'round.css',
-                )},
-                'art/cloud-surge.jpg': AWS_DIR / 'art' / 'cloud-surge.jpg',  # derived from assets/cloud-surge.png
-            }, {'node_modules/': web / 'node_modules'}),
-        }
+        definitions = package_definitions(root)
         results = {}
-        for kind, (files, trees) in definitions.items():
+        for kind in kinds:
+            files, trees = definitions[kind]
             path = out / f'{kind}.zip'
             digest = archive(path, files, trees)
             results[kind] = (f'packages/{kind}/{digest}.zip', path)
@@ -182,13 +204,13 @@ def available_base_version(session) -> str:
     return max(versions)[1]
 
 
-def wait_web(web, *, revision: str | None = None, endpoint: bool = False) -> dict:
+def wait_web(web, *, revision: str | None = None, endpoint: bool = False, function: str = WEB_FUNCTION) -> dict:
     for _ in range(100):
         if revision:
-            item = web.get_web_function_revision(functionName=WEB_FUNCTION, revisionId=revision)
+            item = web.get_web_function_revision(functionName=function, revisionId=revision)
             done = item['state'] != 'Pending'
         else:
-            item = web.get_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
+            item = web.get_web_function_endpoint(functionName=function, endpointName=WEB_ENDPOINT)
             done = item['state'] != 'Pending' and item.get('updateStatus') != 'InProgress'
         if done:
             if item['state'] == 'Failed' or item.get('updateStatus') == 'Failed':
@@ -203,16 +225,33 @@ def wait_web(web, *, revision: str | None = None, endpoint: bool = False) -> dic
 # simultaneous requests got HTTP 429 from the endpoint while it scaled (24 Nov
 # 2026); 10 environments served 24 at once. The throttle was not the limit.
 ENDPOINT_LIMITS = {'scalingConfig': {'maxEnvironments': 10}, 'throttleConfig': {'rateLimit': 100}}
+# The live log is read by one presenter: few environments, but each holds many open streams. Web Functions accept
+# only rate limits of 0 or multiples of 100 (CreateWebFunction refused 20), so 100 is the smallest throttle.
+LOGS_ENDPOINT_LIMITS = {'scalingConfig': {'maxEnvironments': 3}, 'throttleConfig': {'rateLimit': 100}}
 
 
-def deploy_web(session, bucket: str, key: str) -> str:
-    """Create or update the arena Web Function through the Lambda Web API.
+def deploy_web(
+    session, bucket: str, key: str, *, function: str = WEB_FUNCTION, role: str | None = None,
+    environment: dict[str, str] | None = None, timeout: int = 15, concurrency: int = 8,
+    limits: dict = ENDPOINT_LIMITS,
+) -> str:
+    """Create or update a Web Function through the Lambda Web API.
 
     CreateWebFunction now needs its first revision and endpoint in one call, so
     the function is not a CloudFormation resource. A new revision is created only
     when the code object or its settings change, then the endpoint is pointed at it.
+    By default this is the arena: the game stack's role and environment. The live
+    log passes its own function, role, environment and limits.
     """
-    outputs = stack_outputs(session, STACK)
+    if role is None or environment is None:
+        outputs = stack_outputs(session, STACK)
+        role = outputs['WebRole'] if role is None else role
+        if environment is None:
+            environment = {
+                'AWS_LAMBDA_NODEJS_ENTRYPOINT': 'index.mjs',
+                'RUN_TABLE': outputs['RunTable'], 'WORKFLOW_ARN': outputs['WorkflowVersion'],
+                'PRESENTER_PARAMETER': PRESENTER_PARAMETER, 'PASSPHRASE_PARAMETER': PASSPHRASE_PARAMETER,
+            }
     version = session.client('s3').head_object(Bucket=bucket, Key=key)['VersionId']
     build = {
         'codeConfig': {'s3Object': {'bucket': bucket, 'key': key, 'versionId': version}},
@@ -222,56 +261,64 @@ def deploy_web(session, bucket: str, key: str) -> str:
     def service_config(domain: str | None) -> dict:
         # The page's own origin, for the Origin check and the QR code. Known only once the endpoint exists.
         return {
-            'executionRoleArn': outputs['WebRole'], 'timeoutSeconds': 15, 'maxConcurrencyPerEnvironment': 8,
-            'environmentVariables': {
-                'AWS_LAMBDA_NODEJS_ENTRYPOINT': 'index.mjs',
-                'RUN_TABLE': outputs['RunTable'], 'WORKFLOW_ARN': outputs['WorkflowVersion'],
-                'PRESENTER_PARAMETER': PRESENTER_PARAMETER, 'PASSPHRASE_PARAMETER': PASSPHRASE_PARAMETER,
-                **({'PUBLIC_HOST': domain} if domain else {}),
-            },
+            'executionRoleArn': role, 'timeoutSeconds': timeout, 'maxConcurrencyPerEnvironment': concurrency,
+            'environmentVariables': {**environment, **({'PUBLIC_HOST': domain} if domain else {})},
         }
 
     web = session.client('lambda-web')
     try:
-        current = web.get_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
+        current = web.get_web_function_endpoint(functionName=function, endpointName=WEB_ENDPOINT)
     except web.exceptions.ResourceNotFoundException:
         created = web.create_web_function(
-            functionName=WEB_FUNCTION, tags={'project': 'black-friday-demo'},
+            functionName=function, tags={'project': 'black-friday-demo'},
             revisionConfig={'buildConfig': build, 'serviceConfig': service_config(None)},
             endpointConfig={
                 'endpointName': WEB_ENDPOINT, 'endpointType': 'HomeRegion', 'authType': 'ApplicationManaged',
-                'autoDeploymentMode': 'Disabled', **ENDPOINT_LIMITS,
+                'autoDeploymentMode': 'Disabled', **limits,
             },
         )
-        wait_web(web, revision=created['revision']['revisionId'])
-        current = wait_web(web, endpoint=True)
+        wait_web(web, revision=created['revision']['revisionId'], function=function)
+        current = wait_web(web, endpoint=True, function=function)
     service = service_config(current['domainName'])
-    live = web.get_web_function_revision(functionName=WEB_FUNCTION, revisionId=current['revisionWeights'][0]['revisionId'])
+    live = web.get_web_function_revision(functionName=function, revisionId=current['revisionWeights'][0]['revisionId'])
     same = (
         live['buildConfig']['codeConfig']['s3Object'] == build['codeConfig']['s3Object']
         and {name: live['serviceConfig'].get(name) for name in service} == service
     )
     update = {} if same else {'revisionWeights': [{'revisionId': web.create_web_function_revision(
-        functionName=WEB_FUNCTION, buildConfig=build, serviceConfig=service)['revisionId'], 'weight': 100}]}
+        functionName=function, buildConfig=build, serviceConfig=service)['revisionId'], 'weight': 100}]}
     if update:
-        wait_web(web, revision=update['revisionWeights'][0]['revisionId'])
-    update.update({name: value for name, value in ENDPOINT_LIMITS.items() if current.get(name) != value})
+        wait_web(web, revision=update['revisionWeights'][0]['revisionId'], function=function)
+    update.update({name: value for name, value in limits.items() if current.get(name) != value})
     if update:
-        web.update_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT, **update)
-    return 'https://' + wait_web(web, endpoint=True)['domainName']
+        web.update_web_function_endpoint(functionName=function, endpointName=WEB_ENDPOINT, **update)
+    return 'https://' + wait_web(web, endpoint=True, function=function)['domainName']
 
 
-def remove_web(session) -> None:
+def web_log_groups(logs, function: str) -> list[dict]:
+    """The Web Function's own log groups: the exact name, a child of it, or the `.local` sibling Lambda Web creates
+    beside it. A name prefix alone also matches another function that starts with this name (`black-friday-four`
+    and `black-friday-four-logs`), so nothing else matches."""
+    name = f'/aws/lambda/web/{function}'
+    return [
+        group
+        for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=name)
+        for group in page['logGroups']
+        if group['logGroupName'] in (name, name + '.local') or group['logGroupName'].startswith(name + '/')
+    ]
+
+
+def remove_web(session, function: str = WEB_FUNCTION) -> None:
     """Delete what deploy_web created: the endpoint, the function and its logs."""
     web = session.client('lambda-web')
     try:
-        web.delete_web_function_endpoint(functionName=WEB_FUNCTION, endpointName=WEB_ENDPOINT)
+        web.delete_web_function_endpoint(functionName=function, endpointName=WEB_ENDPOINT)
     except web.exceptions.ResourceNotFoundException:
         pass
     for _ in range(40):
         try:
-            web.delete_web_function(functionName=WEB_FUNCTION)
-            print(f'Deleted Web Function {WEB_FUNCTION}', flush=True)
+            web.delete_web_function(functionName=function)
+            print(f'Deleted Web Function {function}', flush=True)
             break
         except web.exceptions.ResourceNotFoundException:
             print('No Web Function to delete', flush=True)
@@ -281,11 +328,9 @@ def remove_web(session) -> None:
     else:
         raise TimeoutError('The Web Function endpoint is still deleting')
     logs = session.client('logs')
-    prefix = f'/aws/lambda/web/{WEB_FUNCTION}'
-    for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=prefix):
-        for group in page['logGroups']:
-            logs.delete_log_group(logGroupName=group['logGroupName'])
-            print(f'Deleted log group {group["logGroupName"]}', flush=True)
+    for group in web_log_groups(logs, function):
+        logs.delete_log_group(logGroupName=group['logGroupName'])
+        print(f'Deleted log group {group["logGroupName"]}', flush=True)
 
 
 def delete_stack(session, stack: str) -> None:
@@ -311,6 +356,18 @@ def artifact_buckets(session) -> list[str]:
     return [b['Name'] for b in session.client('s3').list_buckets()['Buckets'] if b['Name'].startswith(prefix)]
 
 
+def stop_running_games(session) -> None:
+    """A game waiting for a Close or a Reset keeps its Durable execution running for up to 23 h, and while it runs
+    CloudFormation's delete of the workflow version fails NotStabilized (seen 25 Nov 2026). Stop them first."""
+    workflow = stack_outputs(session, STACK)['WorkflowVersion'].split(':')[6]
+    lambda_ = session.client('lambda')
+    pages = lambda_.get_paginator('list_durable_executions_by_function').paginate(
+        FunctionName=workflow, Statuses=['RUNNING'])
+    for execution in (e for page in pages for e in page['DurableExecutions']):
+        lambda_.stop_durable_execution(DurableExecutionArn=execution['DurableExecutionArn'])
+        print(f'Stopped game {execution["DurableExecutionArn"].rsplit("/", 2)[-2]}', flush=True)
+
+
 def destroy(*, artifacts: bool = False) -> None:
     """Tear down in the one safe order. Re-runnable after a partial teardown.
 
@@ -323,6 +380,7 @@ def destroy(*, artifacts: bool = False) -> None:
     session = account_session()
     remove_web(session)
     if stack_exists(session, STACK):
+        stop_running_games(session)
         delete_stack(session, STACK)
     if not artifacts:
         print(f'Kept {ARTIFACTS} and its bucket (packages and run evidence); '
@@ -339,8 +397,8 @@ def destroy(*, artifacts: bool = False) -> None:
 
 def passphrase() -> None:
     """Set the presenter's own passphrase. It is read from a prompt or stdin and never printed."""
-    if DEPLOYMENT != 'round':
-        raise SystemExit('Only the round has a presenter passphrase (BLACK_FRIDAY_DEPLOYMENT=round)')
+    if DEPLOYMENT not in ('round', 'fourround'):
+        raise SystemExit('Only the round and the four-round game have a presenter passphrase (BLACK_FRIDAY_DEPLOYMENT=round or fourround)')
     if sys.stdin.isatty():
         value = getpass.getpass('Presenter passphrase (at least 8 characters): ')
         if value != getpass.getpass('Again: '):
@@ -359,21 +417,21 @@ def passphrase() -> None:
     print(f'Presenter passphrase updated (version {item["Version"]}); devices sign in again within 30 s', flush=True)
 
 
-def retain_web_logs(session) -> None:
+def retain_web_logs(session, function: str = WEB_FUNCTION) -> None:
     """Keep the Web Function's request logs seven days, like every other log group here. Idempotent."""
     logs = session.client('logs')
-    prefix = f'/aws/lambda/web/{WEB_FUNCTION}'
-    for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=prefix):
-        for group in page['logGroups']:
-            if group.get('retentionInDays') != 7:
-                logs.put_retention_policy(logGroupName=group['logGroupName'], retentionInDays=7)
-                print(f'Log group {group["logGroupName"]}: retention 7 days', flush=True)
+    for group in web_log_groups(logs, function):
+        if group.get('retentionInDays') != 7:
+            logs.put_retention_policy(logGroupName=group['logGroupName'], retentionInDays=7)
+            print(f'Log group {group["logGroupName"]}: retention 7 days', flush=True)
 
 
 def deploy(*, keep_failed: bool = False) -> None:
-    session = account_session()
     if DEPLOYMENT == 'rehearsal':
-        raise SystemExit('The rehearsal is frozen. Deploy it from tag rehearsal-fallback-2026-11-24b; use BLACK_FRIDAY_DEPLOYMENT=round for the audience round.')
+        raise SystemExit('The rehearsal is frozen. Deploy it from tag rehearsal-fallback-2026-11-24b; use BLACK_FRIDAY_DEPLOYMENT=fourround for the four-round game.')
+    if DEPLOYMENT == 'round':
+        raise SystemExit('The one-round game is frozen. Deploy it from tag round-fallback-2026-11-25 via git archive; use BLACK_FRIDAY_DEPLOYMENT=fourround for the four-round game.')
+    session = account_session()
     ssm = session.client('ssm')
     try:
         ssm.get_parameter(Name=PRESENTER_PARAMETER)
@@ -401,6 +459,87 @@ def deploy(*, keep_failed: bool = False) -> None:
     url = deploy_web(session, bucket, artifacts['web'][0])
     retain_web_logs(session)
     print(json.dumps({**stack_outputs(session, STACK), 'StageUrl': url}, indent=2))
+
+
+def deploy_web_only() -> None:
+    """Ship a page-only change: build and upload just the web package and point the game's Web Function at it.
+    No stack change, so the workflow, evaluator and image versions stay as they are."""
+    require_fourround('deploy-web')
+    session = account_session()
+    with TemporaryDirectory(prefix='black-friday-web-') as work:
+        artifacts = packages(Path(work), ('web',))
+        bucket = stack_outputs(session, ARTIFACTS)['Bucket']
+        key, path = artifacts['web']
+        session.client('s3').upload_file(str(path), bucket, key)
+    url = deploy_web(session, bucket, key)
+    retain_web_logs(session)
+    print(json.dumps({'StageUrl': url, 'WebKey': key}, indent=2))
+
+
+def require_fourround(command: str) -> None:
+    if DEPLOYMENT != 'fourround':
+        raise SystemExit(f'{command} serves the four-round game only (BLACK_FRIDAY_DEPLOYMENT=fourround)')
+
+
+def logs_buckets(session) -> list[str]:
+    """The retained logs code buckets, found by the name CloudFormation gave them."""
+    prefix = LOGS_STACK.lower() + '-packages-'
+    return [b['Name'] for b in session.client('s3').list_buckets()['Buckets'] if b['Name'].startswith(prefix)]
+
+
+def deploy_logs(*, keep_failed: bool = False) -> None:
+    """Deploy the presenter-only live log beside the running game, without touching the game's stacks or function."""
+    require_fourround('deploy-logs')
+    session = account_session()
+    # The game stack is read, never changed. Its function name is the workflow's own log-group and ARN stem.
+    outputs = stack_outputs(session, STACK)
+    workflow = outputs['WorkflowVersion'].split(':')[6]
+    table_arn = f'arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{outputs["RunTable"]}'
+    with TemporaryDirectory(prefix='black-friday-logs-') as work:
+        artifacts = packages(Path(work), LOGS_PACKAGES)
+        # cloudformation_deploy takes the template and the stack name, so this is a separate stack from the game's.
+        cloudformation_deploy(
+            'logs.yaml', LOGS_STACK, keep_failed=keep_failed, RunTableArn=table_arn,
+            WorkflowFunctionName=workflow, LogsFunctionName=LOGS_FUNCTION,
+            WebLogGroup=f'/aws/lambda/web/{WEB_FUNCTION}',
+            WorkflowLogGroup=f'/aws/lambda/{workflow}',
+            EvaluatorLogGroup=f'/aws/lambda/{WEB_FUNCTION}-evaluator',
+            ShopLogGroup=f'/aws/lambda-microvms/{WEB_FUNCTION}-shop',
+            PresenterParameter=PRESENTER_PARAMETER, PassphraseParameter=PASSPHRASE_PARAMETER,
+        )
+        logs_outputs = stack_outputs(session, LOGS_STACK)
+        key, path = artifacts['logs']
+        session.client('s3').upload_file(str(path), logs_outputs['Bucket'], key)
+    url = deploy_web(
+        session, logs_outputs['Bucket'], key, function=LOGS_FUNCTION, role=logs_outputs['LogsRole'],
+        environment={
+            'AWS_LAMBDA_NODEJS_ENTRYPOINT': 'index.mjs',
+            'RUN_TABLE': outputs['RunTable'], 'WORKFLOW_FUNCTION': workflow,
+            'LOG_GROUPS': ','.join([
+                f'/aws/lambda/web/{WEB_FUNCTION}', f'/aws/lambda/{workflow}',
+                f'/aws/lambda/{WEB_FUNCTION}-evaluator', f'/aws/lambda-microvms/{WEB_FUNCTION}-shop',
+            ]),
+            'PRESENTER_PARAMETER': PRESENTER_PARAMETER, 'PASSPHRASE_PARAMETER': PASSPHRASE_PARAMETER,
+            'AWS_ACCOUNT_ID': ACCOUNT,  # for Live Tail's log group ARNs
+        },
+        timeout=900, concurrency=64, limits=LOGS_ENDPOINT_LIMITS,
+    )
+    retain_web_logs(session, LOGS_FUNCTION)
+    print(json.dumps({'LogsUrl': url, 'LogsFunction': LOGS_FUNCTION, 'LogsStack': LOGS_STACK, **logs_outputs}, indent=2))
+
+
+def destroy_logs() -> None:
+    """Tear down only the live log: its Web Function and log groups, its stack, then its retained bucket."""
+    require_fourround('destroy-logs')
+    session = account_session()
+    remove_web(session, LOGS_FUNCTION)
+    if stack_exists(session, LOGS_STACK):
+        delete_stack(session, LOGS_STACK)
+    for name in logs_buckets(session):
+        bucket = session.resource('s3').Bucket(name)
+        bucket.object_versions.delete()
+        bucket.delete()
+        print(f'Deleted bucket {name}', flush=True)
 
 
 def stage_url(session) -> str:
@@ -433,9 +572,17 @@ def present(port: int, tailnet: bool = False) -> None:
     )['Parameter']['Value']
     local_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
     allowed_get = {'/', '/api/state', '/art/cloud-surge.png', '/art/cloud-surge.jpg', '/host', '/api/host/state', '/api/host/qr.svg', '/round.js', '/round.css'}
-    allowed_post = {f'/api/{action}' for action in ('launch', 'migrate', 'compare', 'reset')}
-    # Round only: these two carry a small JSON body (a team id; an empty object) and are no
-    # longer bodyless. The rehearsal's old code has neither route.
+    # The four-round pages load their script and styles as /round.js?v=<content hash> so a redeploy never pairs
+    # old JS with new HTML; the presenter's drawer polls /api/host/timeline.
+    versioned_asset = re.compile(r'/round\.(?:js|css)\?v=[0-9a-zA-Z_-]{1,64}')
+    # The four-round game's presenter actions all live under /api/host/ (host_auth's rule). Start, Close and Reset
+    # are bodyless; remove and logout carry a small JSON body. The older deployments keep their own routes.
+    four = DEPLOYMENT == 'fourround'
+    if four:
+        allowed_get.add('/api/host/timeline')
+    allowed_post = {f'/api/host/{action}' for action in ('start', 'close', 'reset')} if four else {
+        f'/api/{action}' for action in ('launch', 'migrate', 'compare', 'reset')
+    }
     with_body = {'/api/host/remove', '/api/host/logout'} if credentials is None else set()
     allowed_post |= with_body
     http = build_opener(NoRedirect)
@@ -467,14 +614,14 @@ def present(port: int, tailnet: bool = False) -> None:
                 ):
                     self.send_error(403)
                     return
-            elif self.path not in allowed_get:
+            elif self.path not in allowed_get and not (four and versioned_asset.fullmatch(self.path)):
                 self.send_error(404)
                 return
             body = self.rfile.read(length) if length > 0 else b''
             headers = {'X-Amz-Content-SHA256': sha256(body).hexdigest()}
             if body:
                 headers['Content-Type'] = 'application/json'
-            for name in ('X-Rehearsal-Action', 'X-Rehearsal-Run'):
+            for name in ('X-Rehearsal-Action', 'X-Rehearsal-Run', 'X-Rehearsal-Round'):
                 if value := self.headers.get(name):
                     headers[name] = value
             url = endpoint + self.path
@@ -554,8 +701,13 @@ def main() -> None:
     package.add_argument('output', type=Path)
     deploy_command = commands.add_parser('deploy', help='Deploy the private rehearsal into your AWS account')
     deploy_command.add_argument('--keep-failed', action='store_true', help='Preserve failed stack resources for diagnosis')
+    logs_command = commands.add_parser(
+        'deploy-logs', help='Deploy the presenter-only live log as its own Web Function and stack (fourround only)')
+    logs_command.add_argument('--keep-failed', action='store_true', help='Preserve failed stack resources for diagnosis')
+    commands.add_parser('deploy-web', help="Deploy only the game's Web Function code, no stack change (fourround only)")
+    commands.add_parser('destroy-logs', help='Delete only the live log: its function, log groups, stack and bucket')
     stage = commands.add_parser('present', help='Proxy to the selected deployment (IAM rehearsal, keyed round)')
-    stage.add_argument('--port', type=int, default=8767 if DEPLOYMENT == 'rehearsal' else 8768)
+    stage.add_argument('--port', type=int, default={'rehearsal': 8767, 'round': 8768, 'fourround': 8770}[DEPLOYMENT])
     stage.add_argument('--tailnet', action='store_true',
                        help="Also publish the presenter page on this Mac's tailnet name, for its owner only")
     commands.add_parser('passphrase', help="Set the round's presenter passphrase (prompt, or stdin when piped)")
@@ -563,7 +715,13 @@ def main() -> None:
     teardown.add_argument('--artifacts', action='store_true',
                           help='Also delete the artifact bucket (all versions) and its stack')
     args = parser.parse_args()
-    if args.command == 'deploy':
+    if args.command == 'deploy-logs':
+        deploy_logs(keep_failed=args.keep_failed)
+    elif args.command == 'destroy-logs':
+        destroy_logs()
+    elif args.command == 'deploy-web':
+        deploy_web_only()
+    elif args.command == 'deploy':
         deploy(keep_failed=args.keep_failed)
     elif args.command == 'passphrase':
         passphrase()
@@ -572,7 +730,7 @@ def main() -> None:
     elif args.command == 'destroy':
         destroy(artifacts=args.artifacts)
     else:
-        packages(args.output)
+        packages(args.output, GAME_PACKAGES + LOGS_PACKAGES)
 
 
 if __name__ == '__main__':

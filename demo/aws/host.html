@@ -1,16 +1,31 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLACK FRIDAY · Presenter</title><link rel="stylesheet" href="/round.css"><script src="/round.js" defer></script></head>
 <body data-host="true"><main>
-<header class="hero"><p class="kicker">Presenter controls · AWS User Group Adelaide</p><h1>BLACK FRIDAY</h1><p>One checkpoint. Every team. Real Lambda.</p></header>
-<section id="signin" class="panel" hidden><h2>Presenter sign-in</h2><p class="muted">Only the presenter can start the round. Players never see this.</p><form id="login"><label>Passphrase<input id="passphrase" type="password" autocomplete="current-password" required></label><button>Sign in</button></form><p id="login-error" class="red" role="status"></p></section>
-<div id="panel" hidden><div class="host-grid"><section>
-<ol class="timeline"><li id="stage-launch">1 · Launch</li><li id="stage-migrate">2 · Deploy</li><li id="stage-compare">3 · Shoppers return</li></ol>
+<header class="hero"><p class="kicker">Presenter controls · AWS User Group Adelaide</p><h1>BLACK FRIDAY</h1><p>Four rounds. Every phone is a shop.</p></header>
+<section id="signin" class="panel" hidden><h2>Presenter sign-in</h2><p class="muted">Only the presenter can run the game. Players never see this.</p><form id="login"><label>Passphrase<input id="passphrase" type="password" autocomplete="current-password" required></label><button>Sign in</button></form><p id="login-error" class="red" role="status"></p></section>
+<div id="panel" hidden><div class="host-grid"><section class="host-main">
+<ol id="stages" class="timeline"></ol>
 <h2 id="headline">Connecting to the arena…</h2><p id="progress" class="muted"></p><p id="error" role="status"></p>
-<div class="controls"><button id="launch" type="button">1 · Open round / Run Launch</button><button id="migrate" type="button">2 · Close round and deploy every release</button><button id="compare" type="button">3 · Send the shoppers back</button></div>
-<button id="reset" class="secondary" type="button" hidden>Reset to a fresh open round</button>
-<p class="execution">Durable execution <code id="execution">Not started</code></p><p id="checkpoint" class="hint" hidden></p>
-</section><aside class="panel join-card"><h2>Scan. Join. Pick.</h2><img id="qr" alt="QR code to the public player page" width="150" height="150"><p><a id="public-url" href="#"></a></p><p>Everyone in the room, plus House A and House B.<br>Phones need no AWS credentials.</p></aside></div>
-<section id="scoreboard" hidden><h2>Profit after the AWS bill</h2><p class="muted">Modelled dollars. Top 10. Ties share a rank.</p><div id="scores" class="scores"></div><p id="more" class="muted"></p><p class="hint">Profit = $9 Launch + the shop's profit on the Black Friday wave (nothing sold if the migration broke, so just its cost) + $10 × Maya's sales − $2 migration. One shared retention draw: 42.</p></section>
-<section class="panel"><h2>Live teams</h2><p id="capacity" class="muted"></p><ul id="teams"></ul></section>
+<div class="controls"><button id="start" type="button">Start</button><button id="close" type="button">Close round</button><button id="reset" class="secondary" type="button">Reset</button><button id="explain" class="secondary" type="button" aria-pressed="true">Explanations: on</button></div>
+<details class="callout"><summary>What runs where tonight</summary><ul class="callout-body">
+<li><b>Web Function</b>: this page, every phone and the game API. Start and Close are presenter-only calls to it.</li>
+<li><b>Durable Function</b>: the game's memory, one execution per game. It waits for each Close without running or billing anything, then plans, scores and publishes the round.</li>
+<li><b>Event Function</b>: the judge. Five runs, all before Round 1: Launch, two migrations, two cart checks. Each one drives a MicroVM.</li>
+<li><b>MicroVMs</b>: the real PHP shop and PostgreSQL, one tiny VM per stage, with no AWS role, destroyed when the stage ends.</li>
+<li><b>Managed Instances</b>: not deployed. Christmas's "Commit" option is priced like it: modelled, not measured.</li>
+</ul></details>
+<section id="round-section" class="panel"><p id="round-weeks" class="kicker"></p><h2 id="round-title"></h2><p id="round-forecast"></p><p id="round-market" class="market"></p><div id="round-options" class="host-options"></div><details class="callout"><summary>How this round uses Lambda</summary><p id="round-callout" class="callout-body"></p></details></section>
+<section id="results-section" class="panel" hidden><h2 id="results-title"></h2><p id="market-draw" class="market"></p><div id="option-summary" class="summary"></div><details class="callout"><summary>The customer rules</summary><ul class="callout-body">
+<li>New customers arrive every round: the forecast times the market draw, give or take 10% per shop. Last round's returning customers come too.</li>
+<li>A shop serves them fast up to its capacity, slowly in a narrow band above that, and turns the rest away.</li>
+<li>Every verified sale, fast or slow, earns $10. Profit is $10 × sales − the shop's modelled AWS cost − refunds.</li>
+<li>Next round, 75% of fast customers come back, 50% of slow ones and 20% of those turned away. Only 5% of anyone whose cart was lost or who was charged twice.</li>
+</ul></details></section>
+<section id="scoreboard" hidden><h2 id="board-title">Board</h2><div id="scores" class="scores"></div><p id="more" class="muted"></p></section>
+<section id="evidence-section" class="panel" hidden><h2>Evidence</h2><div id="evidence" class="evidence"></div><details class="callout"><summary>What "real" means</summary><p class="callout-body">These results came from real MicroVMs before Round 1. The judge checked that the order was stored and that the payment went through exactly once: an HTTP 200 alone doesn't count. Careful copied every table and kept Maya's cart; fast skipped the carts and lost it. Everything else on the board is modelled from these.</p></details></section>
+<p class="execution">Durable execution <code id="execution">Not started</code></p>
+</section><aside class="host-side"><section class="panel join-card"><h2>Scan. Join. Play.</h2><button id="qr-open" class="qr-open" type="button" title="Show the QR code full screen"><img id="qr" alt="QR code to the public player page" width="200" height="200"></button><p><a id="public-url" href="#"></a></p><button id="qr-full" class="secondary" type="button">Full screen</button><details class="callout"><summary>What a phone talks to</summary><p class="callout-body">One public Web Function: join, pick, and read the game state every few seconds. A phone never talks to a shop or a VM; only the judge does.</p></details></section>
+<section class="panel"><h2>Players</h2><p id="capacity" class="muted"></p><ul id="teams"></ul></section></aside></div>
+<details id="behind" class="panel behind"><summary>Behind the scenes</summary><p class="muted behind-note">What the game is doing on AWS, as it happens. Click a line for details.</p><details class="callout"><summary>Where these lines come from</summary><p class="callout-body">The game writes them itself as it goes: the Durable workflow adds one line per step and the Web Function one per presenter action. So the list is exact and shows up within a second or two. The VM and PHP detail, and AWS's own record of each Durable step, are on the hosted log page.</p></details><div class="behind-filter"><div id="behind-tags" class="behind-tags" role="group" aria-label="Show lines by tag"></div><input id="behind-search" class="behind-search" type="search" placeholder="Filter lines" aria-label="Filter lines" autocomplete="off" spellcheck="false"></div><div id="behind-log" class="behind-log" role="log" aria-live="off"></div><p id="behind-status" class="muted behind-status" role="status"></p></details>
 <button id="logout" class="secondary" type="button">Sign out</button></div>
-</main></body></html>
+<div id="qr-overlay" class="qr-overlay" role="dialog" aria-modal="true" aria-label="Join the game" hidden><p class="qr-overlay-title">Scan. Join. Play.</p><img id="qr-big" class="qr-big" alt="QR code to the public player page"><p id="qr-big-url" class="qr-big-url"></p><p class="qr-overlay-hint">Esc or click to close</p></div>

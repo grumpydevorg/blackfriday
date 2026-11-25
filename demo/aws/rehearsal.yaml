@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: BLACK FRIDAY AWS rehearsal (two real PHP migrations from one durable checkpoint).
+Description: BLACK FRIDAY AWS game (real PHP launch and growth migrations, then modelled rounds). One template for every deployment.
 Parameters:
   Prefix: {Type: String, Default: black-friday-round}
   PresenterParameter: {Type: String, Default: /black-friday/round/presenter-key}
@@ -99,6 +99,9 @@ Resources:
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt WorkerLogs.Arn
+              # No logs permission for the VM's own log group: RunMicrovm cannot enable VM logging (CloudWatch
+              # logging needs an executionRoleArn, and the VM keeps no AWS role). The evaluator fetches the VM's
+              # buffered log over /control/log and prints it to its own log group (WorkerLogs) instead.
   Evaluator:
     Type: AWS::Lambda::Function
     Properties:
@@ -164,6 +167,9 @@ Resources:
       LoggingConfig: {LogGroup: !Ref WorkflowLogs}
       Timeout: 90
       MemorySize: 512
+      # The four-round game waits on one callback per round (four waits after the real Launch and growth steps);
+      # 48 hours covers the whole event. Each round's results are separate items (pk = results#<run>#<round>) in the
+      # Runs table: the workflow writes them with UpdateItem and the Web Function reads them with GetItem.
       DurableConfig: {ExecutionTimeout: 172800, RetentionPeriodInDays: 7}
       Environment:
         Variables:

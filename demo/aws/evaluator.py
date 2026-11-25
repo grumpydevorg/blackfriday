@@ -7,7 +7,8 @@ import re
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
-from time import monotonic, sleep
+from pathlib import Path
+from time import monotonic, sleep, time
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
@@ -16,14 +17,26 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-import scoring
-
 MAX_ARTIFACT = 1024 * 1024
 VM_LIFESPAN = 120
 PRICE = 2500
-MARGIN = scoring.MARGIN
-LAUNCH_COST = scoring.LAUNCH_COST
-RETURN_DRAW = scoring.RETURN_DRAW
+LEVELS = ('debug', 'info', 'warn', 'error')
+ACTIONS = ('launch', 'migrate', 'compare')
+
+
+def real_options() -> dict[str, str]:
+    """The options whose evidence is really run in a MicroVM, as option id -> migration kind, from rounds.json (the
+    one table the game, the workflow and this worker share; the worker package ships it). The kind follows what the
+    recorded evidence says the migration does to the saved cart: kept -> `preserve` (copies every table), lost ->
+    `omit` (skips carts). The schema and ledger ids reuse the option id."""
+    table = json.loads(Path(__file__).with_name('rounds.json').read_text())
+    return {
+        option['id']: 'preserve' if table['recorded_evidence'][option['id']]['cart_kept'] else 'omit'
+        for rnd in table['rounds'] for option in rnd['options'] if option['evidence'] == 'real'
+    }
+
+
+OPTIONS = real_options()
 HEX32 = re.compile(r'[0-9a-f]{32}')
 AWS_CONFIG = Config(connect_timeout=3, read_timeout=6, retries={'total_max_attempts': 2})
 
@@ -45,6 +58,63 @@ def request_budget(deadline: float, maximum: float) -> float:
 
 def pause(deadline: float) -> None:
     sleep(request_budget(deadline, 0.4))
+
+
+def seconds(started: float) -> str:
+    return f'{monotonic() - started:.2f} s'
+
+
+def millis(started: float) -> int:
+    return round((monotonic() - started) * 1000)
+
+
+# Anything URL- or receipt-shaped. The VM already redacts before it truncates (vm_runtime.redact); this is the same
+# rule applied again here, in case a VM entry still carries one. It changes nothing in a clean entry.
+SECRET = re.compile(r'https?://\S+|\S*X-Amz-\S*|[0-9a-fA-F]{32,}')
+VM_FIELDS = {'seq', 't', 'kind', 'level', 'run', 'action', 'option', 'msg'}
+PHP_FIELDS = {'method', 'path', 'status', 'ms'}
+
+
+def number(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def vm_entry(raw: object) -> dict | None:
+    """One VM log entry exactly as the VM wrote it, or None when it is not a valid one: the field set, types and
+    closed values of the contract. A stage entry may add `ms`; a PHP entry always has method, path, status, ms."""
+    if not isinstance(raw, dict):
+        return None
+    php = raw.get('kind') == 'php'
+    allowed = VM_FIELDS | PHP_FIELDS if php else VM_FIELDS | {'ms'}
+    if not VM_FIELDS <= set(raw) <= allowed or (php and not PHP_FIELDS <= set(raw)):
+        return None
+    run, option, message = raw['run'], raw['option'], raw['msg']
+    valid = (
+        number(raw['seq']) and number(raw['t']) and raw['kind'] in ('stage', 'php') and raw['level'] in LEVELS
+        and isinstance(run, str) and re.fullmatch(r'[0-9a-f]{8}', run) and raw['action'] in ACTIONS
+        and (option is None or (isinstance(option, str) and option in OPTIONS)) and isinstance(message, str)
+        and len(message) <= 200
+        and number(raw.get('ms', 0))
+    )
+    if valid and php:
+        valid = (
+            isinstance(raw['method'], str) and re.fullmatch(r'[A-Z]{3,7}', raw['method'])
+            and isinstance(raw['path'], str) and raw['path'].startswith('/') and '?' not in raw['path']
+            and number(raw['status'])
+        )
+    if not valid:
+        return None
+    entry = {**raw, 'msg': SECRET.sub('<redacted>', message)[:200]}
+    if php:
+        entry['path'] = SECRET.sub('<redacted>', raw['path'])
+    return entry if entry != raw else raw
+
+
+def relay_lines(entries: list) -> tuple[list[str], int]:
+    """`[VM] <json>` for each valid entry, in the order the VM numbered them, and how many were dropped as invalid."""
+    valid = [entry for entry in map(vm_entry, entries) if entry is not None]
+    valid.sort(key=lambda entry: entry['seq'])
+    return [f'[VM] {json.dumps(entry, separators=(",", ":"))}' for entry in valid], len(entries) - len(valid)
 
 
 @dataclass(frozen=True)
@@ -87,7 +157,7 @@ class Store:
     def require(self, key: str) -> bytes:
         result = self.get(key)
         if result is None:
-            raise RuntimeError(f'Missing prerequisite: {key}')
+            raise RuntimeError(f'Missing prerequisite: {key.split("/", 2)[-1]}')  # without the run id
         return result
 
     def put_once(self, key: str, body: bytes, content_type: str) -> None:
@@ -124,6 +194,8 @@ class Fleet:
             clientToken=f'{identity}-{uuid4().hex}', maximumDurationInSeconds=VM_LIFESPAN,
             ingressNetworkConnectors=[self.connector + 'HTTP_INGRESS'],
             egressNetworkConnectors=[self.connector + 'INTERNET_EGRESS'],
+            # VM logging to CloudWatch is not possible: RunMicrovm refuses it without an executionRoleArn, and the VM
+            # must keep no AWS role. The VM keeps its own log and the evaluator relays it (Rehearsal.relay).
             logging={'disabled': {}},
         )
 
@@ -180,10 +252,11 @@ class Fleet:
 
 
 class Shop:
-    def __init__(self, endpoint: str, token: str, deadline: float) -> None:
+    def __init__(self, endpoint: str, token: str, deadline: float, emit=None) -> None:
         self.base = endpoint.rstrip('/')
         self.token = token
         self.deadline = deadline
+        self.emit = emit  # called with (msg, level, ms) per shop check; never given a body or a header
 
     def request(self, path: str, body: dict | None = None, intention: str = '', timeout: float = 7) -> Reply:
         headers = {'X-aws-proxy-auth': self.token, 'X-aws-proxy-port': '8080'}
@@ -207,7 +280,22 @@ class Shop:
             )
 
     def check(self, path: str, status: int = 200, **kwargs) -> Reply:
-        return self.request(path, **kwargs).expect(status, path)
+        started = monotonic()
+        reply = self.request(path, **kwargs)
+        if self.emit and not path.startswith('/control/'):
+            ms = millis(started)
+            self.emit(f'check {path}: HTTP {reply.status} in {ms} ms'
+                      + ('' if reply.status == status else f' (expected {status})'),
+                      'info' if reply.status == status else 'error', ms)
+        return reply.expect(status, path)
+
+    def log(self) -> list:
+        """The VM's own log entries. Best effort after the work deadline: the VM must be read before it is terminated."""
+        self.deadline = max(self.deadline, monotonic() + 6)
+        entries = self.request('/control/log', timeout=5).expect(200, '/control/log').json()['entries']
+        if not isinstance(entries, list):
+            raise ValueError('Unexpected VM log')
+        return entries
 
     def cart(self, cart: str) -> Reply:
         return self.check('/cart', body={'cart_id': cart, 'sku': 'cloud-mug'})
@@ -218,8 +306,8 @@ class Shop:
 
 @dataclass(frozen=True)
 class Rehearsal:
-    """One stage. After Close a stage is judged once per option in use, never once per team:
-    `team` is the option id ('lift', 'scale' or 'refactor'), which doubles as the schema and ledger id."""
+    """One stage: the Launch shop, or a growth migration of one option ('careful' or 'fast') and its check.
+    `team` is the option id, which doubles as the schema and ledger id; `kind` is its migration kind."""
 
     id: str
     action: str
@@ -230,17 +318,39 @@ class Rehearsal:
     def parse(cls, event: dict) -> 'Rehearsal':
         if not isinstance(event, dict):
             raise TypeError('Event must be an object')
-        run_id, action = event.get('id'), event.get('action')
-        team, kind = event.get('team'), event.get('kind')
+        run_id, action, option = event.get('id'), event.get('action'), event.get('option')
         if not isinstance(run_id, str) or not HEX32.fullmatch(run_id):
             raise ValueError('Invalid run id')
         if action == 'launch' and set(event) == {'id', 'action'}:
             return cls(run_id, action, '', '')
-        if action in ('migrate', 'compare') and set(event) == {'id', 'action', 'team', 'kind'} and (
-            team in scoring.OPTIONS and kind == scoring.KIND
-        ):
-            return cls(run_id, action, team, kind)
+        if action in ('migrate', 'compare') and set(event) == {'id', 'action', 'option'} and option in OPTIONS:
+            return cls(run_id, action, option, OPTIONS[option])
         raise ValueError('Invalid action, option or unexpected event field')
+
+    def event(self, msg: str, level: str = 'info', ms: int | None = None) -> None:
+        """One evaluator line: `[EVENT] <json>` with t, level, action, option, step, msg and, for a timed step, ms."""
+        if level not in LEVELS:
+            raise ValueError(f'Invalid log level {level}')
+        entry = {
+            't': round(time() * 1000), 'level': level, 'action': self.action, 'option': self.team or None,
+            'step': self.step, 'msg': msg[:200], **({} if ms is None else {'ms': ms}),
+        }
+        print(f'[EVENT] {json.dumps(entry, separators=(",", ":"))}', flush=True)
+
+    def took(self, msg: str, started: float, level: str = 'info') -> None:
+        self.event(f'{msg} in {seconds(started)}', level, millis(started))
+
+    def relay(self, shop: Shop) -> None:
+        """Print the VM's buffered log entries unchanged, as `[VM] <json>`, in order (MicroVM logging to CloudWatch
+        is not possible). Never raises."""
+        try:
+            lines, dropped = relay_lines(shop.log()[-500:])
+            for line in lines:
+                print(line, flush=True)
+            if dropped:
+                self.event(f'{dropped} VM log entries were not valid and were dropped', 'warn')
+        except Exception as error:
+            self.event(f'VM log not read: {type(error).__name__}', 'warn')
 
     @property
     def root(self) -> str:
@@ -293,7 +403,9 @@ class Rehearsal:
                 else (f'migrate-{self.team}', 'dump', 'branch.dump')
             )
             prior = json.loads(store.require(self.result_key(step)))
+            started = monotonic()
             fleet.finish(prior['vm_id'], deadline)
+            self.took('previous stage VM terminated', started)
             digest = prior[field]
             artifact = store.require(self.artifact_key(step, digest, filename))
             if sha256(artifact).hexdigest() != digest:
@@ -322,57 +434,50 @@ class Rehearsal:
         order = self.verify_order(store, shop, 'launch')
         digest = sha256(artifact).hexdigest()
         store.put_once(self.artifact_key(self.step, digest, 'checkpoint.sqlite'), artifact, 'application/octet-stream')
+        self.event(f'artifact saved: {len(artifact) // 1024} KB (SQLite checkpoint)')
         return {'checkpoint': digest, 'launch': {
             'checkout_statuses': [lost.status, retry.status], 'charges_before_retry': charged,
             'charges': self.observe_charge(store, 'launch'), 'verified_sales': 1, 'cart_status': cart.status,
-            'order_status': order.status, 'profit_cents': MARGIN - LAUNCH_COST,
+            'order_status': order.status,
         }}
 
-    def capacity(self) -> dict:
-        """Score this option on the Virtual RDS wave. Pure Python: no MicroVM involved."""
-        from virtual_rds import Plan, run_round
-
-        architecture = scoring.OPTIONS[self.team]['architecture']
-        plan = Plan(architecture['storage'], architecture['replicas'], architecture['cache'])
-        result, _ = run_round(plan, RETURN_DRAW)
-        return {
-            'storage': plan.storage, 'replicas': plan.replicas, 'cache': plan.cached,
-            'verified_sales': result['verified_sales'], 'wave_verified_sales': result['wave_verified_sales'],
-            'wave_storage_rejections': result['wave_storage_rejections'],
-            'cost_cents': result['modeled_cost_cents'], 'profit_cents': result['profit_cents'],
-        }
-
-    def growth(self, store: Store, shop: Shop, capacity: dict | None) -> dict:
+    def growth(self, store: Store, shop: Shop) -> dict:
         health = shop.check('/health')
         history = self.verify_order(store, shop, 'launch')
         if health.json().get('database') != 'pgsql':
             raise RuntimeError('Growth did not use PostgreSQL')
-        branch = {
-            'kind': self.kind, 'schema': f'bf_{self.id}_{self.team}', 'database': 'pgsql',
-            'health_status': health.status, 'history_status': history.status,
-        }
         if self.action == 'migrate':
             artifact = shop.check('/control/artifact').body
             digest = sha256(artifact).hexdigest()
             store.put_once(self.artifact_key(self.step, digest, 'branch.dump'), artifact, 'application/octet-stream')
-            return {**branch, 'dump': digest}
+            self.event(f'artifact saved: {len(artifact) // 1024} KB (pg_dump)')
+            return {
+                'option': self.team, 'kind': self.kind, 'schema': f'bf_{self.id}_{self.team}', 'database': 'pgsql',
+                'health_status': health.status, 'history_status': history.status, 'dump': digest,
+            }
 
-        # Every option really migrates every table, so Maya's cart survives in every shop.
-        cart = shop.check('/cart/cart-saved')
-        checkout = shop.checkout('growth-mug', 'cart-saved')
-        self.verify_order(store, shop, self.team)
-        if checkout.elapsed is None:
-            raise RuntimeError('Missing checkout timing evidence')
-        probability = scoring.return_probability(checkout.elapsed)
+        # `preserve` migrated the carts, so Maya checks out; `omit` did not, so her cart is gone. That
+        # missing cart is the expected result of omit, not an error, and nothing is sold or charged.
+        preserve = self.kind == 'preserve'
+        cart = shop.check('/cart/cart-saved', 200 if preserve else 404)
+        checkout = shop.checkout('growth-mug', 'cart-saved') if preserve else None
+        if checkout is not None:
+            self.verify_order(store, shop, self.team)
+            if checkout.elapsed is None:
+                raise RuntimeError('Missing checkout timing evidence')
+            sold = 1
+        else:
+            shop.check('/orders/order-growth-mug', 404)
+            sold = 0
         charges = self.observe_charge(store, self.team)
-        if charges != 1:
+        if charges != sold:
             raise RuntimeError('Growth ledger does not agree with verified sales')
-        maya = scoring.maya_sales(1, probability)
-        # No team's roll is known here: the workflow applies each team's own break on top.
-        return {**branch, 'cart_status': cart.status, 'checkout_status': checkout.status,
-                'checkout_ms': checkout.elapsed, 'charges': charges, 'verified_sales': 1,
-                'return_probability': probability, 'returns_next_week': RETURN_DRAW < probability,
-                'maya_sales': maya, 'architecture': capacity}
+        return {
+            'option': self.team, 'kind': self.kind, 'cart_status': cart.status, 'cart_kept': cart.status == 200,
+            'checkout_status': checkout.status if checkout else None,
+            'checkout_ms': checkout.elapsed if checkout else None, 'charges': charges, 'verified_sales': sold,
+            'health_status': health.status, 'history_status': history.status,
+        }
 
 
 def handler(event: dict, context) -> dict:
@@ -384,23 +489,40 @@ def handler(event: dict, context) -> dict:
     key = stage.result_key(stage.step)
     candidate = store.get(key)
     if candidate is None:
-        architecture = stage.capacity() if stage.action == 'compare' else None
-        data = stage.setup(store, fleet, work_deadline)
-        if stage.action in ('launch', 'compare'):
-            phase = stage.team or stage.action
-            data.update(store.payment_capability(stage.ledger_key(phase), stage.receipt(phase)))
-        request_budget(work_deadline, 1)
-        vm = fleet.run(f'{stage.id}-{stage.step}')
+        try:
+            data = stage.setup(store, fleet, work_deadline)
+            if stage.action == 'launch' or (stage.action == 'compare' and stage.kind == 'preserve'):
+                phase = stage.team or stage.action
+                data.update(store.payment_capability(stage.ledger_key(phase), stage.receipt(phase)))
+            request_budget(work_deadline, 1)
+            vm = fleet.run(f'{stage.id}-{stage.step}')
+        except Exception as error:
+            stage.event(f'stage failed before a VM started: {type(error).__name__}', 'error')
+            raise
         vm_id = vm['microvmId']
+        requested = monotonic()
+        stage.event(f'VM requested: {vm_id} (run {stage.id[:8]})')
+        shop = None
         try:
             shop = fleet.connect(vm, work_deadline)
+            shop.emit = stage.event
+            stage.took('VM running, endpoint ready', requested)
+            sent = monotonic()
             shop.check('/control/setup', body=data, timeout=35)
-            result = stage.launch(store, shop) if stage.action == 'launch' else stage.growth(store, shop, architecture)
+            stage.took('setup sent, VM configured', sent)
+            result = stage.launch(store, shop) if stage.action == 'launch' else stage.growth(store, shop)
             # Persist the evaluated candidate before termination. A retry can finish
             # cleanup and return it without doing a new checkout or a new migration.
             store.put_once(key, json.dumps({**result, 'vm_id': vm_id}).encode(), 'application/json')
+        except Exception as error:
+            stage.event(f'stage failed: {type(error).__name__}', 'error')
+            raise
         finally:
+            if shop is not None:
+                stage.relay(shop)
+            terminating = monotonic()
             fleet.finish(vm_id, cleanup_deadline)
+            stage.took('VM terminated', terminating)
         candidate = store.require(key)
         result = json.loads(candidate)
         if result['vm_id'] != vm_id:
@@ -408,5 +530,6 @@ def handler(event: dict, context) -> dict:
     else:
         result = json.loads(candidate)
         fleet.finish(result['vm_id'], cleanup_deadline)
+        stage.event('result already saved, VM terminated')
     result.pop('dump', None)  # The workflow exposes the branch result, not its storage details.
     return {**result, 'vm_state': 'terminated'}
