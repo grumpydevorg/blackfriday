@@ -135,6 +135,32 @@ closing.
 Each callback waits at most 23 hours, so click Start less than 23 hours before
 the first Close, and keep the gap between Closes under 23 hours.
 
+### Live log for the room (fourround)
+
+```sh
+cd demo
+export BLACK_FRIDAY_AWS_ACCOUNT=<account> BLACK_FRIDAY_AWS_PROFILE=<profile>
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/watch.py | tee -a ~/bf-watch.log
+```
+
+[`watch.py`](../../demo/aws/watch.py) prints one coloured line per event in
+Adelaide time, at most 120 characters. It only reads AWS, and it refuses to run
+against any account but the game's.
+
+| Tag | Source |
+|:--|:--|
+| `GAME` | The arena item, read every second: Reset, phase and round changes, joins, picks so far, and each round's results (market draw, best option, top player). |
+| `DURABLE` | The execution's history, read every 2 s: each operation once (steps, invokes, the parallel migrations and checks, callbacks waiting and Closes received), with elapsed time, and each suspension between invocations. |
+| `MICROVM` | The Launch, careful and fast results once the workflow publishes them. MicroVM runs have CloudWatch logging disabled, so their own output never reaches the log group; that group only carries image builds and errors. |
+| `EVENT`, `WORKFLOW` | Event judge and Durable invocation durations and cold starts. |
+| `WEB` | Requests per minute, environments, peak concurrency, cold starts and errors, summed each minute from the Web Function's `platform.invokeSummary` records. |
+| `ERROR` | Error lines, trimmed, from any of those sources. |
+
+Logs come from CloudWatch Logs Live Tail, which reconnects when a session ends
+(sessions last at most 3 hours) or drops. When the SSO session expires it prints
+one red line with the `aws sso login` command and retries every 30 seconds.
+It never prints token hashes, tokens or cookies.
+
 ## What runs
 
 ```mermaid
