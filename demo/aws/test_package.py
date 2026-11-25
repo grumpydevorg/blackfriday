@@ -514,3 +514,62 @@ def test_omit_compare_takes_no_payment_capability_and_preserve_compare_requires_
     for kind in ('', 'lift', None):
         with pytest.raises(vm_runtime.BadRequest):
             vm_runtime.Runtime().setup({**omit, 'kind': kind})
+
+
+# --- MicroVM logs ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('group, expected', [
+    ('/aws/lambda-microvms/black-friday-four-shop', {'cloudWatch': {'logGroup': '/aws/lambda-microvms/black-friday-four-shop'}}),
+    (None, {'disabled': {}}),
+])
+def test_vm_logs_go_to_the_image_log_group_only_when_the_template_names_it(evaluator, monkeypatch, group, expected):
+    monkeypatch.setenv('IMAGE_ARN', 'arn:aws:lambda:ap-southeast-2:123456789012:microvm-image:shop')
+    monkeypatch.setenv('IMAGE_VERSION', '1.0')
+    if group:
+        monkeypatch.setenv('VM_LOG_GROUP', group)
+    else:
+        monkeypatch.delenv('VM_LOG_GROUP', raising=False)
+    calls = []
+    monkeypatch.setattr(evaluator.boto3, 'client', lambda *a, **k: type('C', (), {
+        'run_microvm': lambda self, **kw: calls.append(kw) or {'microvmId': 'vm-1'}})())
+    evaluator.Fleet('ap-southeast-2').run('run-step')
+    assert calls[0]['logging'] == expected
+    assert 'executionRoleArn' not in calls[0], 'the VM keeps no AWS role'
+
+
+def test_the_template_names_the_vm_log_group_and_lets_the_worker_write_it():
+    template = (Path(__file__).with_name('rehearsal.yaml')).read_text()
+    assert 'VM_LOG_GROUP: !Ref ImageLogs' in template
+    assert 'Resource: !GetAtt ImageLogs.Arn' in template
+
+
+def test_vm_stage_lines_shorten_the_run_id_and_never_carry_the_payment_capability(runtime, capsys, monkeypatch):
+    vm_runtime, instance = runtime
+    monkeypatch.setattr(vm_runtime, 'APP', Path(__file__).resolve().parent.parent)   # demo/schema.sql
+    launch = {'id': RUN, 'action': 'launch', 'pay_url': 'https://bucket.s3.amazonaws.com/x?X-Amz-Signature=secret',
+              'receipt': 'c' * 32}
+    monkey_ledger = vm_runtime.ledger_url
+    vm_runtime.ledger_url = lambda value: value
+    try:
+        instance.setup(launch)
+        vm_runtime.say(f'schema bf_{RUN}_careful')
+    finally:
+        vm_runtime.ledger_url = monkey_ledger
+    out = capsys.readouterr().out
+    assert 'setup received: launch' in out and 'SQLite database created in' in out
+    assert RUN not in out and RUN[:8] in out
+    assert 'X-Amz-Signature' not in out and 'c' * 32 not in out and 'https://' not in out
+
+
+def test_php_access_lines_are_filtered_but_errors_are_kept():
+    sys.modules.pop('vm_runtime', None)
+    import vm_runtime
+    access = [
+        '[Wed Nov 25 03:40:01 2026] 127.0.0.1:51234 Accepted',
+        '[Wed Nov 25 03:40:01 2026] 127.0.0.1:51234 [200]: POST /checkout',
+        '[Wed Nov 25 03:40:01 2026] 127.0.0.1:51234 Closing',
+        '[Wed Nov 25 03:40:00 2026] PHP 8.4.11 Development Server (http://127.0.0.1:8081) started',
+    ]
+    assert all(vm_runtime.PHP_ACCESS.search(line) for line in access)
+    assert not vm_runtime.PHP_ACCESS.search('PHP Warning:  Undefined variable $cart in /app/shop.php on line 40')

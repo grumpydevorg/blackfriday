@@ -490,9 +490,13 @@ def handle_log(tag: str, message: str) -> None:
             emit('EVENT', message)
         return
     if tag == 'MICROVM':
+        if isinstance(record, dict):   # a structured wrapper: show the line it carries
+            message = str(record.get('message') or record.get('log') or message).strip()
         if message.startswith('#') and not ERRORISH.search(message):
             return   # image build output
-        emit('ERROR' if ERRORISH.search(message) else 'MICROVM', message)
+        # vm_runtime.py lines look like "[1a2b3c4d migrate careful] PHP shop ready in 1.92 s".
+        bad = ERRORISH.search(message) or ' failed with code ' in message or 'php: PHP ' in message
+        emit('ERROR' if bad else 'MICROVM', message)
         return
     if ERRORISH.search(message):
         emit('ERROR', f'{tag.lower()}: {message}')

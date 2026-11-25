@@ -229,6 +229,21 @@ DynamoDB, one on-demand table:
 | `arena` | `run_id`, `phase`, `round` (the round open or closing), `results_round`, `teams_data` (JSON roster: `id`, `name`, `house`, `token_hash`, `picks`), `frozen_data` (the roster as Close froze it), `callback_id`, `lease_until` (the Close retry lease), `execution_arn`, `workflow_arn`, `start_deadline`, `launch_data`, `evidence_data`, `expired_action` |
 | `results#<run>#<round>` | `run_id`, `round`, `data` (JSON `{round, market, summary, rows}`); written once per round, never changed |
 | `login` | The sign-in throttle: `window_start`, `failures` |
+| `timeline#<run>` | `run_id`, `lines`: the presenter's "Behind the scenes" log, a list of JSON strings `{id, t, tag, text, detail?, log_group?}`, at most 300 per run |
+
+**Timeline.** Each line has a stable `id`, and each id appears once in a normal
+game. The workflow writes `registered`, `launch`, `migrate-<option>`,
+`compare-<option>` (in a `timeline-evidence` step after step 3), `open-<round>`,
+and in `publish-results-<round>` `close-`, `plan-`, `score-` and
+`results-<round>`, then `final`. The Web Function writes `web-reset` (into the
+new run), `web-start` and `web-close-<round>`. The workflow writes only inside
+checkpointed steps, so a replay never repeats a line. Every append is one
+`list_append` UpdateItem conditioned on fewer than 300 lines. A failed write is
+logged and ignored, so the timeline can never stop a game. `detail` keys come
+from a fixed list (durations, VM ids, execution ARN, round, option, cart status,
+charges, market, players, picked, bots, best option, leader); tokens, token
+hashes, cookies and callback ids are never written. Only `GET
+/api/host/timeline` reads it; phones' `/api/state` never carries it.
 
 Phases: `ready` → (Start) `starting` → `open` (Launch) → (Close) `closing` →
 `open` (Growth) → … → `closing` → `final`. `expired` is set when the execution

@@ -112,6 +112,11 @@ class Fleet:
         self.client = boto3.client('lambda-microvms', region_name=region, config=AWS_CONFIG)
         self.image = os.environ['IMAGE_ARN']
         self.version = os.environ['IMAGE_VERSION']
+        # The VM's stdout/stderr go to the image's log group so the room can watch inside it. vm_runtime.py prints
+        # only timed stage lines and never a payment URL, receipt or token; PHP's request log is filtered there.
+        # Without the variable (older templates) logging stays off.
+        group = os.environ.get('VM_LOG_GROUP')
+        self.logging = {'cloudWatch': {'logGroup': group}} if group else {'disabled': {}}
         self.connector = f'arn:{self.image.split(":")[1]}:lambda:{region}:aws:network-connector:aws-network-connector:'
 
     def run(self, identity: str) -> dict:
@@ -122,7 +127,7 @@ class Fleet:
             clientToken=f'{identity}-{uuid4().hex}', maximumDurationInSeconds=VM_LIFESPAN,
             ingressNetworkConnectors=[self.connector + 'HTTP_INGRESS'],
             egressNetworkConnectors=[self.connector + 'INTERNET_EGRESS'],
-            logging={'disabled': {}},
+            logging=self.logging,
         )
 
     def get(self, vm_id: str) -> dict:

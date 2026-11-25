@@ -6,8 +6,10 @@ import json
 import logging
 import os
 import re
+import signal
 import sqlite3
 import subprocess
+import sys
 from contextlib import closing
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -29,6 +31,22 @@ MAX_ARTIFACT = 1024 * 1024
 PAYMENT_URL = 'http://127.0.0.1:8082/payments'
 Hex32 = re.compile(r'[0-9a-f]{32}')
 Team = re.compile(r'[a-z0-9]{3,16}')
+# PHP's built-in server logs every request to stderr; those lines carry nothing the room needs.
+PHP_ACCESS = re.compile(r'(\d{1,3}\.){3}\d{1,3}:\d+ (Accepted|Closing|\[\d{3}\]:)|Development Server .* started')
+
+# Everything this process prints goes to the image's CloudWatch log group (when the run enables it), so it
+# prints only timed stage lines: never the payment URL, the receipt, a token, or the full run id.
+_label = 'vm'
+_run_id = ''
+
+
+def say(message: str) -> None:
+    text = message.replace(_run_id, _run_id[:8]) if _run_id else message
+    print(f'[{_label}] {text[:200]}', flush=True)
+
+
+def timed(started: float) -> str:
+    return f'{monotonic() - started:.2f} s'
 
 
 class BadRequest(ValueError):
@@ -129,7 +147,9 @@ class Runtime:
     def start_shop(self) -> None:
         self.shop = subprocess.Popen(
             ['php', '-S', '127.0.0.1:8081', 'shop.php'], cwd=APP, env=self.env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors='replace',
         )
+        Thread(target=self.relay_php, args=(self.shop,), daemon=True).start()
         # Was 3 s. On 24 Nov 2026 PHP in a fresh Sydney MicroVM was not listening
         # within 3 s (ConnectionRefusedError), though it had been at 17:07 that day.
         started = monotonic()
@@ -141,16 +161,26 @@ class Runtime:
                 status, _, _ = shop_request('GET', '/health')
                 if status != 200:
                     raise RuntimeError('PHP shop could not read the database')
-                print(f'PHP shop ready in {monotonic() - started:.2f} s', flush=True)
+                say(f'PHP shop ready in {timed(started)}')
                 return
             except ConnectionRefusedError:
                 if monotonic() >= deadline:
                     raise
                 sleep(0.025)
 
+    @staticmethod
+    def relay_php(process: subprocess.Popen) -> None:
+        """PHP warnings and errors reach the log; its per-request access lines do not."""
+        for line in process.stderr:
+            line = line.strip()
+            if line and not PHP_ACCESS.search(line):
+                say(f'php: {line}')
+
     def setup(self, data: dict) -> None:
         if self.action:
             raise BadRequest('VM already configured')
+        global _label, _run_id
+        received = monotonic()
         run_id, action, kind = data.get('id'), data.get('action'), data.get('kind')
         team = data.get('team')
         if not isinstance(run_id, str) or not Hex32.fullmatch(run_id):
@@ -169,6 +199,10 @@ class Runtime:
                 raise BadRequest('Invalid Growth configuration')
         else:
             raise BadRequest('Invalid action, team or migration kind')
+        _run_id = run_id
+        _label = ' '.join(part for part in (run_id[:8], action, team) if part)
+        say(f'setup received: {action}' + (f' ({kind})' if kind else '')
+            + (f', {len(data["input"]) * 3 // 4 // 1024} KB input' if 'input' in data else ''))
 
         artifact = b''
         if action != 'launch':
@@ -188,33 +222,52 @@ class Runtime:
         if action == 'launch':
             self.env.pop('SHOP_SCHEMA', None)
             self.env['SHOP_SQLITE'] = str(SQLITE)
+            started = monotonic()
             with closing(sqlite3.connect(SQLITE)) as db, db:
                 db.executescript((APP / 'schema.sql').read_text())
                 db.execute('INSERT INTO customers VALUES (?, ?)', ('maya', 'Maya'))
+            say(f'SQLite database created in {timed(started)}')
         else:
             self.schema = f'bf_{run_id}_{team}'
             self.env['SHOP_SCHEMA'] = self.schema
             cluster = str(STATE / 'postgres')
+            started = monotonic()
             self.run([PG / 'initdb', '-D', cluster, '-A', 'trust', '-U', 'demo', '--locale=C'])
+            say(f'initdb done in {timed(started)}')
+            started = monotonic()
             self.run([
                 PG / 'pg_ctl', '-D', cluster, '-l', STATE / 'postgres.log',
                 '-o', '-h 127.0.0.1 -k /state', '-w', '-t', '10', 'start',
             ])
             self.run([PG / 'createdb', '-U', 'demo', 'shop'])
+            say(f'PostgreSQL started (pg_ctl start, createdb) in {timed(started)}')
+            started = monotonic()
             if action == 'migrate':
                 SQLITE.write_bytes(artifact)
                 self.run(['php', 'migrate.php', SQLITE, self.schema, kind])
                 if SQLITE.read_bytes() != artifact:
                     raise RuntimeError('Migration modified its input checkpoint')
+                say(f'migrate.php ({kind}: {"every table" if kind == "preserve" else "carts skipped"}) '
+                    f'done in {timed(started)}')
             else:
                 DUMP.write_bytes(artifact)
                 self.run([PG / 'pg_restore', '--exit-on-error', '-U', 'demo', '-d', 'shop', DUMP])
+                say(f'pg_restore done in {timed(started)}')
         self.start_shop()
+        say(f'setup finished in {timed(received)}')
 
     def run(self, cmd: list) -> None:
-        subprocess.run(cmd, cwd=APP, env=self.env, check=True, timeout=12)
+        # Tool chatter (initdb's banner and the like) stays out of the log; a failure shows its last words.
+        try:
+            subprocess.run(cmd, cwd=APP, env=self.env, check=True, timeout=12, capture_output=True, text=True,
+                           errors='replace')
+        except subprocess.CalledProcessError as error:
+            tail = ' | '.join((error.stderr or error.stdout or '').strip().splitlines()[-3:])
+            say(f'{Path(str(cmd[0])).name} failed with code {error.returncode}: {tail}')
+            raise
 
     def export(self) -> bytes:
+        started = monotonic()
         if self.action == 'launch':
             if not self.sealed:
                 if self.shop is None:
@@ -223,13 +276,17 @@ class Runtime:
                 self.shop.wait(timeout=3)
                 self.sealed = True
                 self.start_shop()  # Read the committed database through a fresh PHP process.
-            return SQLITE.read_bytes()
-        if self.action == 'migrate':
+            value = SQLITE.read_bytes()
+        elif self.action == 'migrate':
             self.run([
                 PG / 'pg_dump', '-Fc', '-U', 'demo', '-d', 'shop', '--schema', self.schema, '-f', DUMP,
             ])
-            return DUMP.read_bytes()
-        raise BadRequest('This stage does not produce an artifact')
+            value = DUMP.read_bytes()
+        else:
+            raise BadRequest('This stage does not produce an artifact')
+        say(f'artifact exported: {len(value) // 1024} KB '
+            f'({"SQLite checkpoint" if self.action == "launch" else "pg_dump"}) in {timed(started)}')
+        return value
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -351,13 +408,25 @@ class Gateway(Handler):
             return
         status, payload, elapsed = shop_request(method, self.path, body, intention)
         dropped = drop_pending and payment is not None and not payment.drop_next
+        if self.path == '/checkout':
+            say(f'checkout {status} in {elapsed} ms'
+                + (' · reply dropped on purpose (a lost response; the retry must not charge twice)' if dropped else ''))
+        elif self.path == '/cart/cart-saved':
+            say(f"Maya's saved cart: {status} ({'kept' if status == 200 else 'missing'}) in {elapsed} ms")
         self.send_body(status, payload, 'application/json', elapsed, dropped)
+
+
+def shutdown(signum, frame) -> None:
+    say(f'shutdown ({signal.Signals(signum).name})')
+    sys.exit(0)
 
 
 if __name__ == '__main__':
     runtime = Runtime()
     Gateway.runtime = PaymentHandler.runtime = runtime
+    signal.signal(signal.SIGTERM, shutdown)
     with HTTPServer(('127.0.0.1', 8082), PaymentHandler) as payments:
         Thread(target=payments.serve_forever, daemon=True).start()
         with HTTPServer(('0.0.0.0', 8080), Gateway) as gateway:
+            say('runtime up, waiting for setup')
             gateway.serve_forever()

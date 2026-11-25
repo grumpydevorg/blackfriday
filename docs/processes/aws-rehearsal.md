@@ -135,6 +135,22 @@ closing.
 Each callback waits at most 23 hours, so click Start less than 23 hours before
 the first Close, and keep the gap between Closes under 23 hours.
 
+**Behind the scenes.** Below the controls a drawer, collapsed by default, shows
+what the game is doing on AWS. Each line has its time (Adelaide), a coloured
+tag (`GAME`, `DURABLE`, `EVENT`, `MICROVM`, `WEB`) and a short text: Start,
+the execution registered, the real Launch, the two migrations and checks (cart
+kept or lost, VM id), each round opening, Close (picks frozen), the market draw
+and bots, the best option and leader, results, final, and Reset. While open it
+polls `GET /api/host/timeline` every 2 seconds, one request at a time, never
+retrying a 429. Clicking a line shows its details and, where the line names a
+log group, an **Open logs in CloudWatch** link to that group in the Sydney
+console (you need your own console sign-in). The data model is in
+[architecture.md](../architecture.md#the-durable-game-and-its-items).
+
+The pages load `round.js` and `round.css` as `?v=<content hash>`, so a browser
+that cached the old script for its hour never runs it against a new page after
+a redeploy.
+
 ### Live log for the room (fourround)
 
 ```sh
@@ -151,7 +167,7 @@ against any account but the game's.
 |:--|:--|
 | `GAME` | The arena item, read every second: Reset, phase and round changes, joins, picks so far, and each round's results (market draw, best option, top player). |
 | `DURABLE` | The execution's history, read every 2 s: each operation once (steps, invokes, the parallel migrations and checks, callbacks waiting and Closes received), with elapsed time, and each suspension between invocations. |
-| `MICROVM` | The Launch, careful and fast results once the workflow publishes them. MicroVM runs have CloudWatch logging disabled, so their own output never reaches the log group; that group only carries image builds and errors. |
+| `MICROVM` | Inside each VM, from `/aws/lambda-microvms/<prefix>-shop`: one timed line per stage (setup received, initdb, PostgreSQL start, `migrate.php` or `pg_restore`, PHP shop ready, each checkout with status and ms, Maya's saved cart, artifact exported, shutdown), labelled with the run prefix, action and option. Plus the Launch, careful and fast results once the workflow publishes them. The evaluator runs every VM with CloudWatch logging to that group (the VM still has no AWS role); `vm_runtime.py` never prints a payment URL, receipt, token or full run id, and drops PHP's per-request access lines while keeping its warnings and errors. |
 | `EVENT`, `WORKFLOW` | Event judge and Durable invocation durations and cold starts. |
 | `WEB` | Requests per minute, environments, peak concurrency, cold starts and errors, summed each minute from the Web Function's `platform.invokeSummary` records. |
 | `ERROR` | Error lines, trimmed, from any of those sources. |
@@ -193,7 +209,7 @@ Public routes: `GET /`, `/host` (the page only), `/round.js`, `/round.css`
 (`{id, token, round, option}`), `/api/host/login`, `/api/host/logout`. A phone
 sends its `X-Team-Id` and `X-Team-Token` headers with `/api/state` to learn its
 own name and picks. Presenter routes, all under `/api/host/` (a valid cookie or
-the presenter key, otherwise 403): `GET /api/host/state`, `/api/host/qr.svg`;
+the presenter key, otherwise 403): `GET /api/host/state`, `/api/host/qr.svg`, `/api/host/timeline`;
 `POST /api/host/start`, `/api/host/close` (also needs `X-Rehearsal-Round: <round>`),
 `/api/host/reset` (these three take no body) and `/api/host/remove` (a JSON body
 of at most 2 KiB: the player id). Anything else is 404; the old
