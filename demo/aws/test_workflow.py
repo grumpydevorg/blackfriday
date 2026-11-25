@@ -19,9 +19,13 @@ RECORDED = json.loads((HERE / 'rounds.json').read_text())['recorded_evidence']
 
 
 def stub_model():
-    """Just enough model to test the workflow's mechanics: it draws once per player and echoes its inputs."""
+    """Just enough model to test the workflow's mechanics: it draws once per player and echoes its inputs.
+    What rounds.json says (rounds, labels, real-evidence options, recorded fallbacks) is the real model's."""
     module = types.ModuleType('model')
     module.ROUND_IDS = ROUND_IDS
+    real = real_model()
+    for name in ('ROUNDS', 'RECORDED', 'REAL_OPTIONS', 'ALL_OPTION_IDS', 'EVIDENCE_SOURCES', 'option_label', 'round_title'):
+        setattr(module, name, getattr(real, name))
     module.calls = []
 
     def validate_players(value):
@@ -456,7 +460,7 @@ def test_the_real_model_plays_four_rounds_with_a_garbage_row(monkeypatch):
 EXPECTED_IDS = ['registered', 'launch', 'migrate-careful', 'migrate-fast', 'compare-careful', 'compare-fast',
                 *[f'{kind}-{round_id}' for round_id in ROUND_IDS for kind in ('open', 'close', 'plan', 'score', 'results')],
                 'final']
-LINE_KEYS = {'id', 't', 'tag', 'text', 'detail', 'log_group'}
+LINE_KEYS = {'id', 't', 'tag', 'level', 'text', 'detail', 'log_group'}
 DETAIL_KEYS = {'duration_s', 'vm_id', 'execution_arn', 'round', 'option', 'cart_status', 'charges', 'market', 'players',
                'picked', 'source', 'checkout_status', 'checkout_ms', 'bots', 'best_option', 'leader', 'run_id'}
 
@@ -503,8 +507,8 @@ def test_every_line_has_only_allowed_keys_and_no_secrets(workflow, monkeypatch):
     lines = db.timeline_lines()
     assert lines
     for item in lines:
-        assert set(item) <= LINE_KEYS and {'id', 't', 'tag', 'text'} <= set(item)
-        assert item['tag'] in {'GAME', 'DURABLE', 'EVENT', 'MICROVM', 'WEB'}
+        assert set(item) <= LINE_KEYS and {'id', 't', 'tag', 'level', 'text'} <= set(item)
+        assert item['tag'] in {'DURABLE', 'MICROVM'} and item['level'] in {'info', 'warn'}
         assert isinstance(item['t'], int) and len(item['text']) <= 100
         assert set(item.get('detail', {})) <= DETAIL_KEYS
     blob = json.dumps(lines).lower()
@@ -597,11 +601,20 @@ def test_a_line_that_cannot_be_built_is_swallowed_too(workflow, monkeypatch):
         ['registered', *[f'open-{r}' for r in ROUND_IDS], 'final'])
 
 
-# ---- The `[WORKFLOW] <step>: <text>` log lines -----------------------------------------------------------------
+# ---- The `[WORKFLOW] <json>` log lines -------------------------------------------------------------------------
 
-STEP_LINE = re.compile(r'\[WORKFLOW\] ([a-z0-9-]+): (.+)')
 STEP_NAMES = {'register-execution', 'timeline-evidence', 'publish-final',
               *[f'{kind}-{round_id}' for round_id in ROUND_IDS for kind in ('publish-open', 'plan', 'score', 'publish-results')]}
+
+
+def parse(text):
+    """A `[WORKFLOW] <json>` print as a dict: it must parse and carry step, round, level and msg only."""
+    assert text.startswith('[WORKFLOW] ')
+    entry = json.loads(text.removeprefix('[WORKFLOW] '))
+    assert set(entry) == {'step', 'round', 'level', 'msg'}
+    assert entry['level'] in {'debug', 'info', 'warn', 'error'} and entry['round'] in {None, *ROUND_IDS}
+    assert isinstance(entry['step'], str) and isinstance(entry['msg'], str) and 0 < len(entry['msg']) <= 200
+    return entry
 
 
 def capture_prints(workflow, monkeypatch, db):
@@ -641,30 +654,44 @@ def test_each_step_prints_exactly_one_workflow_line_and_only_inside_the_step(wor
     run(workflow, monkeypatch, db=db)
     lines = workflow_lines(printed)
     assert all(in_step is True for _, in_step in lines)
-    steps = [STEP_LINE.fullmatch(text).group(1) for text, _ in lines]
-    assert sorted(steps) == sorted(STEP_NAMES)
-    texts = dict((STEP_LINE.fullmatch(text).groups()) for text, _ in lines)
-    assert texts['timeline-evidence'] == 'launch real, careful real (cart kept), fast real (cart lost)'
-    assert texts['publish-open-growth'] == 'round open'
-    assert re.fullmatch(r'market \d+, 0 bots, 2 players', texts['plan-launch'])
+    entries = [parse(text) for text, _ in lines]
+    assert sorted(entry['step'] for entry in entries) == sorted(STEP_NAMES)
+    by_step = {entry['step']: entry for entry in entries}
+    assert by_step['timeline-evidence'] == {
+        'step': 'timeline-evidence', 'round': None, 'level': 'info',
+        'msg': 'launch real, careful real (cart kept), fast real (cart lost)'}
+    assert by_step['publish-open-growth'] == {
+        'step': 'publish-open-growth', 'round': 'growth', 'level': 'info', 'msg': 'round open'}
+    assert re.fullmatch(r'market \d+%, 0 bots, 2 players', by_step['plan-launch']['msg'])
+    assert all(by_step[f'plan-{r}']['round'] == r == by_step[f'score-{r}']['round'] for r in ROUND_IDS)
+    assert all(entry['level'] == 'info' for entry in entries)
 
 
-def test_a_recorded_fallback_is_named_in_the_evidence_line(workflow, monkeypatch):
+def test_a_recorded_fallback_is_named_in_the_evidence_line_and_warns(workflow, monkeypatch):
     db = FakeDB()
     printed = capture_prints(workflow, monkeypatch, db)
     run(workflow, monkeypatch, db=db, launch_fails=True, fail={('migrate', 'fast')})
-    texts = dict(STEP_LINE.fullmatch(text).groups() for text, _ in workflow_lines(printed))
-    assert texts['timeline-evidence'] == 'launch recorded, careful real (cart kept), fast recorded (cart lost)'
+    entries = {entry['step']: entry for entry in (parse(text) for text, in_step in workflow_lines(printed) if in_step)}
+    assert entries['timeline-evidence']['msg'] == 'launch recorded, careful real (cart kept), fast recorded (cart lost)'
+    assert entries['timeline-evidence']['level'] == 'warn'
+    assert entries['fallback-launch'] == {
+        'step': 'fallback-launch', 'round': None, 'level': 'warn',
+        'msg': 'launch failed (RuntimeError): recorded evidence used'}
+    assert entries['fallback-migrate-fast']['level'] == 'warn'
+    assert 'MicroVM broke' not in json.dumps(entries), 'only the error class is logged, never its message'
 
 
-def test_an_expired_close_prints_its_step_line(workflow, monkeypatch):
+def test_an_expired_close_prints_its_step_line_and_writes_a_warn_timeline_line(workflow, monkeypatch):
     db = FakeDB()
     printed = capture_prints(workflow, monkeypatch, db)
     expired = workflow.CallbackTimeoutError('timed out')
     with pytest.raises(workflow.CallbackTimeoutError):
         run(workflow, monkeypatch, db=db, rooms={**rooms_for(), 'launch': expired})
-    assert [text for text, in_step in workflow_lines(printed) if in_step and 'expire-close-launch' in text] == [
-        '[WORKFLOW] expire-close-launch: close callback timed out, run expired']
+    assert [parse(text) for text, in_step in workflow_lines(printed) if in_step and 'expire-close-launch' in text] == [
+        {'step': 'expire-close-launch', 'round': 'launch', 'level': 'warn',
+         'msg': 'close callback timed out, run expired'}]
+    expire = next(item for item in db.timeline_lines() if item['id'] == 'expire-launch')
+    assert (expire['tag'], expire['level'], expire['detail']) == ('DURABLE', 'warn', {'round': 'launch'})
 
 
 def test_a_full_replay_prints_no_workflow_lines(workflow, monkeypatch):
@@ -688,3 +715,113 @@ def test_workflow_lines_never_carry_secrets_ids_or_names(workflow, monkeypatch):
     for word in ('token', 'secret', 'cb-await', 'callback', RUN, RUN[:8], 'arn:', 'Ada', 'Grace', 'adabyron', 'House'):
         assert word not in blob
     assert re.search(r'[0-9a-f]{32}', blob) is None
+
+
+# ---- One constructor decides tag, level, log group and detail ---------------------------------------------------
+
+
+def sample_key(workflow, kind):
+    names = workflow.LINE_KINDS[kind][0]
+    return {None: None, 'round': 'growth', 'option': 'careful'}[names]
+
+
+LINE_KIND_NAMES = ['registered', 'launch', 'migrate', 'compare', 'open', 'close', 'plan', 'score', 'results', 'final',
+                   'expire']
+
+
+@pytest.mark.parametrize('kind', LINE_KIND_NAMES)
+def test_every_line_kind_builds_only_with_a_workflow_tag_and_a_closed_level(workflow, kind):
+    assert sorted(workflow.LINE_KINDS) == sorted(LINE_KIND_NAMES)
+    for real in (False, True):
+        if real and kind not in workflow.EVIDENCE_KINDS:
+            with pytest.raises(ValueError):
+                workflow.timeline_line(kind, 'x', key=sample_key(workflow, kind), real=True)
+            continue
+        item = workflow.timeline_line(kind, 'x', key=sample_key(workflow, kind), real=real)
+        assert item['tag'] in {'DURABLE', 'MICROVM'} and item['tag'] == ('MICROVM' if real else 'DURABLE')
+        assert item['level'] in {'info', 'warn'}
+
+
+def test_a_line_cannot_be_built_with_a_tag_a_level_or_a_kind_outside_the_vocabulary(workflow):
+    for extra in ({'tag': 'GAME'}, {'tag': 'EVENT'}, {'tag': 'WEB'}, {'level': 'error'}):
+        with pytest.raises(TypeError):
+            workflow.timeline_line('open', 'x', key='launch', **extra)
+    for kind in ('GAME', 'EVENT', 'WEB', 'close-launch', 'error', ''):
+        with pytest.raises(ValueError):
+            workflow.timeline_line(kind, 'x')
+    with pytest.raises(ValueError):
+        workflow.timeline_line('open', 'x', key='nonsense')  # not a round in rounds.json
+    with pytest.raises(ValueError):
+        workflow.timeline_line('open', 'x')  # a round line needs its round
+    with pytest.raises(ValueError):
+        workflow.timeline_line('final', 'x', key='launch')  # and a final line takes none
+    with pytest.raises(ValueError):
+        workflow.timeline_line('compare', 'x', key='small')  # an option that is not real evidence
+    with pytest.raises(ValueError):
+        workflow.emit('step', None, 'GAME', 'x')
+
+
+def test_real_evidence_is_microvm_info_in_the_evaluator_group_and_recorded_is_durable_warn(workflow, monkeypatch):
+    monkeypatch.setenv('AWS_LAMBDA_LOG_GROUP_NAME', '/aws/lambda/durable')
+    monkeypatch.setattr(workflow, 'EVALUATOR', 'arn:aws:lambda:ap-southeast-2:123456789012:function:evaluator:$LATEST')
+    for kind in workflow.EVIDENCE_KINDS:
+        key = sample_key(workflow, kind)
+        real = workflow.timeline_line(kind, 'x', key=key, real=True)
+        recorded = workflow.timeline_line(kind, 'x', key=key)
+        assert (real['tag'], real['level'], real['log_group']) == ('MICROVM', 'info', '/aws/lambda/evaluator')
+        assert (recorded['tag'], recorded['level'], recorded['log_group']) == ('DURABLE', 'warn', '/aws/lambda/durable')
+        assert real['detail']['source'] == 'real' and recorded['detail']['source'] == 'recorded'
+
+
+def test_what_the_workflow_decided_is_durable_info_and_expiry_is_durable_warn(workflow, monkeypatch):
+    monkeypatch.setenv('AWS_LAMBDA_LOG_GROUP_NAME', '/aws/lambda/durable')
+    for kind in ('registered', 'open', 'close', 'plan', 'score', 'results', 'final'):
+        item = workflow.timeline_line(kind, 'x', key=sample_key(workflow, kind))
+        assert (item['tag'], item['level'], item['log_group']) == ('DURABLE', 'info', '/aws/lambda/durable'), kind
+    expire = workflow.timeline_line('expire', 'x', key='launch')
+    assert (expire['tag'], expire['level']) == ('DURABLE', 'warn')
+
+
+def test_detail_is_an_allowlist_per_kind(workflow):
+    asked = {'round': 'christmas', 'players': 3, 'picked': 2, 'token': 'secret', 'vm_id': 'vm-x', 'market': 99,
+             'callback_id': 'cb', 'execution_arn': 'arn:x'}
+    assert workflow.timeline_line('close', 'x', asked, key='growth')['detail'] == {
+        'round': 'growth', 'players': 3, 'picked': 2}, 'the key wins over a detail round'
+    recorded = workflow.timeline_line('compare', 'x', {'vm_id': 'vm-x', 'duration_s': 0.1, 'charges': 1}, key='fast')
+    assert recorded['detail'] == {'charges': 1, 'option': 'fast', 'source': 'recorded'}, 'no VM details without a VM'
+    real = workflow.timeline_line('compare', 'x', {'vm_id': 'vm-x', 'duration_s': 0.1, 'bots': ['b']}, key='fast', real=True)
+    assert real['detail'] == {'vm_id': 'vm-x', 'duration_s': 0.1, 'option': 'fast', 'source': 'real'}
+    assert 'detail' not in workflow.timeline_line('final', 'x', {'leader': None})
+
+
+def test_the_real_evidence_options_come_from_rounds_json(workflow):
+    table = json.loads((HERE / 'rounds.json').read_text())
+    real = [option['id'] for rnd in table['rounds'] for option in rnd['options'] if option['evidence'] == 'real']
+    assert list(workflow.MIGRATIONS) == real == ['careful', 'fast']
+    assert workflow.RECORDED == table['recorded_evidence']
+
+
+def test_a_full_run_writes_only_workflow_tags_with_the_vocabulary_levels(workflow, monkeypatch):
+    _, real_run, _ = run(workflow, monkeypatch)
+    assert {(item['tag'], item['level']) for item in real_run.timeline_lines()} == {('DURABLE', 'info'), ('MICROVM', 'info')}
+    ids = {item['id']: item for item in real_run.timeline_lines()}
+    assert [ids[i]['tag'] for i in ('launch', 'migrate-careful', 'compare-fast')] == ['MICROVM'] * 3
+    assert ids['close-launch']['tag'] == ids['final']['tag'] == ids['open-launch']['tag'] == 'DURABLE'
+    _, fallback, _ = run(workflow, monkeypatch, launch_fails=True, fail={('migrate', 'careful'), ('migrate', 'fast')})
+    lines = {item['id']: item for item in fallback.timeline_lines()}
+    for item_id in ('launch', 'migrate-careful', 'migrate-fast', 'compare-careful', 'compare-fast'):
+        assert (lines[item_id]['tag'], lines[item_id]['level']) == ('DURABLE', 'warn'), item_id
+    assert lines['open-launch']['level'] == 'info'
+
+
+def test_a_failing_timeline_write_logs_a_json_warn_line_with_only_the_error_code(workflow, monkeypatch):
+    db = FakeDB()
+    db.timeline_error = ClientError({'Error': {'Code': 'ProvisionedThroughputExceededException',
+                                               'Message': 'table arn:aws:dynamodb:x'}}, 'UpdateItem')
+    printed = capture_prints(workflow, monkeypatch, db)
+    run(workflow, monkeypatch, db=db)
+    entries = [parse(text) for text, in_step in workflow_lines(printed) if in_step]
+    failed = [entry for entry in entries if entry['msg'].startswith('timeline write failed')]
+    assert failed and all(entry['level'] == 'warn' and entry['msg'] ==
+                          'timeline write failed: ProvisionedThroughputExceededException' for entry in failed)
+    assert 'arn:' not in json.dumps(failed)

@@ -100,6 +100,58 @@ def test_recorded_evidence_marks_the_row_source():
     assert rows[1]['evidence'] == 'real'
 
 
+def test_the_real_evidence_options_are_derived_from_rounds_json():
+    table = json.loads((AWS_DIR / 'rounds.json').read_text())
+    real = {opt['id']: rnd['id'] for rnd in table['rounds'] for opt in rnd['options'] if opt['evidence'] == 'real'}
+    assert model.REAL_OPTIONS == real == {'careful': 'growth', 'fast': 'growth'}
+    assert set(model.RECORDED) == set(real)
+    assert model.option_label('careful') == 'Careful migration' and model.round_title('growth') == 'Round 2 · Growth'
+
+
+def test_outcome_is_lost_carts_exactly_when_a_cart_was_lost_and_otherwise_hit_or_held():
+    for evidence in (KEPT, LOST, {'careful': {'cart_kept': False, 'source': 'real'}, 'fast': {'cart_kept': True, 'source': 'real'}}):
+        for second in model.ROUNDS[1]['options']:
+            for third in model.ROUNDS[2]['options']:
+                if not model.allowed('blackfriday', third['id'], {'growth': second['id']}):
+                    continue
+                for roll in (0, 20, 34, 37, 38, 50, 99):
+                    outputs = play(['small', second['id'], third['id'], 'keep'], rolls={'growth': roll, 'blackfriday': roll},
+                                   evidence=evidence)
+                    for round_id, output in zip(model.ROUND_IDS, outputs):
+                        r = mine(output)
+                        lost_carts = (round_id == 'growth' and (
+                            second['id'] == 'careful' and not evidence['careful']['cart_kept']
+                            or second['id'] == 'fast' and roll < 38 and not evidence['fast']['cart_kept']))
+                        assert r['hit'] == (roll < r['risk'])
+                        assert (r['outcome'] == 'lost_carts') == lost_carts, (round_id, r)
+                        if not lost_carts:
+                            assert r['outcome'] == ('hit' if r['hit'] else 'held'), (round_id, r)
+                        if round_id == 'growth':
+                            assert output['states']['abc']['hist_lost'] == lost_carts
+
+
+def test_a_careful_migration_that_lost_the_carts_is_lost_carts_without_a_dice_hit():
+    r = mine(play(['small', 'careful', 'ride', 'keep'], evidence=LOST | {'careful': {'cart_kept': False, 'source': 'real'}})[1])
+    assert (r['hit'], r['outcome']) == (False, 'lost_carts')
+    kept = mine(play(['small', 'fast', 'ride', 'keep'], rolls={'growth': 0}, evidence=KEPT)[1])
+    assert (kept['hit'], kept['outcome']) == (True, 'hit'), 'the dice hit but the real check kept the carts'
+
+
+@pytest.mark.parametrize('bad', [{'source': 'real'}, {'source': 'real', 'cart_kept': None},
+                                 {'source': 'real', 'cart_kept': 'yes'}, {'source': 'real', 'cart_kept': 1}])
+def test_real_evidence_without_a_boolean_cart_kept_is_rejected(bad):
+    for option in ('careful', 'fast'):
+        planned = hand_plan('growth', 100, [row('abc', 'careful')])
+        with pytest.raises(ValueError, match='cart_kept'):
+            model.score('growth', planned, None, {**KEPT, option: bad})
+
+
+def test_recorded_or_missing_evidence_does_not_need_cart_kept_and_falls_back_to_the_recorded_result():
+    planned = hand_plan('growth', 100, [row('abc', 'careful')])
+    assert model.score('growth', planned, None, {'careful': {'source': 'recorded'}})['rows']
+    assert model.score('growth', planned, None, {})['rows']
+
+
 def test_autoscale_needs_a_shared_database():
     assert not model.allowed('blackfriday', 'autoscale', {'growth': 'stay'})
     assert not model.allowed('blackfriday', 'autoscale', {})
@@ -313,12 +365,13 @@ def test_summary_shape():
 
 
 def test_every_row_has_the_contract_shape():
-    keys = ['id', 'name', 'house', 'bot', 'rank', 'option', 'roll', 'risk', 'hit', 'event', 'sales', 'slow',
+    keys = ['id', 'name', 'house', 'bot', 'rank', 'option', 'roll', 'risk', 'hit', 'outcome', 'event', 'sales', 'slow',
             'failed', 'cost_cents', 'refund_cents', 'profit_cents', 'cumulative_cents', 'returning', 'evidence']
     for output in play(['medium', 'fast', 'queue', 'commit'], rolls={'growth': 0, 'blackfriday': 0}):
         for r in output['rows']:
             assert list(r) == keys
             assert r['event'] and isinstance(r['hit'], bool) and r['evidence'] in ('real', 'recorded', 'modelled')
+            assert r['outcome'] in ('held', 'hit', 'lost_carts')
 
 
 def test_a_hundred_players_over_four_rounds_is_fast_and_rows_are_small():

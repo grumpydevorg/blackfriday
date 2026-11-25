@@ -34,6 +34,12 @@ _OPTIONS = {rnd['id']: {opt['id']: opt for opt in rnd['options']} for rnd in ROU
 PLAYER_ID = re.compile(r'[a-z0-9]{3,16}')
 NAME_LIMIT = 20
 ALL_OPTION_IDS = {option for options in _OPTIONS.values() for option in options}
+# Options whose evidence can come from a real MicroVM: option id -> round id. rounds.json is the only list.
+REAL_OPTIONS: dict[str, str] = {opt['id']: rnd['id'] for rnd in ROUNDS for opt in rnd['options']
+                                if opt['evidence'] == 'real'}
+EVIDENCE_SOURCES = ('real', 'recorded', 'modelled')
+if set(REAL_OPTIONS) != set(RECORDED):
+    raise ValueError('rounds.json: recorded_evidence must name exactly the options whose evidence is real')
 
 
 def bot_id(name: str) -> str:
@@ -47,6 +53,15 @@ def bot_id(name: str) -> str:
 
 def default_option(round_id: str) -> str:
     return _BY_ID[round_id]['options'][0]['id']
+
+
+def option_label(option: str) -> str:
+    """The rounds.json label of an option id (option ids are unique across rounds)."""
+    return next(opt['label'] for options in _OPTIONS.values() for key, opt in options.items() if key == option)
+
+
+def round_title(round_id: str) -> str:
+    return _BY_ID[round_id]['title']
 
 
 def allowed(round_id: str, option: str, picks: dict[str, str]) -> bool:
@@ -186,6 +201,7 @@ def step(state: dict, round_id: str, option: str, market: int, roll: int, noise:
     hit = roll < entry['risk']
     new = dict(state, picks={**state['picks'], round_id: option})
     cost = refund = dc = 0
+    lost = False  # saved carts were lost in this round's migration
     bad_in = new['bad']
     event = ''
 
@@ -201,7 +217,6 @@ def step(state: dict, round_id: str, option: str, market: int, roll: int, noise:
         new['data'] = 'disk' if option == 'stay' else 'shared'
         new['cap'], new['run'] = _cap_run(new, new['server'], new['data'])
         cost += db['migration']
-        lost = False
         if option == 'stay':
             event = 'Stayed on the disk database'
         elif option == 'careful':
@@ -223,6 +238,8 @@ def step(state: dict, round_id: str, option: str, market: int, roll: int, noise:
     back_in, bad_back = returning(state, bad_in) if state['server'] else (0, 0)
     demand = fresh + back_in
     cap_week, run_week = new['cap'], new['run']
+    # The autoscale ramp below is billed twice: once as `cost`, once again through `run_week`. Billing it once makes
+    # `python model.py balance` FAIL (autoscale on the best path in 93% of worlds), so rounds.json is tuned to this.
 
     if round_id == 'blackfriday':
         conf = PARAMS['blackfriday']
@@ -284,8 +301,9 @@ def step(state: dict, round_id: str, option: str, market: int, roll: int, noise:
     new.update(fast=fast, slow=slow, failed=failed, bad=flagged, cum=state['cum'] + profit)
     next_back = returning(new, flagged)[0]
     return new, {
-        'hit': hit, 'event': event, 'sales': fast, 'slow': slow, 'failed': failed, 'cost_cents': cost,
-        'refund_cents': refund, 'profit_cents': profit, 'returning': next_back, 'demand': demand,
+        'hit': hit, 'outcome': 'lost_carts' if lost else 'hit' if hit else 'held', 'event': event, 'sales': fast,
+        'slow': slow, 'failed': failed, 'cost_cents': cost, 'refund_cents': refund, 'profit_cents': profit,
+        'returning': next_back, 'demand': demand,
     }
 
 
@@ -370,14 +388,18 @@ def _ranked(rows: list[dict]) -> list[dict]:
     return out
 
 
-_ROW_KEYS = ('option', 'roll', 'risk', 'hit', 'event', 'sales', 'slow', 'failed', 'cost_cents', 'refund_cents',
-             'profit_cents', 'cumulative_cents', 'returning', 'evidence')
+_ROW_KEYS = ('option', 'roll', 'risk', 'hit', 'outcome', 'event', 'sales', 'slow', 'failed', 'cost_cents',
+             'refund_cents', 'profit_cents', 'cumulative_cents', 'returning', 'evidence')
 
 
 def _evidence(evidence: dict) -> dict:
+    """The evidence per real option; a missing or malformed option falls back to its recorded evidence.
+    Real evidence must say whether the cart survived: a real result without `cart_kept` is rejected."""
     out = {}
     for option, recorded in RECORDED.items():
         got = evidence.get(option) if isinstance(evidence, dict) else None
+        if isinstance(got, dict) and got.get('source') == 'real' and not isinstance(got.get('cart_kept'), bool):
+            raise ValueError(f'real evidence for {option} must say whether the cart survived (cart_kept)')
         out[option] = got if isinstance(got, dict) else recorded
     return out
 
@@ -404,7 +426,8 @@ def score(round_id: str, plan: dict, previous: dict | None, evidence: dict) -> d
         rows.append({
             'id': pid, 'name': player['name'], 'house': player['house'], 'bot': player.get('bot') is True,
             'option': option, 'roll': draw['roll'], 'risk': _OPTIONS[round_id][option]['risk'],
-            'hit': out['hit'], 'event': out['event'], 'sales': out['sales'], 'slow': out['slow'],
+            'hit': out['hit'], 'outcome': out['outcome'], 'event': out['event'], 'sales': out['sales'],
+            'slow': out['slow'],
             'failed': out['failed'], 'cost_cents': out['cost_cents'], 'refund_cents': out['refund_cents'],
             'profit_cents': out['profit_cents'], 'cumulative_cents': state['cum'], 'returning': out['returning'],
             'evidence': _evidence_source(round_id, option, evidence),

@@ -186,7 +186,7 @@ const publishResults = (round, rows, market = 100) => {
   arena().results_round = s(round);
 };
 const row = (id, name, rank) => ({
-  id, name, house: false, bot: false, rank, option: 'medium', roll: 12, risk: 0, hit: false, event: 'Demand was normal this round',
+  id, name, house: false, bot: false, rank, option: 'medium', roll: 12, risk: 0, hit: false, outcome: 'held', event: 'Demand was normal this round',
   sales: 120, slow: 10, failed: 5, cost_cents: 3000, refund_cents: 0, profit_cents: 120000, cumulative_cents: 250000 - rank, returning: 80, evidence: 'modelled',
 });
 await state();   // creates the arena item
@@ -572,6 +572,8 @@ def test_the_timeline_route_is_presenter_only_and_phones_never_see_it():
       assert.equal(shown.body.run_id, run);
       assert.deepEqual(shown.body.lines.map(line => line.id), ['web-start']);
       assert.equal(shown.body.lines[0].tag, 'WEB');
+      assert.equal(shown.body.lines[0].level, 'info');
+      assert.deepEqual(Object.keys(shown.body.lines[0]).sort(), ['detail', 'id', 'level', 'tag', 'text', 't'].sort());
       assert.deepEqual(shown.body.lines[0].detail, { players: 1, run_id: run });
       assert.ok(shown.body.lines[0].text.length <= 100 && Number.isInteger(shown.body.lines[0].t));
       for (const response of [await state(a), await state(), await call('GET', '/api/host/state', { headers: PRESENTER })]) {
@@ -599,7 +601,7 @@ def test_start_close_and_reset_each_append_exactly_one_web_line():
       const written = lines(first);
       assert.deepEqual(written.map(line => line.id), ['web-start', 'web-close-launch']);
       assert.deepEqual(written[1].detail, { round: 'launch', picked: 1, players: 2 });
-      assert.ok(written.every(line => line.tag === 'WEB' && !('log_group' in line)));
+      assert.ok(written.every(line => line.tag === 'WEB' && line.level === 'info' && !('log_group' in line)));
       assert.ok(!JSON.stringify(written).match(/token|callback|cb-/i));
       const reset = await hostPost('reset');
       assert.equal(reset.status, 200);
@@ -607,6 +609,7 @@ def test_start_close_and_reset_each_append_exactly_one_web_line():
       assert.notEqual(second, first);
       assert.deepEqual(lines(second).map(line => line.id), ['web-reset'], 'Reset writes into the new run');
       assert.deepEqual(lines(second)[0].detail, { run_id: second });
+      assert.deepEqual([lines(second)[0].tag, lines(second)[0].level], ['WEB', 'warn'], 'a forced reset is a warning');
       assert.equal(lines(first).length, 2, 'the old run is left alone');
       assert.deepEqual((await call('GET', '/api/host/timeline', { headers: PRESENTER })).body.lines.map(line => line.id), ['web-reset']);
     """)
@@ -736,6 +739,12 @@ def test_every_request_prints_exactly_one_access_line_and_nothing_secret():
     assert all(set(entry) <= {'bf', 'level', 'method', 'route', 'status', 'ms', 'phase', 'round'} for entry in entries)
     assert all({'bf', 'level', 'method', 'route', 'status', 'ms'} <= set(entry) for entry in entries)
     assert all(isinstance(entry['ms'], int) and entry['ms'] >= 0 for entry in entries)
+    assert all(entry['level'] in {'debug', 'info', 'warn', 'error'} for entry in entries)
+    assert all(entry['method'] in {'GET', 'POST', 'HEAD', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'other'} for entry in entries)
+    assert all(entry['route'] == 'other' or entry['route'].startswith(('/api/', '/round.', '/art/')) or entry['route'] in {'/', '/host'}
+               for entry in entries)
+    assert all(e.get('phase', 'ready') in {'ready', 'starting', 'open', 'closing', 'final', 'expired', 'failed'}
+               and e.get('round', 'launch') in {'launch', 'growth', 'blackfriday', 'christmas'} for e in entries)
     summary = [(e['method'], e['route'], e['status'], e['level']) for e in entries]
     assert summary.count(('POST', '/api/join', 200, 'info')) == 1
     assert summary.count(('POST', '/api/pick', 200, 'info')) == 1

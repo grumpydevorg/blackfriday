@@ -54,8 +54,30 @@ const staticFiles = new Map([
 ]);
 
 // Presenter-only "Behind the scenes" lines, best effort: a failed write is logged and never changes a response.
+// The kind alone decides a line's id, text, level and the detail fields it may carry; the tag is always WEB.
 const TIMELINE_CAP = 300;
-async function timeline(runId, line) {
+const WEB_LINES = {
+  start: {
+    level: 'info', detail: ['players', 'run_id'], id: () => 'web-start',
+    text: ({ players }) => `Presenter pressed Start: ${players} players in the room`,
+  },
+  close: {
+    level: 'info', detail: ['round', 'picked', 'players'], id: ({ round }) => `web-close-${round}`,
+    text: ({ round, picked, players }) => `Presenter closed ${round}: ${picked} of ${players} players picked`,
+  },
+  reset: { level: 'warn', detail: ['run_id'], id: () => 'web-reset', text: () => 'Presenter reset the game' },
+};
+function webLine(kind, fields) {
+  if (!Object.hasOwn(WEB_LINES, kind)) throw new Error(`Unknown timeline line kind: ${kind}`);
+  const spec = WEB_LINES[kind];
+  const detail = Object.fromEntries(spec.detail.filter(name => fields[name] !== undefined).map(name => [name, fields[name]]));
+  if (detail.round !== undefined && !ROUND_IDS.includes(detail.round)) throw new Error(`Not a round: ${detail.round}`);
+  return {
+    t: Date.now(), tag: 'WEB', level: spec.level, id: spec.id(detail), text: spec.text(detail), detail,
+    ...(process.env.AWS_LAMBDA_LOG_GROUP_NAME && { log_group: process.env.AWS_LAMBDA_LOG_GROUP_NAME }),
+  };
+}
+async function timeline(runId, kind, fields) {
   try {
     await db.send(new UpdateItemCommand({
       TableName: table, Key: { pk: s(`timeline#${runId}`) },
@@ -65,14 +87,11 @@ async function timeline(runId, line) {
       ExpressionAttributeNames: { '#lines': 'lines' },
       ExpressionAttributeValues: {
         ':run': s(runId), ':cap': n(TIMELINE_CAP), ':empty': { L: [] },
-        ':new': { L: [s(JSON.stringify({
-          t: Date.now(), tag: 'WEB', ...line,
-          ...(process.env.AWS_LAMBDA_LOG_GROUP_NAME && { log_group: process.env.AWS_LAMBDA_LOG_GROUP_NAME }),
-        }))] },
+        ':new': { L: [s(JSON.stringify(webLine(kind, fields)))] },
       },
     }), { abortSignal: AbortSignal.timeout(3_000) });
   } catch (error) {
-    if (error.name !== 'ConditionalCheckFailedException') console.error('Timeline write failed', line.id, error.name);
+    if (error.name !== 'ConditionalCheckFailedException') console.error('Timeline write failed', kind, error.name);
   }
 }
 async function timelineLines(runId) {
@@ -205,10 +224,7 @@ async function start(token, row) {
   // record the ARN; neither can overwrite a later stage or a different run.
   const runId = run.run_id.S;
   // Written before the invoke so it precedes the workflow's own lines.
-  await timeline(runId, {
-    id: 'web-start', text: `Presenter pressed Start: ${playersOf(row).length} players in the room`,
-    detail: { players: playersOf(row).length, run_id: runId },
-  });
+  await timeline(runId, 'start', { players: playersOf(row).length, run_id: runId });
   try {
     const { DurableExecutionArn } = await lambda.send(new InvokeCommand({
       FunctionName: workflow, InvocationType: 'Event', DurableExecutionName: runId,
@@ -318,10 +334,7 @@ async function close(token, round, row, state) {
   if (state.phase === 'open') {
     const frozen = JSON.parse(claimed.frozen_data.S);
     const picked = frozen.filter(player => player.picks?.[round]).length;
-    await timeline(state.id, {
-      id: `web-close-${round}`, text: `Presenter closed ${round}: ${picked} of ${frozen.length} players picked`,
-      detail: { round, picked, players: frozen.length },
-    });
+    await timeline(state.id, 'close', { round, picked, players: frozen.length });
   }
   try {
     await lambda.send(new SendDurableExecutionCallbackSuccessCommand({
@@ -344,8 +357,10 @@ async function close(token, round, row, state) {
 const requestLog = new AsyncLocalStorage();
 function note(phase, round) {
   const entry = requestLog.getStore();
-  if (entry && phase) { entry.phase = phase; entry.round = round ?? undefined; }
+  if (entry && PHASES.has(phase)) { entry.phase = phase; entry.round = ROUND_IDS.includes(round) ? round : undefined; }
 }
+const PHASES = new Set(['ready', 'starting', 'open', 'closing', 'final', 'expired', 'failed']);
+const METHODS = new Set(['GET', 'POST', 'HEAD', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 const POLLS = new Set(['/api/state', '/api/host/state', '/api/host/timeline']);
 const API_ROUTES = new Set([
   'GET /api/state', 'GET /api/host/state', 'GET /api/host/timeline', 'GET /api/host/qr.svg',
@@ -360,8 +375,8 @@ function routeTemplate(method, url) {
 function accessLine(entry, status) {
   const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : POLLS.has(entry.route) ? 'debug' : 'info';
   return JSON.stringify({
-    bf: 'access', level, method: entry.method, route: entry.route, status, ms: Date.now() - entry.start,
-    ...(entry.phase && { phase: entry.phase }), ...(entry.round && { round: entry.round }),
+    bf: 'access', level, method: METHODS.has(entry.method) ? entry.method : 'other', route: entry.route, status,
+    ms: Date.now() - entry.start, ...(entry.phase && { phase: entry.phase }), ...(entry.round && { round: entry.round }),
   });
 }
 
@@ -539,9 +554,7 @@ async function route(request, response) {
     // Force: any phase, as long as the presenter's token names this run.
     const next = fresh();
     if (token !== row.run_id.S || !await replace(next, 'run_id = :id', { ':id': row.run_id })) throw new ActionConflict();
-    await timeline(next.run_id.S, {
-      id: 'web-reset', text: 'Presenter reset the game', detail: { run_id: next.run_id.S },
-    });
+    await timeline(next.run_id.S, 'reset', { run_id: next.run_id.S });
   } else {
     await close(token, headers['x-rehearsal-round'], row, await describe(row));
   }
