@@ -277,7 +277,7 @@ message), so every environment, and Live Tail and FilterLogEvents alike, gives
 the same id for the same line. Text and details are redacted again: signed or
 payment URLs, 32-hex ids, token-, receipt- and cookie-shaped values. The status
 bar counts players and picks without names. Running and signing in:
-[aws-rehearsal.md](processes/aws-rehearsal.md#hosted-live-log-fourround).
+[aws-rehearsal.md](processes/aws-rehearsal.md#live-log-for-the-room-fourround).
 
 ## The arena
 

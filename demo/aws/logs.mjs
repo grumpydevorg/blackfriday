@@ -60,7 +60,7 @@ function make(id, ts, tag, level, source, text, detail) {
   };
 }
 
-// ---------------------------------------------------------------- CloudWatch lines (ported from watch.py)
+// ---------------------------------------------------------------- CloudWatch lines
 
 const LEVEL_NAMES = { DEBUG: 'debug', INFO: 'info', WARN: 'warn', WARNING: 'warn', ERROR: 'error', CRITICAL: 'error', FATAL: 'error' };
 const ERRORISH = /\b(ERROR|Error|Exception|Traceback|FAILED|Task timed out)\b/;
@@ -175,7 +175,7 @@ export function groupTag(group) {
 const shown = (message, record) => String(record?.message ?? message);
 const seconds = ms => (Number(ms) / 1000);
 
-/** One CloudWatch message -> {tag, level, text, detail} or undefined (dropped). Port of watch.py's handle_log. */
+/** One CloudWatch message -> {tag, level, text, detail} or undefined (dropped). */
 export function classify(groupKind, rawMessage) {
   const message = String(rawMessage ?? '').trim();
   if (!message) return undefined;
@@ -287,7 +287,7 @@ export function fromCloudWatch(group, raw) {
 /** `arn:aws:logs:<region>:<account>:log-group:<name>[:*]` or `<account>:<name>` -> `<name>`. */
 export const groupOfIdentifier = identifier => String(identifier ?? '').split('log-group:').pop().replace(/:\*$/, '').replace(/^\d{12}:/, '');
 
-// ---------------------------------------------------------------- Durable history (ported from watch.py durable_line)
+// ---------------------------------------------------------------- Durable history
 
 const SKIP_STARTED = new Set(['StepStarted', 'ContextStarted']);
 const stamp = value => new Date(value).getTime();

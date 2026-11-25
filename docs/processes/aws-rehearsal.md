@@ -151,10 +151,10 @@ The pages load `round.js` and `round.css` as `?v=<content hash>`, so a browser
 that cached the old script for its hour never runs it against a new page after
 a redeploy.
 
-### Hosted live log (fourround)
+### Live log for the room (fourround)
 
-A separate, presenter-only Web Function, `black-friday-four-logs`, serves the
-same log from AWS. It needs no laptop, tunnel or SSO session:
+A separate, presenter-only Web Function, `black-friday-four-logs`, streams the
+game's log from AWS. It needs no laptop, tunnel or SSO session:
 
 ```sh
 cd demo
@@ -180,6 +180,25 @@ the current execution's Durable history every 2 s, and CloudWatch through one
 Live Tail session. FilterLogEvents fills the last 15 minutes on connect and any
 gaps every 10 s.
 
+| Tag | Source |
+|:--|:--|
+| `GAME` | The arena item: Reset, phase and round changes, joins, picks so far, and each round's results (market draw, best option, top player). |
+| `DURABLE` | The execution's history: each operation once (steps, invokes, the parallel migrations and checks, callbacks waiting and Closes received), with elapsed time, and each suspension between invocations. |
+| `MICROVM` | The Launch, careful and fast results once the workflow publishes them. |
+| `VM`, `PHP` | Inside each VM: one timed line per stage (setup received, initdb, PostgreSQL start, `migrate.php` or `pg_restore`, PHP shop ready, Maya's saved cart, artifact exported, shutdown) and one line per shop request (`GET /cart/cart-saved 404 3 ms`), labelled with the run prefix, action and option. |
+| `EVENT` | The Event judge's sub-steps (VM requested, endpoint ready, setup sent, each shop check with status and ms, artifact saved, VM terminated) and its duration and cold start. |
+| `WORKFLOW` | One line per Durable step (market draw, bots, best option, leader's total) and each invocation's duration. |
+| `WEB` | One access line per request (route template, status, ms, phase and round; polls are `debug`), and each minute a summary: requests per minute, environments, peak concurrency, cold starts and errors from `platform.invokeSummary`. |
+| `ERROR` | Error lines, trimmed, from any of those sources. |
+
+**VM logs reach CloudWatch through the judge.** RunMicrovm refuses CloudWatch
+logging without an `executionRoleArn`, and the VM keeps no AWS role, so runs use
+`logging={disabled}`. `vm_runtime.py` keeps its last 500 lines in memory; the
+evaluator reads them from `GET /control/log` before it terminates the VM (also
+after a failure) and prints them as `[VM]` and `[PHP]` lines in its own log
+group. Neither prints a payment URL, receipt, token or full run id, and the
+evaluator replaces any URL- or receipt-shaped text again.
+
 Measured in a 5-player game on 25 November 2026 (04:26 UTC), from the event's
 own timestamp to arrival in the browser stream:
 
@@ -200,53 +219,9 @@ lasts up to the 900-second timeout, then the browser reconnects with
 `Last-Event-ID`. The server re-sends from 60 s before that cursor, and the page
 drops duplicates by event id, so a reconnect leaves no gap and no duplicate. If
 no `hello` arrives within 5 s the page polls `/events` every 2 s instead.
-Filtering is client-side, as in `watch_web.py`.
-
-### Live log for the room (fourround)
-
-```sh
-cd demo
-export BLACK_FRIDAY_AWS_ACCOUNT=<account> BLACK_FRIDAY_AWS_PROFILE=<profile>
-BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/watch.py | tee -a ~/bf-watch.log
-```
-
-[`watch.py`](../../demo/aws/watch.py) prints one coloured line per event in
-Adelaide time, at most 120 characters. It only reads AWS, and it refuses to run
-against any account but the game's.
-
-| Tag | Source |
-|:--|:--|
-| `GAME` | The arena item, read every second: Reset, phase and round changes, joins, picks so far, and each round's results (market draw, best option, top player). |
-| `DURABLE` | The execution's history, read every 2 s: each operation once (steps, invokes, the parallel migrations and checks, callbacks waiting and Closes received), with elapsed time, and each suspension between invocations. |
-| `MICROVM` | The Launch, careful and fast results once the workflow publishes them. |
-| `VM`, `PHP` | Inside each VM: one timed line per stage (setup received, initdb, PostgreSQL start, `migrate.php` or `pg_restore`, PHP shop ready, Maya's saved cart, artifact exported, shutdown) and one line per shop request (`GET /cart/cart-saved 404 3 ms`), labelled with the run prefix, action and option. |
-| `EVENT` | The Event judge's sub-steps (VM requested, endpoint ready, setup sent, each shop check with status and ms, artifact saved, VM terminated) and its duration and cold start. |
-| `WORKFLOW` | One line per Durable step (market draw, bots, best option, leader's total) and each invocation's duration. |
-| `WEB` | One access line per request (route template, status, ms, phase and round; polls are `debug`), and each minute a summary: requests per minute, environments, peak concurrency, cold starts and errors from `platform.invokeSummary`. |
-| `ERROR` | Error lines, trimmed, from any of those sources. |
-
-**VM logs reach CloudWatch through the judge.** RunMicrovm refuses CloudWatch
-logging without an `executionRoleArn`, and the VM keeps no AWS role, so runs use
-`logging={disabled}`. `vm_runtime.py` keeps its last 500 lines in memory; the
-evaluator reads them from `GET /control/log` before it terminates the VM (also
-after a failure) and prints them as `[VM]` and `[PHP]` lines in its own log
-group. Neither prints a payment URL, receipt, token or full run id, and the
-evaluator replaces any URL- or receipt-shaped text again.
-
-The room screen (stdout) leaves out `debug` events and routine `WEB` access
-lines. Every event, including those, also goes to `~/bf-watch.jsonl`
-(`{ts, tag, level, source, text, detail}`; player names are left out).
-
-**Filterable viewer.** `python3 aws/watch_web.py` serves the JSONL on
-<http://127.0.0.1:7682/> (loopback only): the last 2,000 events and then a live
-stream. In the browser you can toggle tags and levels (`debug` is hidden by
-default), search (optionally with a regex), pause, and expand a line. Filters
-live in the URL hash, and the page keeps 10,000 lines.
-
-Logs come from CloudWatch Logs Live Tail, which reconnects when a session ends
-(sessions last at most 3 hours) or drops. When the SSO session expires it prints
-one red line with the `aws sso login` command and retries every 30 seconds.
-It never prints token hashes, tokens or cookies.
+In the browser you can toggle tags and levels (`debug` is hidden by default),
+search (optionally with a regex), pause, and expand a line. Filters live in the
+URL hash, and the page keeps 10,000 lines.
 
 ## What runs
 
