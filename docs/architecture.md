@@ -52,11 +52,14 @@ load balancer, VPC or NAT gateway. The team's side of the built game is not a
 cloud at all: each player picks options, and [`model.py`](../demo/aws/model.py)
 computes the shop (see [game.md](game.md#economics)).
 
-Three deployments with the same shape and no shared resources except the
-presenter key and passphrase (selected by `BLACK_FRIDAY_DEPLOYMENT`): the
-**four-round game** (`fourround`), the one-round **round** it replaced (frozen at
-tag `round-fallback-2026-11-25`), and the **rehearsal**, the frozen IAM-only
-predecessor of both (tag `rehearsal-fallback-2026-11-24b`). The four-round game:
+One deployment is live: the **four-round game** (`fourround`), with no shared
+resources besides the presenter key and passphrase (selected by
+`BLACK_FRIDAY_DEPLOYMENT`). Two earlier deployments of the same shape were
+destroyed on 25 November 2026, artifacts buckets kept, and are redeployed from
+their tags: the one-round **round** (`round-fallback-2026-11-25`) and the
+**rehearsal**, the IAM-only predecessor of both
+(`rehearsal-fallback-2026-11-24b`). Tonight's rollback tag for `fourround` is
+`fourround-live-2026-11-25`. The four-round game:
 
 ```mermaid
 flowchart LR
@@ -89,10 +92,10 @@ flowchart LR
 | `black-friday-four-workflow` ([`workflow.py`](../demo/aws/workflow.py)) | Durable Function | The real Launch, migrations and checks, then for each of four rounds: wait for Close → plan (market, bots, dice) → score → publish results | 48 h execution, 23 h callbacks, 7-day history; at most five MicroVMs per game, none after Round 1 opens |
 | `black-friday-four-evaluator` ([`evaluator.py`](../demo/aws/evaluator.py)) | Event Function | Starts a MicroVM for one real stage (`launch`, `migrate` or `compare`, careful or fast), drives the shop, checks the order, payment and saved cart, saves the result | 512 MB, 300 s, at most 10 at once |
 | `black-friday-four-shop` | MicroVM image | PHP shop with SQLite or PostgreSQL 17 | ARM64, 1 GiB; each VM at most 120 s, no role |
-| Arena table | DynamoDB, on demand | The arena item (roster, phase, callback), one immutable results item per round, the sign-in throttle | 100 audience players; each item is small against the 400 KB item limit |
-| Artifacts ([`artifacts.yaml`](../demo/aws/artifacts.yaml)) | S3, versioned | Code packages, checkpoints between stages, payment receipts | Objects expire after 7 days; old versions after 1 day |
+| Arena table | DynamoDB, on demand | The arena item (roster, phase, callback), one immutable results item per round, the sign-in throttle, the timeline | 100 audience players; each item is small against the 400 KB item limit |
+| Artifacts ([`artifacts.yaml`](../demo/aws/artifacts.yaml)) | S3, versioned | Code packages, checkpoints between stages, payment receipts | `runs/` objects expire after 7 days (old versions after 1 day); code packages are kept |
 
-`round` and `rehearsal` are the same shape with their own names:
+`round` and `rehearsal` had the same shape with their own names:
 `BlackFridayRound`, `black-friday-round` and `black-friday-round-evaluator`;
 `BlackFridayRehearsal`, `black-friday-arena` and `black-friday-evaluator` (at most
 4 at once) with an IAM-only endpoint that `present` signs with SigV4. Each is
@@ -128,7 +131,9 @@ flowchart LR
 
 - The gateway ([`vm_runtime.py`](../demo/aws/vm_runtime.py)) serves `/ready`,
   a single-use `/control/setup` (launch, migrate or compare; keep or drop data),
-  `/control/artifact` (SQLite file or PostgreSQL dump), and a fixed list of shop
+  `/control/artifact` (SQLite file or PostgreSQL dump), `/control/log` (the VM's
+  last 500 log entries: the judge reads them before terminating the VM, because
+  RunMicrovm logging needs a role the VM must not have), and a fixed list of shop
   routes. Everything else is 404.
 - The shop holds no payment credential. The relay accepts only the checkout the
   judge expects and writes one receipt through a link that expires with the VM.
@@ -205,7 +210,9 @@ event `{id: <run id>}`). Every operation name is unique and round-scoped.
 3. `migrate-every-option` runs `migrate-careful` and `migrate-fast` in parallel;
    then `check-every-option` runs `compare-careful` and `compare-fast` (only for
    migrations that worked). An option whose migration or check fails uses its
-   `recorded_evidence` from `rounds.json`; the other option is untouched.
+   `recorded_evidence` from `rounds.json`; the other option is untouched (if
+   Launch fails before saving its result, both migrations fail with "Missing
+   prerequisite" and both options use recorded evidence).
 4. For each round (`launch`, `growth`, `blackfriday`, `christmas`):
    `publish-open-<round>` sets the phase `open`, the round and the callback id
    (Launch also writes `launch_data` and `evidence_data`; later rounds write
@@ -229,35 +236,47 @@ DynamoDB, one on-demand table:
 | `arena` | `run_id`, `phase`, `round` (the round open or closing), `results_round`, `teams_data` (JSON roster: `id`, `name`, `house`, `token_hash`, `picks`), `frozen_data` (the roster as Close froze it), `callback_id`, `lease_until` (the Close retry lease), `execution_arn`, `workflow_arn`, `start_deadline`, `launch_data`, `evidence_data`, `expired_action` |
 | `results#<run>#<round>` | `run_id`, `round`, `data` (JSON `{round, market, summary, rows}`); written once per round, never changed |
 | `login` | The sign-in throttle: `window_start`, `failures` |
-| `timeline#<run>` | `run_id`, `lines`: the presenter's "Behind the scenes" log, a list of JSON strings `{id, t, tag, text, detail?, log_group?}`, at most 300 per run |
+| `timeline#<run>` | `run_id`, `lines`: the presenter's "Behind the scenes" log, a list of JSON strings, one timeline item each (below), at most 300 per run |
 
-**Timeline.** Each line has a stable `id`, and each id appears once in a normal
-game. The workflow writes `registered`, `launch`, `migrate-<option>`,
-`compare-<option>` (in a `timeline-evidence` step after step 3), `open-<round>`,
-and in `publish-results-<round>` `close-`, `plan-`, `score-` and
-`results-<round>`, then `final`. The Web Function writes `web-reset` (into the
-new run), `web-start` and `web-close-<round>`. The workflow writes only inside
-checkpointed steps, so a replay never repeats a line. Every append is one
-`list_append` UpdateItem conditioned on fewer than 300 lines. A failed write is
-logged and ignored, so the timeline can never stop a game. `detail` keys come
-from a fixed list (durations, VM ids, execution ARN, round, option, cart status,
-charges, market, players, picked, bots, best option, leader); tokens, token
-hashes, cookies and callback ids are never written. Only `GET
-/api/host/timeline` reads it; phones' `/api/state` never carries it.
+**Timeline.** One item is `{id, t, tag, level, text, detail, log_group?}`: `t` is
+epoch ms, `tag` is `DURABLE`, `MICROVM` or `WEB`, and `level` is `debug`, `info`,
+`warn` or `error`. One constructor decides tag, level and log group together:
+[`workflow.timeline_line`](../demo/aws/workflow.py) and `webLine` in
+[`web.mjs`](../demo/aws/web.mjs). `DURABLE` is a decision the workflow recorded
+(registered, round open, Close received, plan, score, results, final); recorded
+evidence and expiry are `DURABLE` at `warn`; `MICROVM` is evidence that really
+ran in a VM (Launch, careful, fast), with the evaluator's log group; `WEB` is a
+presenter action (Reset is `warn`). Each line has a stable `id`, and each id
+appears once in a normal game. The workflow writes `registered`, `launch`,
+`migrate-<option>`, `compare-<option>` (in a `timeline-evidence` step after
+step 3), `open-<round>`, and in `publish-results-<round>` `close-`, `plan-`,
+`score-` and `results-<round>`, then `final` (or `expire-<round>` when a Close
+times out). The Web Function writes
+`web-reset` (into the new run), `web-start` and `web-close-<round>`. The workflow
+writes only inside checkpointed steps, so a replay never repeats a line. Every
+append is one `list_append` UpdateItem conditioned on fewer than 300 lines. A
+failed write is logged and ignored, so the timeline can never stop a game.
+`detail` keys come from a fixed list per line kind (durations, VM ids, execution
+ARN, round, option, cart status, charges, market, players, picked, bots, best
+option, leader); tokens, token hashes, cookies and callback ids are never
+written. Only `GET /api/host/timeline` and the read-only logs function read it;
+phones' `/api/state` never carries it.
 
 Phases: `ready` → (Start) `starting` → `open` (Launch) → (Close) `closing` →
-`open` (Growth) → … → `closing` → `final`. `expired` is set when the execution
-is not found within 90 s of Start or a Close callback times out; `failed` is not
-stored: the Web Function reports it when Lambda says the execution failed,
-stopped or succeeded without a `final` phase. Reset replaces the arena item with
-a new `ready` run in any phase. The workflow's writes name the run, the ARN and
-the previous phase, so a stale execution cannot change a newer run.
+`open` (Growth) → … → `closing` → `final`. `expired` is set when the execution is not found within
+90 s of Start, when a Close callback times out, or when Lambda reports the
+execution `TIMED_OUT`; `failed` is not stored: the Web Function reports it when
+Lambda says the execution `FAILED`, `STOPPED`, is `DELETING`, or `SUCCEEDED`
+without a `final` phase. Reset replaces the arena item with a new `ready` run in
+any phase. The workflow's writes name the run, the ARN and the previous phase, so
+a stale execution cannot change a newer run.
 
 A results row (about 360 bytes of JSON with a 20-character name, so about 37 KB
-per round at 101 players, computed offline with `model.py`) carries `id`, `name`, `house`, `bot`,
-`rank`, `option`, `roll`, `risk`, `hit`, `event`, `sales`, `slow`, `failed`,
-`cost_cents`, `refund_cents`, `profit_cents`, `cumulative_cents`, `returning`
-and `evidence` (`real`, `recorded` or `modelled`).
+per round at 101 players, computed offline with `model.py`) carries `id`, `name`,
+`house`, `bot`, `rank`, `option`, `roll`, `risk`, `hit`, `outcome` (`held`, `hit`
+or `lost_carts`; the colour follows it, while `hit` is the dice alone), `event`,
+`sales`, `slow`, `failed`, `cost_cents`, `refund_cents`, `profit_cents`,
+`cumulative_cents`, `returning` and `evidence` (`real`, `recorded` or `modelled`).
 
 ## The logs function
 
@@ -277,7 +296,42 @@ message), so every environment, and Live Tail and FilterLogEvents alike, gives
 the same id for the same line. Text and details are redacted again: signed or
 payment URLs, 32-hex ids, token-, receipt- and cookie-shaped values. The status
 bar counts players and picks without names. Running and signing in:
-[aws-rehearsal.md](processes/aws-rehearsal.md#live-log-for-the-room-fourround).
+[aws-rehearsal.md](processes/aws-rehearsal.md#live-log-for-the-room-fourround);
+what each tag means is in the table there.
+
+### Log lines
+
+One closed vocabulary runs from the producers to the viewer.
+
+- **Tags** (eight): `DURABLE`, `WORKFLOW`, `EVENT`, `MICROVM`, `VM`, `PHP`, `WEB`
+  and `WATCH` (the viewer's own status line; only the logs function emits it).
+  There is no `GAME` or `ERROR` tag: an error is a level.
+- **Levels**: `debug`, `info`, `warn`, `error`.
+- **Evidence source**: `real`, `recorded`, `modelled`. The real-evidence options
+  are read from `rounds.json` (`evidence: "real"`: growth `careful` and `fast`),
+  never listed by hand.
+
+Each producer prints one JSON object per line after a fixed prefix; nothing
+parses free text, except the Web Function's `console.error` lines, which stay
+free text.
+
+| Producer | Line | Fields |
+|:--|:--|:--|
+| VM, [`vm_runtime.py`](../demo/aws/vm_runtime.py) buffer entry | one JSON object; `/control/log` returns `{"entries":[...]}` | `seq` (0-based, monotonic per VM), `t` (epoch ms), `kind` (`stage` or `php`), `level`, `run` (first 8 characters of the run id), `action` (`launch`, `migrate` or `compare`), `option` (`careful`, `fast` or null), `msg` (at most 200 characters, redacted before it is cut). A stage entry may carry `ms`. A `php` entry also carries `method`, `path` (no query string), `status` and `ms`. PHP's own stderr is a `stage` entry whose message starts `php:`. |
+| Evaluator relay | `[VM] <json>` | Each valid VM entry unchanged, in `seq` order; an invalid one is dropped and counted in one `[EVENT]` warn line. Kind `php` becomes tag `PHP`, every other entry tag `VM`. |
+| Evaluator | `[EVENT] <json>` | `t`, `level`, `action`, `option` (null for launch), `step` (`launch`, `migrate-careful`, …), `msg` and, for a timed step, `ms`. |
+| Workflow | `[WORKFLOW] <json>` | `step`, `round` (or null), `level`, `msg`. Printed only inside checkpointed steps, so a replay never repeats one. |
+| Timeline item | stored, not logged | `{t, id, tag, level, text, detail, log_group?}`, above. |
+| Web access | `{"bf":"access",…}` | `level`, `method`, `route`, `status`, `ms` and optionally `phase`, `round`; `method`, `phase` and `round` come from closed sets. |
+
+No entry carries a payment URL, receipt, token, signed URL, request body or
+header. Examples:
+
+```
+{"seq":1,"t":1795585743478,"kind":"php","level":"info","run":"aaaaaaaa","action":"compare","option":"careful","msg":"GET /cart/cart-saved 404 12 ms","method":"GET","path":"/cart/cart-saved","status":404,"ms":12}
+[WORKFLOW] {"step":"plan-growth","round":"growth","level":"info","msg":"market 18%, 0 bots, 2 players"}
+{"t":1795585822599,"id":"compare-fast","tag":"DURABLE","level":"warn","text":"Fast migration check (recorded): cart LOST (404)","detail":{"cart_status":404,"charges":0,"option":"fast","source":"recorded"},"log_group":"/aws/lambda/bf-workflow"}
+```
 
 ## The arena
 
@@ -298,14 +352,15 @@ rules in [`game.mjs`](../demo/aws/game.mjs)) serves two pages, both driven by
   ([`host_auth.mjs`](../demo/aws/host_auth.mjs)). The passphrase is Rick's own
   (SSM SecureString, set with `operate.py passphrase`); the session cookie is an
   HMAC keyed by the SSM presenter key over the current passphrase, so changing
-  either signs every device out. After sign-in: QR and public URL, the players
-  with ticks for who has picked, Remove while joining is open, the round's
-  forecast and market range, **Start**, **Close round N** and **Reset**, the
-  market draw, a per-option summary of the last round, the board, the evidence,
-  and the execution ARN. Each action is bound to the current run (and Close to
-  the open round), so a double-click cannot advance it twice. Only these
-  actions start compute. `operate.py present` (presenter key header) remains as
-  a second way in.
+  either signs every device out. After sign-in: QR and public URL (and a full
+  screen QR), the players with ticks for who has picked, Remove while joining is
+  open, the round's forecast and market range, **Start**, **Close round N** and
+  **Reset**, the market draw, a per-option summary of the last round, the board,
+  the evidence, and the execution ARN; a "Behind the scenes" timeline drawer with
+  tag filters and search; and an **Explanations** toggle for the callouts. Each
+  action is bound to the current run (and Close to the open round), so a
+  double-click cannot advance it twice. Only these actions start compute.
+  `operate.py present` (presenter key header) remains as a second way in.
 
 Routes and rules: [AWS game and rehearsal](processes/aws-rehearsal.md#what-runs).
 The frozen rehearsal serves the older single presenter page,

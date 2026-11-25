@@ -1,18 +1,22 @@
 # AWS game and rehearsal
 
-Three separate deployments run in Sydney (`ap-southeast-2`):
+One deployment is live in Sydney (`ap-southeast-2`): **fourround**, the four-round
+game. The one-round `round` deployment and the `rehearsal` deployment were
+destroyed on 25 November 2026 (their artifacts buckets were kept); redeploy
+either from its tag ([the frozen deployments](#the-frozen-deployments)).
 
-| Deployment | What it is | Endpoint | Presenter page |
-|:--|:--|:--|:--|
-| **fourround** | The four-round game: everyone in the room plays, up to 100 players plus the house, and bots if the room is thin | Public (`ApplicationManaged`): players open it on their phones | <http://127.0.0.1:8770/host> |
-| **round** | The one-round game it replaced (up to 200 teams, one Growth round). Frozen at tag `round-fallback-2026-11-25` | Public | <http://127.0.0.1:8768/host> |
-| **rehearsal** | Nobody plays: the presenter compares two releases. Frozen at tag `rehearsal-fallback-2026-11-24b` | IAM only | <http://127.0.0.1:8767/> |
+| Deployment | What it is | Endpoint | Presenter page | Now |
+|:--|:--|:--|:--|:--|
+| **fourround** | The four-round game: everyone in the room plays, up to 100 players plus the house, and bots if the room is thin | Public (`ApplicationManaged`): players open it on their phones | <http://127.0.0.1:8770/host> | Deployed. Rollback tag for the 25 November talk: `fourround-live-2026-11-25` |
+| **round** | The one-round game it replaced (up to 200 teams, one Growth round) | Public | <http://127.0.0.1:8768/host> | Destroyed; tag `round-fallback-2026-11-25` |
+| **rehearsal** | Nobody plays: the presenter compares two releases | IAM only | <http://127.0.0.1:8767/> | Destroyed; tag `rehearsal-fallback-2026-11-24b` |
 
 Select one with `BLACK_FRIDAY_DEPLOYMENT=fourround`, `round` or `rehearsal` (the
 default). They share no stacks, functions, tables or Web Function, so one can
 change or be torn down without touching the others. `fourround` and `round`
-share one thing on purpose: the presenter key and passphrase in SSM. The
-[local demo](local-play.md) needs no AWS account and is the last fallback.
+share one thing on purpose: the presenter key and passphrase in SSM, which
+outlive every teardown. The [local demo](local-play.md) needs no AWS account and
+is the last fallback.
 
 | | Stack | Artifacts stack | Web Function |
 |:--|:--|:--|:--|
@@ -79,8 +83,8 @@ version, never the value. Console fallback: Systems Manager → Parameter Store 
 `/black-friday/round/presenter-passphrase` → Edit → SecureString value (at least
 8 characters). Changing it signs every device out within 30 seconds: each cookie
 is an HMAC over its expiry, keyed by the SSM presenter key over the current
-passphrase, so neither secret is in it. Until a passphrase exists, sign-in
-answers 503 and presenter routes stay 403.
+passphrase. Until a passphrase exists, sign-in answers 503; presenter routes
+accept only the presenter key.
 
 Sign-in is throttled across all of the Web Function's environments: ten failed
 attempts in ten minutes, then every sign-in gets 429 until the window passes.
@@ -113,7 +117,8 @@ process on the Mac itself is trusted, as it already is for 8770. Without
 
 The page shows the public URL as text and a QR code, the players and whether they
 have picked for the open round, the round's forecast and market range, the
-execution ARN, and three buttons. **Full screen** under the QR (or a click on the
+execution ARN, three action buttons and an **Explanations** on/off toggle (the
+callouts that say what each Lambda is doing). **Full screen** under the QR (or a click on the
 QR) shows the QR as large as the screen allows, with the public URL in large
 text and "Scan. Join. Play.", in browser fullscreen; Esc or a click closes it.
 
@@ -126,7 +131,7 @@ text and "Scan. Join. Play.", in browser fullscreen; Esc or a click closes it.
    page says to reset. If the close callback's 20-second lease lapses without
    AWS confirming it, the button becomes **Retry close round N**.
 3. **Reset.** In any phase: throws every player and score away and starts a fresh
-   lobby. The page asks first unless the game is waiting or over. A running
+   lobby. The page asks first unless the game is waiting or final. A running
    Durable execution is not stopped; its writes no longer match the new run.
 
 While joining is open each audience player has a **Remove** button (the house
@@ -138,15 +143,16 @@ Each callback waits at most 23 hours, so click Start less than 23 hours before
 the first Close, and keep the gap between Closes under 23 hours.
 
 **Behind the scenes.** Below the controls a drawer, collapsed by default, shows
-what the game is doing on AWS. Each line has its time (Adelaide), a coloured
-tag (`GAME`, `DURABLE`, `EVENT`, `MICROVM`, `WEB`) and a short text: Start,
-the execution registered, the real Launch, the two migrations and checks (cart
-kept or lost, VM id), each round opening, Close (picks frozen), the market draw
-and bots, the best option and leader, results, final, and Reset. While open it
-polls `GET /api/host/timeline` every 2 seconds, one request at a time, never
-retrying a 429. Clicking a line shows its details and, where the line names a
-log group, an **Open logs in CloudWatch** link to that group in the Sydney
-console (you need your own console sign-in). The data model is in
+what the game is doing on AWS. Each line has its time (Adelaide), a coloured tag
+(`DURABLE`, `MICROVM` or `WEB`, which you can toggle as filters, beside a search
+box) and a short text: Start, the execution registered, the real Launch, the two
+migrations and checks (cart kept or lost, VM id), each round opening, Close
+(picks frozen), the market draw and bots, the best option and leader, results,
+final, and Reset. Recorded evidence, an expired close and Reset are `warn`. While
+open it polls `GET /api/host/timeline` every 2 seconds, one request at a time,
+never retrying a 429. Clicking a line shows its details and, where the line names
+a log group, an **Open logs in CloudWatch** link to that group in the Sydney
+console (you need your own console sign-in). The item shape and data model are in
 [architecture.md](../architecture.md#the-durable-game-and-its-items).
 
 The pages load `round.js` and `round.css` as `?v=<content hash>`, so a browser
@@ -182,24 +188,32 @@ the current execution's Durable history every 2 s, and CloudWatch through one
 Live Tail session. FilterLogEvents fills the last 15 minutes on connect and any
 gaps every 10 s.
 
+Every line has one of eight tags, a level (`debug`, `info`, `warn` or `error`;
+an error is a level, never a tag) and the structured formats in
+[architecture.md](../architecture.md#log-lines). Filter errors with the `error`
+level.
+
 | Tag | Source |
 |:--|:--|
-| `GAME` | The arena item: Reset, phase and round changes, joins, picks so far, and each round's results (market draw, best option, top player). |
-| `DURABLE` | The execution's history: each operation once (steps, invokes, the parallel migrations and checks, callbacks waiting and Closes received), with elapsed time, and each suspension between invocations. |
-| `MICROVM` | The Launch, careful and fast results once the workflow publishes them. |
-| `VM`, `PHP` | Inside each VM: one timed line per stage (setup received, initdb, PostgreSQL start, `migrate.php` or `pg_restore`, PHP shop ready, Maya's saved cart, artifact exported, shutdown) and one line per shop request (`GET /cart/cart-saved 404 3 ms`), labelled with the run prefix, action and option. |
-| `EVENT` | The Event judge's sub-steps (VM requested, endpoint ready, setup sent, each shop check with status and ms, artifact saved, VM terminated) and its duration and cold start. |
-| `WORKFLOW` | One line per Durable step (market draw, bots, best option, leader's total) and each invocation's duration. |
-| `WEB` | One access line per request (route template, status, ms, phase and round; polls are `debug`), and each minute a summary: requests per minute, environments, peak concurrency, cold starts and errors from `platform.invokeSummary`. |
-| `ERROR` | Error lines, trimmed, from any of those sources. |
+| `DURABLE` | The execution's history: each operation once (steps, invokes, the parallel migrations and checks, callbacks waiting and Closes received), with elapsed time, and each suspension between invocations; plus the workflow's decisions from the timeline item (registered, round open, Close received, plan, score, results, final, recorded evidence as `warn`). |
+| `WORKFLOW` | `[WORKFLOW]` lines: one per Durable step (market draw, bots, best option, leader's total) and each invocation's duration. |
+| `EVENT` | `[EVENT]` lines from the Event judge: VM requested, endpoint ready, setup sent, each shop check with status and ms, artifact saved, VM terminated; plus its duration and cold start. |
+| `MICROVM` | The summary of a stage that really ran in a VM: Launch, careful and fast, once the workflow publishes them. Recorded evidence is never `MICROVM`. |
+| `VM` | `[VM]` stage entries inside each VM: setup received, initdb, PostgreSQL start, `migrate.php` or `pg_restore`, PHP shop ready, Maya's saved cart, artifact exported, shutdown. |
+| `PHP` | `[VM]` entries of kind `php`: one per shop request (`GET /cart/cart-saved 404 3 ms`). |
+| `WEB` | The game Web Function: one access line per request (route template, status, ms, phase and round; polls are `debug`), and each minute `environment served N requests` with its peak concurrency. Its `console.error` lines are free text. |
+| `WATCH` | The viewer's own warnings, e.g. `live tail unavailable: …`. Only the logs function emits it. |
+
+The arena item feeds no log line: it gives the status bar its player and pick
+counts, and Story its cards.
 
 **VM logs reach CloudWatch through the judge.** RunMicrovm refuses CloudWatch
 logging without an `executionRoleArn`, and the VM keeps no AWS role, so runs use
-`logging={disabled}`. `vm_runtime.py` keeps its last 500 lines in memory; the
+`logging={disabled}`. `vm_runtime.py` keeps its last 500 entries in memory; the
 evaluator reads them from `GET /control/log` before it terminates the VM (also
-after a failure) and prints them as `[VM]` and `[PHP]` lines in its own log
-group. Neither prints a payment URL, receipt, token or full run id, and the
-evaluator replaces any URL- or receipt-shaped text again.
+after a failure) and prints each unchanged as `[VM] <json>` in its own log
+group. No entry carries a payment URL, receipt, token or full run id, and the
+evaluator drops an entry that is not valid.
 
 Measured in a 5-player game on 25 November 2026 (04:26 UTC), from the event's
 own timestamp to arrival in the browser stream:
@@ -344,8 +358,9 @@ versions.
 
 ### The frozen deployments
 
-On this branch `deploy` refuses `round` and `rehearsal`. Deploy either from its
-tag with `git archive`, and present it from either checkout:
+Both were destroyed on 25 November 2026, artifacts buckets kept. On this branch
+`deploy` refuses `round` and `rehearsal`. To bring either back, deploy it from
+its tag with `git archive`, and present it from either checkout:
 
 ```sh
 out=$(mktemp -d) && git archive round-fallback-2026-11-25 | tar -x -C "$out"
@@ -384,20 +399,25 @@ The one-round game's rules and runbook are in its own tag's copy of this file.
 When no run should resume, stop the presenter, then, for one deployment:
 
 ```sh
+BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy-logs         # the live log first: its function, log groups, stack and bucket
 BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy              # Web Function and its logs, then BlackFridayFourRound
 BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy --artifacts  # also its artifact bucket (all versions) and stack
 ```
 
 Use `BLACK_FRIDAY_DEPLOYMENT=round` or `rehearsal` (the default) for the others.
 `destroy` deletes in the only safe order: the Web Function first, because
-CloudFormation does not own it, then the stacks. Without `--artifacts` it keeps
-the artifacts stack and its bucket, with the packages and run evidence. With it,
-the stack goes before the bucket it retains, then the bucket is found by name
-and emptied, so a re-run finishes an interrupted teardown. It never touches the
-other deployments. The presenter key and passphrase stay in SSM, shared by
-`round` and `fourround` (`aws ssm delete-parameter --name
-/black-friday/round/presenter-passphrase` removes the passphrase; the sign-in
-then answers 503).
+CloudFormation does not own it, then the stacks. It deletes only the game
+function's own log groups (`web_log_groups` matches the exact name or a child of
+it); `black-friday-four-logs` has a name that starts the same way, and `destroy`
+no longer removes its log group (it did before 25 November 2026). It still never
+removes the logs function, stack or bucket, so run `destroy-logs` for those.
+Without `--artifacts` it keeps the artifacts stack and its bucket, with the
+packages and run evidence. With it, the stack goes before the bucket it retains,
+then the bucket is found by name and emptied, so a re-run finishes an
+interrupted teardown. It never touches the other deployments. The presenter key
+and passphrase stay in SSM, shared by `round` and `fourround` (`aws ssm
+delete-parameter --name /black-friday/round/presenter-passphrase` removes the
+passphrase; the sign-in then answers 503).
 
 Managed Instances is not part of any deployment. See
 [On-demand vs Managed Instances](launch-wave.md#on-demand-vs-managed-instances).
@@ -442,7 +462,7 @@ timeline. Every evidence source was `real` in all three completed games.
 | Timeline: every expected line once per game, nothing secret | exact | 33 lines per game, 0 missing, duplicated or extra, 0 secret-looking details |
 | `/api/host/timeline` without sign-in | 403 | 403 |
 
-Before this run, one 5-player game's logs in all five `fourround` log groups were
+Before this run, one 5-player game's logs in all four `fourround` log groups were
 searched for `php:`, `receipt`, `token`, `pay_url`, `X-Amz-`, `Signature`,
 `cookie`, the passphrase and the presenter key. The only hit was the apt
 package name `tokenizer.ini` in the image build log.

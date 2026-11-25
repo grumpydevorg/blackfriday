@@ -206,7 +206,7 @@ function renderPhone(state) {
     const head = make('p', '', 'option-head');
     head.append(make('span', optionLabel(state, results.round, mine.option), 'option-label'), badge(mine.evidence));
     const nodes = [make('p', `${resultRound?.weeks ?? ''} · result`, 'kicker'), make('h2', `${resultRound?.title ?? 'Last round'}: #${mine.rank} of ${results.board.total}`), head, make('p', mine.event, `event ${bad(mine) ? 'red' : 'green'}`)];
-    if (mine.risk > 0) nodes.push(make('p', `Dice: rolled ${mine.roll} against a risk of ${mine.risk}. ${mine.hit ? 'It hit.' : 'You were safe.'}`, 'dice'));
+    if (mine.risk > 0) nodes.push(make('p', `Dice: rolled ${mine.roll} against a risk of ${mine.risk}. ${mine.hit ? 'It hit.' : mine.outcome === 'lost_carts' ? 'The roll was safe, but the migration lost the carts.' : 'You were safe.'}`, 'dice'));
     if (resultRound) nodes.push(make('p', marketDraw(resultRound, results.market), 'market'));
     nodes.push(stats);
     if (mine.refund_cents) nodes.push(make('p', `Includes ${money(mine.refund_cents)} in refunds.`, 'hint'));
