@@ -139,7 +139,7 @@ def package_definitions(root: Path) -> dict[str, tuple[dict[str, Path], dict[str
             'aws/vm_runtime.py': AWS_DIR / 'vm_runtime.py',
             **{name: DEMO / name for name in ('schema.sql', 'db.php', 'shop.php', 'migrate.php')},
         }, {}),
-        'worker': ({'evaluator.py': AWS_DIR / 'evaluator.py'}, {'': root / 'sdk'}),
+        'worker': ({name: AWS_DIR / name for name in ('evaluator.py', 'rounds.json')}, {'': root / 'sdk'}),
         'workflow': ({
             name: AWS_DIR / name for name in ('workflow.py', 'model.py', 'rounds.json')
         }, {'': root / 'sdk'}),
@@ -295,6 +295,18 @@ def deploy_web(
     return 'https://' + wait_web(web, endpoint=True, function=function)['domainName']
 
 
+def web_log_groups(logs, function: str) -> list[dict]:
+    """The Web Function's own log groups. A name prefix alone also matches another function that starts with this
+    name (`black-friday-four` and `black-friday-four-logs`), so the match is the exact name or a child of it."""
+    name = f'/aws/lambda/web/{function}'
+    return [
+        group
+        for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=name)
+        for group in page['logGroups']
+        if group['logGroupName'] == name or group['logGroupName'].startswith(name + '/')
+    ]
+
+
 def remove_web(session, function: str = WEB_FUNCTION) -> None:
     """Delete what deploy_web created: the endpoint, the function and its logs."""
     web = session.client('lambda-web')
@@ -315,11 +327,9 @@ def remove_web(session, function: str = WEB_FUNCTION) -> None:
     else:
         raise TimeoutError('The Web Function endpoint is still deleting')
     logs = session.client('logs')
-    prefix = f'/aws/lambda/web/{function}'
-    for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=prefix):
-        for group in page['logGroups']:
-            logs.delete_log_group(logGroupName=group['logGroupName'])
-            print(f'Deleted log group {group["logGroupName"]}', flush=True)
+    for group in web_log_groups(logs, function):
+        logs.delete_log_group(logGroupName=group['logGroupName'])
+        print(f'Deleted log group {group["logGroupName"]}', flush=True)
 
 
 def delete_stack(session, stack: str) -> None:
@@ -396,12 +406,10 @@ def passphrase() -> None:
 def retain_web_logs(session, function: str = WEB_FUNCTION) -> None:
     """Keep the Web Function's request logs seven days, like every other log group here. Idempotent."""
     logs = session.client('logs')
-    prefix = f'/aws/lambda/web/{function}'
-    for page in logs.get_paginator('describe_log_groups').paginate(logGroupNamePrefix=prefix):
-        for group in page['logGroups']:
-            if group.get('retentionInDays') != 7:
-                logs.put_retention_policy(logGroupName=group['logGroupName'], retentionInDays=7)
-                print(f'Log group {group["logGroupName"]}: retention 7 days', flush=True)
+    for group in web_log_groups(logs, function):
+        if group.get('retentionInDays') != 7:
+            logs.put_retention_policy(logGroupName=group['logGroupName'], retentionInDays=7)
+            print(f'Log group {group["logGroupName"]}: retention 7 days', flush=True)
 
 
 def deploy(*, keep_failed: bool = False) -> None:

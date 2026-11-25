@@ -7,7 +7,8 @@ import re
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
-from time import monotonic, sleep
+from pathlib import Path
+from time import monotonic, sleep, time
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
@@ -19,9 +20,23 @@ from botocore.exceptions import ClientError
 MAX_ARTIFACT = 1024 * 1024
 VM_LIFESPAN = 120
 PRICE = 2500
-# The two real growth migrations: option id -> migration kind. `careful` copies every table
-# (carts survive); `fast` omits carts. The schema and ledger ids reuse the option id.
-OPTIONS = {'careful': 'preserve', 'fast': 'omit'}
+LEVELS = ('debug', 'info', 'warn', 'error')
+ACTIONS = ('launch', 'migrate', 'compare')
+
+
+def real_options() -> dict[str, str]:
+    """The options whose evidence is really run in a MicroVM, as option id -> migration kind, from rounds.json (the
+    one table the game, the workflow and this worker share; the worker package ships it). The kind follows what the
+    recorded evidence says the migration does to the saved cart: kept -> `preserve` (copies every table), lost ->
+    `omit` (skips carts). The schema and ledger ids reuse the option id."""
+    table = json.loads(Path(__file__).with_name('rounds.json').read_text())
+    return {
+        option['id']: 'preserve' if table['recorded_evidence'][option['id']]['cart_kept'] else 'omit'
+        for rnd in table['rounds'] for option in rnd['options'] if option['evidence'] == 'real'
+    }
+
+
+OPTIONS = real_options()
 HEX32 = re.compile(r'[0-9a-f]{32}')
 AWS_CONFIG = Config(connect_timeout=3, read_timeout=6, retries={'total_max_attempts': 2})
 
@@ -49,15 +64,56 @@ def seconds(started: float) -> str:
     return f'{monotonic() - started:.2f} s'
 
 
-def relay_line(line: object) -> str:
-    """One VM log line as an evaluator log line. The VM already prints no capability, receipt or full run id;
-    this drops anything URL- or receipt-shaped again, in case a PHP warning quotes one."""
-    text = re.sub(r'https?://\S+|[0-9a-f]{32}', '<redacted>', ' '.join(str(line).split()))[:240]
-    match = re.fullmatch(r'\[([^\]]*)\] (.*)', text)
-    if match is None:
-        return f'[VM] {text}'
-    label, rest = match.groups()
-    return f'[PHP] {rest[4:]}' if rest.startswith('php ') else f'[VM] {label}: {rest}'
+def millis(started: float) -> int:
+    return round((monotonic() - started) * 1000)
+
+
+# Anything URL- or receipt-shaped. The VM already redacts before it truncates (vm_runtime.redact); this is the same
+# rule applied again here, in case a VM entry still carries one. It changes nothing in a clean entry.
+SECRET = re.compile(r'https?://\S+|\S*X-Amz-\S*|[0-9a-fA-F]{32,}')
+VM_FIELDS = {'seq', 't', 'kind', 'level', 'run', 'action', 'option', 'msg'}
+PHP_FIELDS = {'method', 'path', 'status', 'ms'}
+
+
+def number(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def vm_entry(raw: object) -> dict | None:
+    """One VM log entry exactly as the VM wrote it, or None when it is not a valid one: the field set, types and
+    closed values of the contract. A stage entry may add `ms`; a PHP entry always has method, path, status, ms."""
+    if not isinstance(raw, dict):
+        return None
+    php = raw.get('kind') == 'php'
+    allowed = VM_FIELDS | PHP_FIELDS if php else VM_FIELDS | {'ms'}
+    if not VM_FIELDS <= set(raw) <= allowed or (php and not PHP_FIELDS <= set(raw)):
+        return None
+    run, option, message = raw['run'], raw['option'], raw['msg']
+    valid = (
+        number(raw['seq']) and number(raw['t']) and raw['kind'] in ('stage', 'php') and raw['level'] in LEVELS
+        and isinstance(run, str) and re.fullmatch(r'[0-9a-f]{8}', run) and raw['action'] in ACTIONS
+        and (option is None or option in OPTIONS) and isinstance(message, str) and len(message) <= 200
+        and number(raw.get('ms', 0))
+    )
+    if valid and php:
+        valid = (
+            isinstance(raw['method'], str) and re.fullmatch(r'[A-Z]{3,7}', raw['method'])
+            and isinstance(raw['path'], str) and raw['path'].startswith('/') and '?' not in raw['path']
+            and number(raw['status'])
+        )
+    if not valid:
+        return None
+    entry = {**raw, 'msg': SECRET.sub('<redacted>', message)}
+    if php:
+        entry['path'] = SECRET.sub('<redacted>', raw['path'])
+    return entry if entry != raw else raw
+
+
+def relay_lines(entries: list) -> tuple[list[str], int]:
+    """`[VM] <json>` for each valid entry, in the order the VM numbered them, and how many were dropped as invalid."""
+    valid = [entry for entry in map(vm_entry, entries) if entry is not None]
+    valid.sort(key=lambda entry: entry['seq'])
+    return [f'[VM] {json.dumps(entry, separators=(",", ":"))}' for entry in valid], len(entries) - len(valid)
 
 
 @dataclass(frozen=True)
@@ -199,7 +255,7 @@ class Shop:
         self.base = endpoint.rstrip('/')
         self.token = token
         self.deadline = deadline
-        self.emit = emit  # called with one text line per shop check; never given a body or a header
+        self.emit = emit  # called with (msg, level, ms) per shop check; never given a body or a header
 
     def request(self, path: str, body: dict | None = None, intention: str = '', timeout: float = 7) -> Reply:
         headers = {'X-aws-proxy-auth': self.token, 'X-aws-proxy-port': '8080'}
@@ -226,17 +282,19 @@ class Shop:
         started = monotonic()
         reply = self.request(path, **kwargs)
         if self.emit and not path.startswith('/control/'):
-            self.emit(f'check {path}: HTTP {reply.status} in {round((monotonic() - started) * 1000)} ms'
-                      + ('' if reply.status == status else f' (expected {status})'))
+            ms = millis(started)
+            self.emit(f'check {path}: HTTP {reply.status} in {ms} ms'
+                      + ('' if reply.status == status else f' (expected {status})'),
+                      'info' if reply.status == status else 'error', ms)
         return reply.expect(status, path)
 
-    def log(self) -> list[str]:
-        """The VM's own log. Best effort after the work deadline: the VM must be read before it is terminated."""
+    def log(self) -> list:
+        """The VM's own log entries. Best effort after the work deadline: the VM must be read before it is terminated."""
         self.deadline = max(self.deadline, monotonic() + 6)
-        lines = self.request('/control/log', timeout=5).expect(200, '/control/log').json()['lines']
-        if not isinstance(lines, list):
+        entries = self.request('/control/log', timeout=5).expect(200, '/control/log').json()['entries']
+        if not isinstance(entries, list):
             raise ValueError('Unexpected VM log')
-        return lines
+        return entries
 
     def cart(self, cart: str) -> Reply:
         return self.check('/cart', body={'cart_id': cart, 'sku': 'cloud-mug'})
@@ -268,16 +326,30 @@ class Rehearsal:
             return cls(run_id, action, option, OPTIONS[option])
         raise ValueError('Invalid action, option or unexpected event field')
 
-    def event(self, text: str) -> None:
-        print(f'[EVENT] {self.action} {self.team or "-"}: {text}', flush=True)
+    def event(self, msg: str, level: str = 'info', ms: int | None = None) -> None:
+        """One evaluator line: `[EVENT] <json>` with t, level, action, option, step, msg and, for a timed step, ms."""
+        if level not in LEVELS:
+            raise ValueError(f'Invalid log level {level}')
+        entry = {
+            't': round(time() * 1000), 'level': level, 'action': self.action, 'option': self.team or None,
+            'step': self.step, 'msg': msg, **({} if ms is None else {'ms': ms}),
+        }
+        print(f'[EVENT] {json.dumps(entry, separators=(",", ":"))}', flush=True)
+
+    def took(self, msg: str, started: float, level: str = 'info') -> None:
+        self.event(f'{msg} in {seconds(started)}', level, millis(started))
 
     def relay(self, shop: Shop) -> None:
-        """Print the VM's buffered log lines (MicroVM logging to CloudWatch is not possible). Never raises."""
+        """Print the VM's buffered log entries unchanged, as `[VM] <json>`, in order (MicroVM logging to CloudWatch
+        is not possible). Never raises."""
         try:
-            for line in shop.log()[-500:]:
-                print(relay_line(line), flush=True)
+            lines, dropped = relay_lines(shop.log()[-500:])
+            for line in lines:
+                print(line, flush=True)
+            if dropped:
+                self.event(f'{dropped} VM log entries were not valid and were dropped', 'warn')
         except Exception as error:
-            self.event(f'VM log not read: {type(error).__name__}')
+            self.event(f'VM log not read: {type(error).__name__}', 'warn')
 
     @property
     def root(self) -> str:
@@ -332,7 +404,7 @@ class Rehearsal:
             prior = json.loads(store.require(self.result_key(step)))
             started = monotonic()
             fleet.finish(prior['vm_id'], deadline)
-            self.event(f'previous stage VM terminated in {seconds(started)}')
+            self.took('previous stage VM terminated', started)
             digest = prior[field]
             artifact = store.require(self.artifact_key(step, digest, filename))
             if sha256(artifact).hexdigest() != digest:
@@ -429,23 +501,23 @@ def handler(event: dict, context) -> dict:
         try:
             shop = fleet.connect(vm, work_deadline)
             shop.emit = stage.event
-            stage.event(f'VM running, endpoint ready in {seconds(requested)}')
+            stage.took('VM running, endpoint ready', requested)
             sent = monotonic()
             shop.check('/control/setup', body=data, timeout=35)
-            stage.event(f'setup sent, VM configured in {seconds(sent)}')
+            stage.took('setup sent, VM configured', sent)
             result = stage.launch(store, shop) if stage.action == 'launch' else stage.growth(store, shop)
             # Persist the evaluated candidate before termination. A retry can finish
             # cleanup and return it without doing a new checkout or a new migration.
             store.put_once(key, json.dumps({**result, 'vm_id': vm_id}).encode(), 'application/json')
         except Exception as error:
-            stage.event(f'stage failed: {type(error).__name__}')
+            stage.event(f'stage failed: {type(error).__name__}', 'error')
             raise
         finally:
             if shop is not None:
                 stage.relay(shop)
             terminating = monotonic()
             fleet.finish(vm_id, cleanup_deadline)
-            stage.event(f'VM terminated in {seconds(terminating)}')
+            stage.took('VM terminated', terminating)
         candidate = store.require(key)
         result = json.loads(candidate)
         if result['vm_id'] != vm_id:

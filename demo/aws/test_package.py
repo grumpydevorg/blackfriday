@@ -9,6 +9,7 @@ import re
 import sys
 import threading
 import time
+import zipfile
 from hashlib import sha256
 from http.client import HTTPConnection
 from pathlib import Path
@@ -57,9 +58,16 @@ def test_the_workflow_package_has_the_game_and_no_one_round_files(monkeypatch, t
     assert files['rounds.json'] == AWS_DIR / 'rounds.json'
 
 
-def test_the_worker_package_is_the_evaluator_alone(monkeypatch, tmp_path):
+def test_the_worker_package_is_the_evaluator_and_the_table_it_reads(monkeypatch, tmp_path):
     files, _ = definitions(monkeypatch, tmp_path)['worker']
-    assert set(files) == {'evaluator.py'}
+    assert set(files) == {'evaluator.py', 'rounds.json'}
+    assert files['rounds.json'] == AWS_DIR / 'rounds.json'
+    # Built the way `packages` builds it: the archive really holds rounds.json beside evaluator.py.
+    archive = load_operate(monkeypatch, 'fourround').archive(tmp_path / 'worker.zip', files)
+    assert len(archive) == 64
+    with zipfile.ZipFile(tmp_path / 'worker.zip') as zipped:
+        assert sorted(zipped.namelist()) == ['evaluator.py', 'rounds.json']
+        assert json.loads(zipped.read('rounds.json')) == json.loads((AWS_DIR / 'rounds.json').read_text())
 
 
 @pytest.mark.parametrize('kind', ['worker', 'workflow'])
@@ -617,12 +625,23 @@ def test_a_charge_the_omit_shop_should_not_have_made_is_an_error(evaluator):
         stage.growth(store, shop)
 
 
-VM_LINES = [
-    '[aaaaaaaa compare careful] setup received: compare (preserve), 0 KB input',
-    '[aaaaaaaa compare careful] php GET /health 200 4 ms',
-    '[aaaaaaaa compare careful] php GET /cart/cart-saved 200 12 ms',
-    '[aaaaaaaa compare careful] php: PHP Warning:  fopen(https://bucket.s3.amazonaws.com/x?X-Amz-Signature=s) failed',
-    '[aaaaaaaa compare careful] schema bf_' + 'b' * 32 + '_careful',
+def vm_entry(seq, msg, **extra):
+    """One VM log entry, shaped as vm_runtime.Journal writes it."""
+    return {'seq': seq, 't': 1_764_000_000_000 + seq, 'kind': 'stage', 'level': 'info', 'run': RUN[:8],
+            'action': 'compare', 'option': 'careful', 'msg': msg, **extra}
+
+
+def php_entry(seq, method, path, status, ms):
+    return vm_entry(seq, f'{method} {path} {status} {ms} ms', kind='php', method=method, path=path, status=status,
+                    ms=ms)
+
+
+VM_ENTRIES = [
+    vm_entry(0, 'setup received: compare (preserve), 0 KB input'),
+    php_entry(1, 'GET', '/health', 200, 4),
+    php_entry(2, 'GET', '/cart/cart-saved', 200, 12),
+    vm_entry(3, 'php: PHP Warning:  fopen(https://bucket.s3.amazonaws.com/x?X-Amz-Signature=s) failed', level='warn'),
+    vm_entry(4, 'schema bf_' + 'b' * 32 + '_careful'),
 ]
 
 
@@ -650,7 +669,7 @@ def run_handler(evaluator, monkeypatch, option, *, cart):
                     setups.append(body)
                     return reply(evaluator, 200)
                 if path == '/control/log':
-                    return reply(evaluator, 200, {'lines': VM_LINES})
+                    return reply(evaluator, 200, {'entries': VM_ENTRIES})
                 return real(path, body, intention, timeout)
 
             shop.request = request
@@ -774,46 +793,127 @@ def gateway(runtime, monkeypatch):
     server.server_close()
 
 
-def test_control_log_returns_the_buffered_lines_without_secrets(gateway, monkeypatch):
-    vm_runtime, instance, get = gateway
-    pay_url = 'https://bucket.s3.amazonaws.com/x?X-Amz-Signature=secret'
+ENTRY_FIELDS = {'seq', 't', 'kind', 'level', 'run', 'action', 'option', 'msg'}
+PHP_FIELDS = {'method', 'path', 'status', 'ms'}
+
+
+def started_launch(vm_runtime, instance, monkeypatch, pay_url='https://bucket.s3.amazonaws.com/x?X-Amz-Signature=secret'):
+    monkeypatch.setattr(vm_runtime, 'APP', Path(__file__).resolve().parent.parent)   # demo/schema.sql
     monkeypatch.setattr(vm_runtime, 'ledger_url', lambda value: value)
     instance.setup({'id': RUN, 'action': 'launch', 'pay_url': pay_url, 'receipt': 'c' * 32})
-    vm_runtime.say(f'schema bf_{RUN}_careful')
+
+
+def test_control_log_returns_the_json_entries_without_secrets(gateway, monkeypatch):
+    vm_runtime, instance, get = gateway
+    pay_url = 'https://bucket.s3.amazonaws.com/x?X-Amz-Signature=secret'
+    started_launch(vm_runtime, instance, monkeypatch, pay_url)
+    vm_runtime.log_stage(f'schema bf_{RUN}_careful')
     status, body = get('/control/log')
-    lines = json.loads(body)['lines']
-    assert status == 200 and lines == vm_runtime.buffered_lines()
-    assert all(line.startswith(f'[{RUN[:8]} launch] ') for line in lines)
-    assert any('setup received: launch' in line for line in lines)
+    entries = json.loads(body)['entries']
+    assert status == 200 and entries == vm_runtime.buffered_entries()
+    assert all(entry['run'] == RUN[:8] and entry['action'] == 'launch' and entry['option'] is None for entry in entries)
+    assert any(entry['msg'] == 'setup received: launch' for entry in entries)
+    assert any(entry['msg'] == f'schema bf_{RUN[:8]}_careful' for entry in entries)
     text = body.decode()
     assert pay_url not in text and 'X-Amz' not in text and 'c' * 32 not in text and RUN not in text
 
 
-def test_the_log_buffer_keeps_the_newest_500_lines(runtime):
+def test_every_entry_has_the_contract_fields_closed_values_and_a_strictly_increasing_seq(
+        runtime, evaluator):
+    vm_runtime, instance = runtime
+    dump = base64.b64encode(b'PGDMP' + b'\0' * 16).decode()
+    instance.setup({'id': RUN, 'action': 'compare', 'team': 'fast', 'kind': 'omit', 'input': dump})
+    vm_runtime.log_stage('a warning', 'warn')
+    vm_runtime.log_stage('a failure', 'error', 12)
+    vm_runtime.log_php('POST', '/checkout', 502, 31, dropped=True)
+    vm_runtime.log_php('GET', '/product', 200, 4)
+    entries = vm_runtime.buffered_entries()
+    assert [entry['seq'] for entry in entries] == list(range(len(entries))) and len(entries) >= 6
+    for entry in entries:
+        assert json.loads(json.dumps(entry)) == entry
+        php = entry['kind'] == 'php'
+        assert set(entry) - ENTRY_FIELDS <= ({'ms'} | PHP_FIELDS), entry
+        assert (set(entry) >= ENTRY_FIELDS | PHP_FIELDS) if php else not ({'method', 'path', 'status'} & set(entry))
+        assert entry['kind'] in ('stage', 'php') and entry['level'] in ('debug', 'info', 'warn', 'error')
+        assert entry['run'] == RUN[:8] and entry['action'] == 'compare' and entry['option'] == 'fast'
+        assert isinstance(entry['t'], int) and isinstance(entry['msg'], str) and len(entry['msg']) <= 200
+        assert evaluator.vm_entry(entry) == entry, 'the consumer accepts what the producer writes, unchanged'
+    assert [entry['level'] for entry in entries[-4:]] == ['warn', 'error', 'warn', 'info']
+    assert entries[-3]['ms'] == 12 and 'ms' not in entries[-4]
+    assert {key: entries[-2][key] for key in PHP_FIELDS} == {'method': 'POST', 'path': '/checkout', 'status': 502, 'ms': 31}
+    assert entries[-2]['msg'] == 'POST /checkout 502 31 ms'
+
+
+def test_messages_are_redacted_before_they_are_truncated(runtime):
     vm_runtime, _ = runtime
+    vm_runtime.JOURNAL.configure(RUN, 'compare', 'careful')
+    receipt = sha256(b'receipt').hexdigest()
+    signed = 'https://bucket.s3.ap-southeast-2.amazonaws.com/k?X-Amz-Signature=' + 'd' * 64 + '&X-Amz-Credential=AKIA'
+    # Each secret straddles the 200-character limit: cut before redacting, a prefix of it would survive.
+    long_hex = 'x' * 180 + receipt + ' ' + 'z' * 55
+    long_url = 'q' * 184 + ' ' + signed + ' tail'
+    for text in (long_hex, long_url, f'run {RUN} {receipt}\n\tmultiline   spaces'):
+        vm_runtime.log_stage(text)
+    hex_line, url_line, run_line = (entry['msg'] for entry in vm_runtime.buffered_entries())
+    assert len(long_hex) == 300 and len(long_url) > 200
+    for message in (hex_line, url_line, run_line):
+        assert len(message) <= 200
+        assert not re.search(r'[0-9a-fA-F]{32,}', message)
+        assert 'X-Amz' not in message and 'https' not in message and 'amazonaws' not in message
+    assert receipt[:12] not in hex_line and receipt[:12] not in run_line
+    assert hex_line.startswith('x' * 180 + '<redacted>')
+    assert url_line == 'q' * 184 + ' <redacted> tail'
+    assert run_line == f'run {RUN[:8]} <redacted> multiline spaces'
+
+
+def test_the_log_buffer_keeps_the_newest_500_entries_and_seq_keeps_counting(runtime):
+    vm_runtime, _ = runtime
+    vm_runtime.JOURNAL.configure(RUN, 'launch', None)
     for number in range(600):
-        vm_runtime.say(f'line {number}')
-    lines = vm_runtime.buffered_lines()
-    assert len(lines) == 500 and lines[0].endswith('line 100') and lines[-1].endswith('line 599')
+        vm_runtime.log_stage(f'line {number}')
+    entries = vm_runtime.buffered_entries()
+    assert len(entries) == 500
+    assert (entries[0]['seq'], entries[0]['msg']) == (100, 'line 100')
+    assert (entries[-1]['seq'], entries[-1]['msg']) == (599, 'line 599')
 
 
-def test_every_proxied_shop_request_logs_a_php_access_line(gateway, monkeypatch):
+def test_nothing_is_recorded_before_setup_names_a_run(runtime, capsys):
+    vm_runtime, _ = runtime
+    vm_runtime.log_stage('too early')
+    vm_runtime.log_php('GET', '/health', 200, 1)
+    assert vm_runtime.buffered_entries() == [] and capsys.readouterr().out == ''
+
+
+def test_php_entries_come_from_fields_and_never_carry_the_query_string(runtime):
+    vm_runtime, _ = runtime
+    vm_runtime.JOURNAL.configure(RUN, 'launch', None)
+    vm_runtime.log_php('GET', '/cart/cart-saved?token=abc123&X-Amz-Signature=sig#frag', 404, 12)
+    [entry] = vm_runtime.buffered_entries()
+    assert (entry['method'], entry['path'], entry['status'], entry['ms']) == ('GET', '/cart/cart-saved', 404, 12)
+    assert entry['msg'] == 'GET /cart/cart-saved 404 12 ms'
+    assert 'token' not in json.dumps(entry) and 'X-Amz' not in json.dumps(entry) and '?' not in entry['path']
+    assert entry['level'] == 'info', 'a 4xx is an answer, not a fault'
+
+
+def test_every_proxied_shop_request_logs_a_php_entry(gateway, monkeypatch):
     vm_runtime, instance, get = gateway
-    monkeypatch.setattr(vm_runtime, 'ledger_url', lambda value: value)
-    instance.setup({'id': RUN, 'action': 'launch', 'pay_url': 'https://x/y', 'receipt': 'c' * 32})
+    started_launch(vm_runtime, instance, monkeypatch)
     instance.shop = object()
     answers = {'/product': (200, b'{}', 5), '/cart/cart-saved': (404, b'{}', 12)}
     monkeypatch.setattr(vm_runtime, 'shop_request', lambda method, path, body=None, intention='': answers[path])
     assert get('/cart/cart-saved')[0] == 404 and get('/product')[0] == 200
-    lines = json.loads(get('/control/log')[1])['lines']
-    assert f'[{RUN[:8]} launch] php GET /cart/cart-saved 404 12 ms' in lines
-    assert f'[{RUN[:8]} launch] php GET /product 200 5 ms' in lines
-    assert any("Maya's saved cart: 404" in line for line in lines)
+    entries = json.loads(get('/control/log')[1])['entries']
+    php = [(e['method'], e['path'], e['status'], e['ms'], e['level']) for e in entries if e['kind'] == 'php']
+    assert php == [('GET', '/cart/cart-saved', 404, 12, 'info'), ('GET', '/product', 200, 5, 'info')]
+    [cart] = [e for e in entries if e['msg'].startswith("Maya's saved cart")]
+    assert (cart['msg'], cart['level'], cart['ms'], cart['kind']) == (
+        "Maya's saved cart: 404 (missing) in 12 ms", 'warn', 12, 'stage')
 
 
-def test_the_payment_line_names_the_ledger_outcome_and_no_url(runtime):
+def test_the_payment_entry_names_the_ledger_outcome_and_no_url(runtime):
     from urllib.error import HTTPError
     vm_runtime, _ = runtime
+    vm_runtime.JOURNAL.configure(RUN, 'compare', 'careful')
     url = 'https://bucket.s3.amazonaws.com/x?X-Amz-Signature=secret'
     payment = vm_runtime.Payment(f'{RUN}:careful', False, url, 'c' * 32)
 
@@ -829,54 +929,121 @@ def test_the_payment_line_names_the_ledger_outcome_and_no_url(runtime):
     vm_runtime.S3_HTTP = Ledger(HTTPError(url, 403, 'Forbidden', {}, io.BytesIO()))
     with pytest.raises(HTTPError):
         vm_runtime.PaymentHandler.charge(payment)
-    lines = vm_runtime.buffered_lines()
-    assert re.fullmatch(r'\[vm\] payment ledger PUT 412 already paid in \d+ ms', lines[0])
-    assert re.fullmatch(r'\[vm\] payment ledger PUT failed in \d+ ms', lines[1])
-    assert all('X-Amz' not in line and 'https' not in line for line in lines)
+    paid, failed = vm_runtime.buffered_entries()
+    assert re.fullmatch(r'payment ledger PUT 412 already paid in \d+ ms', paid['msg']) and paid['level'] == 'info'
+    assert re.fullmatch(r'payment ledger PUT failed in \d+ ms', failed['msg']) and failed['level'] == 'error'
+    assert isinstance(paid['ms'], int) and isinstance(failed['ms'], int)
+    assert all('X-Amz' not in json.dumps(e) and 'https' not in json.dumps(e) for e in (paid, failed))
 
 
-def test_the_handler_prints_event_substeps_and_relays_vm_and_php_lines(evaluator, monkeypatch, capsys):
+def test_php_stderr_keeps_the_severity_php_wrote(runtime):
+    vm_runtime, instance = runtime
+    vm_runtime.JOURNAL.configure(RUN, 'launch', None)
+    process = type('P', (), {'stderr': iter([
+        '[Wed Nov 25 03:40:01 2026] 127.0.0.1:51234 [200]: POST /checkout\n',
+        '[Wed Nov 25 03:40:02 2026] PHP Warning:  Undefined variable $cart in /app/shop.php on line 40\n',
+        'PHP Fatal error:  Uncaught Error in /app/shop.php:9\n',
+        'PHP Notice:  Something\n',
+        'something php did not label\n',
+        '\n',
+    ])})()
+    instance.relay_php(process)
+    entries = vm_runtime.buffered_entries()
+    assert [(e['kind'], e['level']) for e in entries] == [
+        ('stage', 'warn'), ('stage', 'error'), ('stage', 'info'), ('stage', 'warn')]
+    assert entries[0]['msg'].startswith('php: [Wed Nov 25 03:40:02 2026] PHP Warning:')
+
+
+def event_lines(out, tag):
+    return [json.loads(line[len(tag) + 3:]) for line in out.splitlines() if line.startswith(f'[{tag}] ')]
+
+
+def test_the_handler_prints_event_json_and_relays_the_vm_entries_unchanged_in_order(evaluator, monkeypatch, capsys):
     run_handler(evaluator, monkeypatch, 'careful', cart=True)
     out = capsys.readouterr().out
     lines = out.splitlines()
-    expected = [
-        '[EVENT] compare careful: VM requested: vm-compare (run aaaaaaaa)',
-        '[PHP] GET /health 200 4 ms',
-        '[PHP] GET /cart/cart-saved 200 12 ms',
-        '[VM] aaaaaaaa compare careful: setup received: compare (preserve), 0 KB input',
-    ]
-    for line in expected:
-        assert line in lines
-    assert lines.index(expected[0]) < lines.index(expected[1])
-    assert lines[-1].startswith('[EVENT] compare careful: VM terminated in '), 'the VM log is read before termination'
-    for prefix in (
-        '[EVENT] compare careful: VM running, endpoint ready in ',
-        '[EVENT] compare careful: setup sent, VM configured in ',
-        '[EVENT] compare careful: check /health: HTTP 200 in ',
-        '[EVENT] compare careful: check /cart/cart-saved: HTTP 200 in ',
-        '[EVENT] compare careful: check /checkout: HTTP 200 in ',
-        '[EVENT] compare careful: VM terminated in ',
-    ):
-        assert any(line.startswith(prefix) for line in lines), prefix
-    assert all(re.fullmatch(r'\[(EVENT|VM|PHP)\] .+', line) for line in lines)
-    assert not any('/control/' in line for line in lines if line.startswith('[EVENT]'))
+    assert all(re.fullmatch(r'\[(EVENT|VM)\] \{.+\}', line) for line in lines), 'every line is a tag and one JSON object'
+    events = event_lines(out, 'EVENT')
+    for event in events:
+        assert set(event) - {'ms'} == {'t', 'level', 'action', 'option', 'step', 'msg'}
+        assert event['level'] in evaluator.LEVELS and (event['action'], event['option'], event['step']) == (
+            'compare', 'careful', 'compare-careful')
+        assert isinstance(event['t'], int)
+    messages = [event['msg'] for event in events]
+    assert f'VM requested: vm-compare (run {RUN[:8]})' in messages
+    for prefix in ('VM running, endpoint ready in ', 'setup sent, VM configured in ', 'check /health: HTTP 200 in ',
+                   'check /cart/cart-saved: HTTP 200 in ', 'check /checkout: HTTP 200 in ', 'VM terminated in '):
+        assert any(message.startswith(prefix) for message in messages), prefix
+    timed = [event for event in events if event['msg'].startswith('VM terminated in ')]
+    assert isinstance(timed[0]['ms'], int)
+    assert not any('/control/' in message for message in messages)
+    assert lines[-1].startswith('[EVENT] ') and 'VM terminated in ' in lines[-1], 'the VM log is read before termination'
+    # The relay: the VM's entries, in seq order, with nothing added. Entries 3 and 4 quoted a URL and a long hex run.
+    relayed = event_lines(out, 'VM')
+    assert [entry['seq'] for entry in relayed] == [0, 1, 2, 3, 4] and len(relayed) == len(VM_ENTRIES)
+    assert relayed[:3] == VM_ENTRIES[:3]
+    assert [json.dumps(entry, separators=(',', ':')) for entry in relayed[:3]] == [
+        json.dumps(entry, separators=(',', ':')) for entry in VM_ENTRIES[:3]]
+    assert relayed[3]['msg'] == 'php: PHP Warning:  <redacted> failed'
+    assert relayed[4]['msg'] == 'schema bf_<redacted>_careful'
+    first_event = next(i for i, line in enumerate(lines) if 'VM requested' in line)
+    assert first_event < next(i for i, line in enumerate(lines) if line.startswith('[VM] '))
     stage = evaluator.Rehearsal.parse({'id': RUN, 'action': 'compare', 'option': 'careful'})
     for secret in (
         RUN, 'b' * 32, stage.receipt('careful').decode(), stage.receipt('launch').decode(), 'token',
         'https://', 'X-Amz', 'amazonaws.com',
     ):
         assert secret not in out, secret
-    assert '<redacted>' in out
+
+
+def test_the_relay_orders_by_seq_adds_nothing_and_drops_what_is_not_an_entry(evaluator):
+    entries = [vm_entry(seq, f'step {seq}') for seq in range(6)]
+    entries.append(php_entry(6, 'GET', '/health', 200, 3))
+    shuffled = [entries[i] for i in (4, 0, 6, 2, 1, 5, 3)]
+    lines, dropped = evaluator.relay_lines(shuffled)
+    assert dropped == 0
+    assert lines == [f'[VM] {json.dumps(entry, separators=(",", ":"))}' for entry in entries]
+    bad = [
+        vm_entry(7, 'x', level='fatal'), vm_entry(8, 'x', action='destroy'), vm_entry(9, 'x', option='lift'),
+        vm_entry(10, 'x', kind='error'), vm_entry(11, 'x' * 201), {**vm_entry(12, 'x'), 'extra': 1},
+        php_entry(13, 'GET', '/health?token=a', 200, 1), {**php_entry(14, 'GET', '/health', 200, 1), 'status': '200'},
+        {key: value for key, value in vm_entry(15, 'x').items() if key != 'run'}, 'text', None, [],
+        vm_entry(-1, 'x'), vm_entry(True, 'x'),
+    ]
+    lines, dropped = evaluator.relay_lines(entries + bad)
+    assert dropped == len(bad) and len(lines) == len(entries)
+
+
+def test_a_vm_entry_that_still_quotes_a_secret_is_redacted_in_the_relay(evaluator):
+    receipt = 'e' * 64
+    entry = php_entry(0, 'GET', '/product', 200, 3)
+    leaky = {**entry, 'msg': f'GET https://bucket.s3.amazonaws.com/k?X-Amz-Signature=abc {receipt}'}
+    [line], dropped = evaluator.relay_lines([leaky])
+    assert dropped == 0 and 'X-Amz' not in line and 'https' not in line and receipt not in line
+    assert json.loads(line[5:])['msg'] == 'GET <redacted> <redacted>'
+
+
+def test_the_real_options_come_from_rounds_json_not_a_hand_list(evaluator):
+    table = json.loads((AWS_DIR / 'rounds.json').read_text())
+    real = {option['id'] for rnd in table['rounds'] for option in rnd['options'] if option['evidence'] == 'real'}
+    assert real == {'careful', 'fast'} == set(evaluator.OPTIONS)
+    assert evaluator.OPTIONS == {'careful': 'preserve', 'fast': 'omit'}
+    assert all(table['recorded_evidence'][option]['cart_kept'] == (kind == 'preserve')
+               for option, kind in evaluator.OPTIONS.items())
 
 
 def test_a_failed_stage_still_relays_the_vm_log_before_terminating(evaluator, monkeypatch, capsys):
     with pytest.raises(RuntimeError, match='cart/cart-saved returned HTTP 200'):
         run_handler(evaluator, monkeypatch, 'fast', cart=True)
-    lines = capsys.readouterr().out.splitlines()
-    assert '[EVENT] compare fast: stage failed: RuntimeError' in lines
-    assert '[PHP] GET /health 200 4 ms' in lines
-    assert lines.index('[EVENT] compare fast: stage failed: RuntimeError') < lines.index('[PHP] GET /health 200 4 ms')
-    assert lines[-1].startswith('[EVENT] compare fast: VM terminated in ')
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    failed = next(i for i, line in enumerate(lines) if line.startswith('[EVENT] ') and 'stage failed' in line)
+    first_vm = next(i for i, line in enumerate(lines) if line.startswith('[VM] '))
+    assert json.loads(lines[failed][8:]) | {'t': 0} == {
+        't': 0, 'level': 'error', 'action': 'compare', 'option': 'fast', 'step': 'compare-fast',
+        'msg': 'stage failed: RuntimeError'}
+    assert failed < first_vm
+    assert lines[-1].startswith('[EVENT] ') and 'VM terminated in ' in lines[-1]
 
 
 def test_an_unreadable_vm_log_never_raises_and_names_no_detail(evaluator, capsys):
@@ -887,7 +1054,10 @@ def test_an_unreadable_vm_log_never_raises_and_names_no_detail(evaluator, capsys
             raise ConnectionError('https://secret.example/?token=abc')
 
     stage.relay(Broken())
-    assert capsys.readouterr().out == '[EVENT] launch -: VM log not read: ConnectionError\n'
+    [event] = event_lines(capsys.readouterr().out, 'EVENT')
+    assert event | {'t': 0} == {
+        't': 0, 'level': 'warn', 'action': 'launch', 'option': None, 'step': 'launch',
+        'msg': 'VM log not read: ConnectionError'}
 
 
 def test_a_saved_artifact_is_reported_in_kb(evaluator, capsys):
@@ -898,24 +1068,22 @@ def test_a_saved_artifact_is_reported_in_kb(evaluator, capsys):
         reply(evaluator, 200, b'PGDMP' + b'\0' * 2048) if path == '/control/artifact'
         else real(path, body, intention, timeout))
     stage.growth(store, shop)
-    assert '[EVENT] migrate careful: artifact saved: 2 KB (pg_dump)' in capsys.readouterr().out.splitlines()
+    assert 'artifact saved: 2 KB (pg_dump)' in [event['msg'] for event in event_lines(capsys.readouterr().out, 'EVENT')]
 
 
+def test_an_evaluator_event_rejects_a_level_outside_the_vocabulary(evaluator):
+    stage = evaluator.Rehearsal.parse({'id': RUN, 'action': 'launch'})
+    with pytest.raises(ValueError):
+        stage.event('x', 'ERROR')
 
 
-def test_vm_stage_lines_shorten_the_run_id_and_never_carry_the_payment_capability(runtime, capsys, monkeypatch):
+def test_vm_entries_shorten_the_run_id_and_never_carry_the_payment_capability(runtime, capsys, monkeypatch):
     vm_runtime, instance = runtime
-    monkeypatch.setattr(vm_runtime, 'APP', Path(__file__).resolve().parent.parent)   # demo/schema.sql
-    launch = {'id': RUN, 'action': 'launch', 'pay_url': 'https://bucket.s3.amazonaws.com/x?X-Amz-Signature=secret',
-              'receipt': 'c' * 32}
-    monkey_ledger = vm_runtime.ledger_url
-    vm_runtime.ledger_url = lambda value: value
-    try:
-        instance.setup(launch)
-        vm_runtime.say(f'schema bf_{RUN}_careful')
-    finally:
-        vm_runtime.ledger_url = monkey_ledger
+    started_launch(vm_runtime, instance, monkeypatch)
+    vm_runtime.log_stage(f'schema bf_{RUN}_careful')
     out = capsys.readouterr().out
+    printed = [json.loads(line) for line in out.splitlines()]
+    assert printed == vm_runtime.buffered_entries(), 'stdout carries the same JSON entries as the buffer'
     assert 'setup received: launch' in out and 'SQLite database created in' in out
     assert RUN not in out and RUN[:8] in out
     assert 'X-Amz-Signature' not in out and 'c' * 32 not in out and 'https://' not in out
@@ -932,3 +1100,79 @@ def test_php_access_lines_are_filtered_but_errors_are_kept():
     ]
     assert all(vm_runtime.PHP_ACCESS.search(line) for line in access)
     assert not vm_runtime.PHP_ACCESS.search('PHP Warning:  Undefined variable $cart in /app/shop.php on line 40')
+
+
+# --- teardown -------------------------------------------------------------------------------------------------
+
+
+class FakeLogs:
+    """CloudWatch Logs as far as the teardown uses it: a name-prefix listing, like the real describe_log_groups."""
+
+    def __init__(self, groups):
+        self.groups = groups
+        self.deleted = []
+        self.retained = []
+
+    def get_paginator(self, operation):
+        assert operation == 'describe_log_groups'
+        logs = self
+
+        class Pages:
+            def paginate(self, logGroupNamePrefix):
+                yield {'logGroups': [{'logGroupName': name, **extra} for name, extra in logs.groups.items()
+                                     if name.startswith(logGroupNamePrefix)]}
+        return Pages()
+
+    def delete_log_group(self, logGroupName):
+        self.deleted.append(logGroupName)
+
+    def put_retention_policy(self, logGroupName, retentionInDays):
+        self.retained.append((logGroupName, retentionInDays))
+
+
+def teardown_session(logs):
+    class Web:
+        exceptions = type('Errors', (), {
+            'ResourceNotFoundException': type('Missing', (Exception,), {}),
+            'ConflictException': type('Conflict', (Exception,), {}),
+        })
+
+        def delete_web_function_endpoint(self, **kw):
+            pass
+
+        def delete_web_function(self, **kw):
+            pass
+
+    clients = {'lambda-web': Web(), 'logs': logs}
+    return type('Session', (), {'client': lambda self, name: clients[name]})()
+
+
+GROUPS = {
+    '/aws/lambda/web/black-friday-four': {'retentionInDays': 3},
+    '/aws/lambda/web/black-friday-four/revision': {},
+    '/aws/lambda/web/black-friday-four-logs': {'retentionInDays': 3},
+    '/aws/lambda/web/black-friday-fourth': {},
+}
+
+
+def test_destroy_deletes_the_game_log_groups_and_not_the_log_viewers(monkeypatch):
+    operate = load_operate(monkeypatch, 'fourround')
+    logs = FakeLogs(GROUPS)
+    operate.remove_web(teardown_session(logs), 'black-friday-four')
+    assert sorted(logs.deleted) == ['/aws/lambda/web/black-friday-four', '/aws/lambda/web/black-friday-four/revision']
+    assert '/aws/lambda/web/black-friday-four-logs' not in logs.deleted
+
+
+def test_destroy_logs_deletes_only_the_viewers_group(monkeypatch):
+    operate = load_operate(monkeypatch, 'fourround')
+    logs = FakeLogs(GROUPS)
+    operate.remove_web(teardown_session(logs), operate.LOGS_FUNCTION)
+    assert logs.deleted == ['/aws/lambda/web/black-friday-four-logs']
+
+
+def test_retention_is_set_on_the_functions_own_log_groups_only(monkeypatch):
+    operate = load_operate(monkeypatch, 'fourround')
+    logs = FakeLogs(GROUPS)
+    operate.retain_web_logs(teardown_session(logs), 'black-friday-four')
+    assert sorted(logs.retained) == [
+        ('/aws/lambda/web/black-friday-four', 7), ('/aws/lambda/web/black-friday-four/revision', 7)]

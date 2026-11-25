@@ -16,7 +16,7 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -34,28 +34,89 @@ Hex32 = re.compile(r'[0-9a-f]{32}')
 Team = re.compile(r'[a-z0-9]{3,16}')
 # PHP's built-in server logs every request to stderr; those lines carry nothing the room needs.
 PHP_ACCESS = re.compile(r'(\d{1,3}\.){3}\d{1,3}:\d+ (Accepted|Closing|\[\d{3}\]:)|Development Server .* started')
+# PHP's own severity, as written by its error log: `PHP Warning:  ...`, optionally after a `[date]` stamp.
+PHP_SEVERITY = re.compile(r'(?:\[[^\]]*\] )?PHP (Fatal error|Parse error|Warning|Notice|Deprecated):')
+PHP_LEVEL = {'Fatal error': 'error', 'Parse error': 'error', 'Warning': 'warn', 'Notice': 'info', 'Deprecated': 'info'}
 
-# MicroVM logging to CloudWatch is not possible, so nothing here reaches CloudWatch by itself. Every line goes to
-# stdout and to this buffer, which the evaluator reads over GET /control/log and relays before it terminates the
-# VM. So it holds only timed stage lines and access lines: never the payment URL, the receipt, a token, a request
-# body or the full run id.
-_label = 'vm'
-_run_id = ''
-_lines: deque[str] = deque(maxlen=500)
-_lines_lock = Lock()
-
-
-def say(message: str) -> None:
-    text = message.replace(_run_id, _run_id[:8]) if _run_id else message
-    line = f'[{_label}] {text[:200]}'
-    with _lines_lock:
-        _lines.append(line)
-    print(line, flush=True)
+LEVELS = ('debug', 'info', 'warn', 'error')
+KINDS = ('stage', 'php')
+ACTIONS = ('launch', 'migrate', 'compare')
+MAX_MESSAGE = 200
+BUFFER = 500
+# Anything a message could leak: a URL (payment capability), a signed-URL parameter, a receipt or any long hex run.
+SECRET = re.compile(r'https?://\S+|\S*X-Amz-\S*|[0-9a-fA-F]{32,}')
 
 
-def buffered_lines() -> list[str]:
-    with _lines_lock:
-        return list(_lines)
+def redact(text: str, run_id: str = '') -> str:
+    """Shorten the run id, drop anything URL- or receipt-shaped, then limit the length. In this order: a secret
+    cut in half by the limit would no longer match the patterns."""
+    if run_id:
+        text = text.replace(run_id, run_id[:8])
+    return SECRET.sub('<redacted>', ' '.join(text.split()))[:MAX_MESSAGE]
+
+
+class Journal:
+    """The VM's own log. MicroVM logging to CloudWatch is not possible, so nothing here reaches CloudWatch by
+    itself: every entry goes to stdout and to this buffer, which the evaluator reads over GET /control/log and
+    relays before it terminates the VM. An entry is one JSON object: seq, t, kind, level, run, action, option, msg,
+    and for a PHP request also method, path, status and ms. A stage entry may carry the ms its step took. Messages
+    hold only timed stage facts and request facts: never the payment URL, the receipt, a token, a request body or
+    the full run id. Entries made before setup (no run, no action) are not recorded."""
+
+    def __init__(self) -> None:
+        self.run_id = ''
+        self.action = ''
+        self.option: str | None = None
+        self.seq = 0
+        self.entries: deque[dict] = deque(maxlen=BUFFER)
+        self.lock = Lock()
+
+    def configure(self, run_id: str, action: str, option: str | None) -> None:
+        assert action in ACTIONS, action
+        self.run_id, self.action, self.option = run_id, action, option
+
+    def record(self, kind: str, level: str, message: str, **fields: object) -> None:
+        assert kind in KINDS and level in LEVELS, (kind, level)
+        if not self.action:
+            return
+        with self.lock:
+            entry = {
+                'seq': self.seq, 't': round(time() * 1000), 'kind': kind, 'level': level,
+                'run': self.run_id[:8], 'action': self.action, 'option': self.option,
+                'msg': redact(message, self.run_id), **fields,
+            }
+            self.seq += 1
+            self.entries.append(entry)
+        print(json.dumps(entry, separators=(',', ':')), flush=True)
+
+    def snapshot(self) -> list[dict]:
+        with self.lock:
+            return list(self.entries)
+
+
+JOURNAL = Journal()
+
+
+def log_stage(message: str, level: str = 'info', ms: int | None = None) -> None:
+    JOURNAL.record('stage', level, message, **({} if ms is None else {'ms': ms}))
+
+
+def log_took(message: str, started: float, level: str = 'info') -> None:
+    """A stage line whose text ends with how long it took, and which carries the same time as `ms`."""
+    log_stage(f'{message} in {timed(started)}', level, round((monotonic() - started) * 1000))
+
+
+def log_php(method: str, path: str, status: int, ms: int, dropped: bool = False) -> None:
+    """One PHP request, from its parsed fields. The query string never enters the entry. A 5xx is an error unless
+    the shop's payment reply was dropped on purpose."""
+    path = urlsplit(path).path
+    level = 'info' if status < 500 else 'warn' if dropped else 'error'
+    JOURNAL.record('php', level, f'{method} {path} {status} {ms} ms',
+                   method=method, path=redact(path), status=status, ms=ms)
+
+
+def buffered_entries() -> list[dict]:
+    return JOURNAL.snapshot()
 
 
 def timed(started: float) -> str:
@@ -175,10 +236,10 @@ class Runtime:
                 raise RuntimeError(f'PHP shop exited before readiness with code {self.shop.returncode}')
             try:
                 status, _, elapsed = shop_request('GET', '/health')
+                log_php('GET', '/health', status, elapsed)
                 if status != 200:
                     raise RuntimeError('PHP shop could not read the database')
-                say(f'php GET /health {status} {elapsed} ms')
-                say(f'PHP shop ready in {timed(started)}')
+                log_took('PHP shop ready', started)
                 return
             except ConnectionRefusedError:
                 if monotonic() >= deadline:
@@ -187,16 +248,17 @@ class Runtime:
 
     @staticmethod
     def relay_php(process: subprocess.Popen) -> None:
-        """PHP warnings and errors reach the log; its per-request access lines do not."""
+        """PHP warnings and errors reach the log, at the severity PHP itself wrote; its per-request access lines
+        do not. A line without a severity is unclassified PHP stderr, so it is a warning."""
         for line in process.stderr:
             line = line.strip()
             if line and not PHP_ACCESS.search(line):
-                say(f'php: {line}')
+                severity = PHP_SEVERITY.match(line)
+                log_stage(f'php: {line}', PHP_LEVEL[severity[1]] if severity else 'warn')
 
     def setup(self, data: dict) -> None:
         if self.action:
             raise BadRequest('VM already configured')
-        global _label, _run_id
         received = monotonic()
         run_id, action, kind = data.get('id'), data.get('action'), data.get('kind')
         team = data.get('team')
@@ -216,10 +278,9 @@ class Runtime:
                 raise BadRequest('Invalid Growth configuration')
         else:
             raise BadRequest('Invalid action, team or migration kind')
-        _run_id = run_id
-        _label = ' '.join(part for part in (run_id[:8], action, team) if part)
-        say(f'setup received: {action}' + (f' ({kind})' if kind else '')
-            + (f', {len(data["input"]) * 3 // 4 // 1024} KB input' if 'input' in data else ''))
+        JOURNAL.configure(run_id, action, team if action != 'launch' else None)
+        log_stage(f'setup received: {action}' + (f' ({kind})' if kind else '')
+                  + (f', {len(data["input"]) * 3 // 4 // 1024} KB input' if 'input' in data else ''))
 
         artifact = b''
         if action != 'launch':
@@ -243,35 +304,35 @@ class Runtime:
             with closing(sqlite3.connect(SQLITE)) as db, db:
                 db.executescript((APP / 'schema.sql').read_text())
                 db.execute('INSERT INTO customers VALUES (?, ?)', ('maya', 'Maya'))
-            say(f'SQLite database created in {timed(started)}')
+            log_took('SQLite database created', started)
         else:
             self.schema = f'bf_{run_id}_{team}'
             self.env['SHOP_SCHEMA'] = self.schema
             cluster = str(STATE / 'postgres')
             started = monotonic()
             self.run([PG / 'initdb', '-D', cluster, '-A', 'trust', '-U', 'demo', '--locale=C'])
-            say(f'initdb done in {timed(started)}')
+            log_took('initdb done', started)
             started = monotonic()
             self.run([
                 PG / 'pg_ctl', '-D', cluster, '-l', STATE / 'postgres.log',
                 '-o', '-h 127.0.0.1 -k /state', '-w', '-t', '10', 'start',
             ])
             self.run([PG / 'createdb', '-U', 'demo', 'shop'])
-            say(f'PostgreSQL started (pg_ctl start, createdb) in {timed(started)}')
+            log_took('PostgreSQL started (pg_ctl start, createdb)', started)
             started = monotonic()
             if action == 'migrate':
                 SQLITE.write_bytes(artifact)
                 self.run(['php', 'migrate.php', SQLITE, self.schema, kind])
                 if SQLITE.read_bytes() != artifact:
                     raise RuntimeError('Migration modified its input checkpoint')
-                say(f'migrate.php ({kind}: {"every table" if kind == "preserve" else "carts skipped"}) '
-                    f'done in {timed(started)}')
+                log_took(f'migrate.php ({kind}: {"every table" if kind == "preserve" else "carts skipped"}) done',
+                         started)
             else:
                 DUMP.write_bytes(artifact)
                 self.run([PG / 'pg_restore', '--exit-on-error', '-U', 'demo', '-d', 'shop', DUMP])
-                say(f'pg_restore done in {timed(started)}')
+                log_took('pg_restore done', started)
         self.start_shop()
-        say(f'setup finished in {timed(received)}')
+        log_took('setup finished', received)
 
     def run(self, cmd: list) -> None:
         # Tool chatter (initdb's banner and the like) stays out of the log; a failure shows its last words.
@@ -280,7 +341,7 @@ class Runtime:
                            errors='replace')
         except subprocess.CalledProcessError as error:
             tail = ' | '.join((error.stderr or error.stdout or '').strip().splitlines()[-3:])
-            say(f'{Path(str(cmd[0])).name} failed with code {error.returncode}: {tail}')
+            log_stage(f'{Path(str(cmd[0])).name} failed with code {error.returncode}: {tail}', 'error')
             raise
 
     def export(self) -> bytes:
@@ -301,8 +362,8 @@ class Runtime:
             value = DUMP.read_bytes()
         else:
             raise BadRequest('This stage does not produce an artifact')
-        say(f'artifact exported: {len(value) // 1024} KB '
-            f'({"SQLite checkpoint" if self.action == "launch" else "pg_dump"}) in {timed(started)}')
+        log_took(f'artifact exported: {len(value) // 1024} KB '
+                 f'({"SQLite checkpoint" if self.action == "launch" else "pg_dump"})', started)
         return value
 
 
@@ -347,9 +408,11 @@ class PaymentHandler(Handler):
         try:
             dropped = payment.charge()
         except BaseException:
-            say(f'payment ledger PUT failed in {round((monotonic() - started) * 1000)} ms')
+            ms = round((monotonic() - started) * 1000)
+            log_stage(f'payment ledger PUT failed in {ms} ms', 'error', ms)
             raise
-        say(f'payment ledger PUT {payment.last_status} in {round((monotonic() - started) * 1000)} ms')
+        ms = round((monotonic() - started) * 1000)
+        log_stage(f'payment ledger PUT {payment.last_status} in {ms} ms', 'info', ms)
         return dropped
 
     def do_POST(self) -> None:
@@ -400,7 +463,7 @@ class Gateway(Handler):
                 self.send_json(200, {'status': 'configured'})
                 return
             case ('GET', '/control/log'):
-                self.send_json(200, {'lines': buffered_lines()})
+                self.send_json(200, {'entries': buffered_entries()})
                 return
             case ('GET', '/control/artifact'):
                 value = runtime.export()
@@ -439,17 +502,19 @@ class Gateway(Handler):
             return
         status, payload, elapsed = shop_request(method, self.path, body, intention)
         dropped = drop_pending and payment is not None and not payment.drop_next
-        say(f'php {method} {urlsplit(self.path).path} {status} {elapsed} ms')
+        log_php(method, self.path, status, elapsed, dropped)
         if self.path == '/checkout':
-            say(f'checkout {status} in {elapsed} ms'
-                + (' · reply dropped on purpose (a lost response; the retry must not charge twice)' if dropped else ''))
+            log_stage(f'checkout {status} in {elapsed} ms'
+                      + (' · reply dropped on purpose (a lost response; the retry must not charge twice)' if dropped else ''),
+                      'warn' if dropped else 'error' if status >= 500 else 'info', elapsed)
         elif self.path == '/cart/cart-saved':
-            say(f"Maya's saved cart: {status} ({'kept' if status == 200 else 'missing'}) in {elapsed} ms")
+            log_stage(f"Maya's saved cart: {status} ({'kept' if status == 200 else 'missing'}) in {elapsed} ms",
+                      'info' if status == 200 else 'warn', elapsed)
         self.send_body(status, payload, 'application/json', elapsed, dropped)
 
 
 def shutdown(signum, frame) -> None:
-    say(f'shutdown ({signal.Signals(signum).name})')
+    log_stage(f'shutdown ({signal.Signals(signum).name})')
     sys.exit(0)
 
 
@@ -460,5 +525,5 @@ if __name__ == '__main__':
     with HTTPServer(('127.0.0.1', 8082), PaymentHandler) as payments:
         Thread(target=payments.serve_forever, daemon=True).start()
         with HTTPServer(('0.0.0.0', 8080), Gateway) as gateway:
-            say('runtime up, waiting for setup')
+            print('runtime up, waiting for setup', flush=True)  # Before setup there is no run to label an entry with.
             gateway.serve_forever()
