@@ -394,6 +394,30 @@ The one-round game's rules and runbook are in its own tag's copy of this file.
 - Run artifacts and logs expire after seven days; deployment packages remain
   because revisions reference them.
 
+### What it cost
+
+Cost Explorer, unblended, before tax, read 26 November 2026; 25 November may
+still be revised. Days are UTC, so the talk falls on 25 November. Counted:
+every Lambda, DynamoDB and S3 line from 22 November, when the account's earlier
+VPC and Secrets Manager charges stop; not counted: those charges, the 21 November
+Oregon MicroVM runs (about $0.07, mixed with them) and Cost Explorer's own
+$0.01 for these queries.
+
+| Day | What ran | US$ |
+|:--|:--|--:|
+| 22 Nov | Launch-wave fan-out in Oregon | 0.01 |
+| 23 Nov | Rehearsal moved to Sydney | 0.04 |
+| 24 Nov | One-round game, 200-team runs, four-round build | 0.73 |
+| 25 Nov | Go/no-go runs with 100 phones, the talk, teardown | 0.59 |
+| **Total** | | **1.37** |
+
+Lambda was $1.17 of it. On 24-25 November its largest line was MicroVM
+snapshot reads ($0.81 for 495 GB: each VM start loads the shop image); Web
+Functions cost $0.19 for 75,000 requests, MicroVM CPU and memory $0.09, and
+Durable execution $0.01 for 1,600 operations. DynamoDB rose from $0.02 to
+$0.15 on 25 November, the day of the 100-phone runs. Nothing bills after the teardown:
+no MicroVM images remain in Sydney or Oregon, and every MicroVM is terminated.
+
 ## Teardown
 
 When no run should resume, for one deployment:
@@ -544,5 +568,3 @@ talk.
   failure in AWS; the recorded-evidence fallback has only run in unit tests.
 - The run table has no TTL, so old games accumulate until the stack is
   destroyed: add one before the next deployment.
-- The `four-round` commits made on rick-dev are unsigned: re-sign or
-  squash-merge into `main`.
