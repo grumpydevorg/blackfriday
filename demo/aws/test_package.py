@@ -907,7 +907,7 @@ def test_every_proxied_shop_request_logs_a_php_entry(gateway, monkeypatch):
     assert php == [('GET', '/cart/cart-saved', 404, 12, 'info'), ('GET', '/product', 200, 5, 'info')]
     [cart] = [e for e in entries if e['msg'].startswith("Maya's saved cart")]
     assert (cart['msg'], cart['level'], cart['ms'], cart['kind']) == (
-        "Maya's saved cart: 404 (missing) in 12 ms", 'warn', 12, 'stage')
+        "Maya's saved cart: 404 (missing) in 12 ms", 'info', 12, 'stage')
 
 
 def test_the_payment_entry_names_the_ledger_outcome_and_no_url(runtime):

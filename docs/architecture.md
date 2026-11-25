@@ -330,7 +330,7 @@ header. Examples:
 ```
 {"seq":1,"t":1795585743478,"kind":"php","level":"info","run":"aaaaaaaa","action":"compare","option":"careful","msg":"GET /cart/cart-saved 404 12 ms","method":"GET","path":"/cart/cart-saved","status":404,"ms":12}
 [WORKFLOW] {"step":"plan-growth","round":"growth","level":"info","msg":"market 18%, 0 bots, 2 players"}
-{"t":1795585822599,"id":"compare-fast","tag":"DURABLE","level":"warn","text":"Fast migration check (recorded): cart LOST (404)","detail":{"cart_status":404,"charges":0,"option":"fast","source":"recorded"},"log_group":"/aws/lambda/bf-workflow"}
+{"t":1795585822599,"id":"compare-fast","tag":"DURABLE","level":"warn","text":"Fast migration check (recorded): fumbled, Maya's cart lost (404)","detail":{"cart_status":404,"charges":0,"option":"fast","source":"recorded"},"log_group":"/aws/lambda/bf-workflow"}
 ```
 
 ## The arena

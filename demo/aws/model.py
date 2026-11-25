@@ -225,7 +225,7 @@ def step(state: dict, round_id: str, option: str, market: int, roll: int, noise:
         else:
             lost = hit and evidence.get('fast', {}).get('cart_kept', False) is False
             if lost:
-                event = 'Saved carts were lost'
+                event = 'Fumbled migration: saved carts lost'
             else:
                 event = 'Dice hit, carts survived' if hit else 'Migrated fast, no trouble'
         if lost:

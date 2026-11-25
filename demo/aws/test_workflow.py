@@ -535,8 +535,8 @@ def test_the_evidence_and_round_texts_are_human_and_durations_come_from_the_eval
     lines = {item['id']: item for item in db.timeline_lines()}
     assert lines['registered']['text'] == 'Execution registered'
     assert lines['launch']['text'] == 'Launch shop (real MicroVM)'  # the fake launch reports no checkout statuses
-    assert lines['compare-careful']['text'] == 'Careful migration check: cart kept (200)'
-    assert lines['compare-fast']['text'] == 'Fast migration check: cart LOST (200)'
+    assert lines['compare-careful']['text'] == "Careful migration check: Maya's cart kept (200)"
+    assert lines['compare-fast']['text'] == "Fast migration check: fumbled, Maya's cart lost (200)"
     assert lines['compare-careful']['detail']['checkout_ms'] == 40
     assert lines['compare-careful']['detail']['duration_s'] == 0.04
     assert lines['migrate-careful']['detail']['vm_id'] == 'vm-migrate-careful'
@@ -562,7 +562,7 @@ def test_a_failed_launch_and_migrations_still_get_their_lines_with_the_source_re
         assert lines[f'compare-{option}']['detail']['source'] == 'recorded'
         assert 'vm_id' not in lines[f'compare-{option}']['detail']
         assert 'duration_s' not in lines[f'compare-{option}']['detail']
-    assert lines['compare-fast']['text'] == 'Fast migration check (recorded): cart LOST (404)'
+    assert lines['compare-fast']['text'] == "Fast migration check (recorded): fumbled, Maya's cart lost (404)"
 
 
 def test_a_full_replay_writes_no_timeline_lines(workflow, monkeypatch):

@@ -508,8 +508,9 @@ class Gateway(Handler):
                       + (' · reply dropped on purpose (a lost response; the retry must not charge twice)' if dropped else ''),
                       'warn' if dropped else 'error' if status >= 500 else 'info', elapsed)
         elif self.path == '/cart/cart-saved':
+            # Info either way: a fast migration drops the cart by design. Whether it was expected is the judge's call.
             log_stage(f"Maya's saved cart: {status} ({'kept' if status == 200 else 'missing'}) in {elapsed} ms",
-                      'info' if status == 200 else 'warn', elapsed)
+                      'info', elapsed)
         self.send_body(status, payload, 'application/json', elapsed, dropped)
 
 

@@ -223,7 +223,9 @@ def evidence_lines(launch_data: dict[str, Any], evidence: dict[str, Any], notes:
         result = evidence[option]
         real = result.get('source') == 'real'
         status, kept = result.get('cart_status'), result.get('cart_kept')
-        outcome = f'cart {"kept" if kept else "LOST"}' + (f' ({status})' if isinstance(status, int) else '')
+        # A fast migration skips the carts table by design: its lost cart is the fumble the dice hand out, shown for real.
+        loss = "fumbled, Maya's cart lost" if option == 'fast' else "Maya's cart LOST (unexpected)"
+        outcome = ("Maya's cart kept" if kept else loss) + (f' ({status})' if isinstance(status, int) else '')
         ms = result.get('checkout_ms')
         out.append(timeline_line(
             'compare', f'{model.option_label(option)} check{"" if real else " (recorded)"}: {outcome}', {
