@@ -106,9 +106,9 @@ async function body(request) {
 
 // ---------------------------------------------------------------- access log (same JSON as web.mjs)
 
-const POLLS = new Set(['/events', '/api/status']);
+const POLLS = new Set(['/events', '/api/status', '/api/players']);
 const ROUTES = new Set([
-  'GET /', 'GET /viewer', 'GET /stream', 'GET /events', 'GET /api/status', 'POST /api/login', 'POST /api/logout',
+  'GET /', 'GET /viewer', 'GET /stream', 'GET /events', 'GET /api/status', 'GET /api/players', 'POST /api/login', 'POST /api/logout',
   ...Object.keys(assets).map(path => `GET ${path}`),
 ]);
 const routeTemplate = (method, path) => (ROUTES.has(`${method} ${path}`) ? path : 'other');
@@ -149,9 +149,12 @@ function stream(request, response, query) {
   const backlog = hub.eventsAfter(cursor, debug);
   if (backlog.length) write(backlog.map(event => message(event.ts, event)).join(''));
   if (hub.polls) write(statusMessage(hub.status));
-  const release = hub.attach((added, status) => {
+  // Story cards carry no SSE id: the resume cursor stays the newest log event. The client replaces a card by its id.
+  const cardsMessage = cards => cards.map(card => `event: story\ndata: ${JSON.stringify(card)}\n\n`).join('');
+  write(cardsMessage(hub.storyCards()));
+  const release = hub.attach((added, status, story = []) => {
     const fresh = added.filter(event => debug || event.level !== 'debug');
-    write(fresh.map(event => message(event.ts, event)).join('') + (status ? statusMessage(status) : ''));
+    write(fresh.map(event => message(event.ts, event)).join('') + (status ? statusMessage(status) : '') + cardsMessage(story));
   });
   const ping = setInterval(() => write(': ping\n\n'), PING_MS);
   const stop = setTimeout(() => response.end(), STREAM_SECONDS * 1000);
@@ -198,11 +201,15 @@ async function route(request, response, path, query) {
   if (path === '/events') {
     await hub.touch();
     const events = hub.eventsAfter(cursorOf(query.get('after')), query.get('debug') === '1');
-    return json(response, 200, { now: Date.now(), events, status: hub.status });
+    return json(response, 200, { now: Date.now(), events, status: hub.status, story: hub.storyCards() });
   }
   if (path === '/api/status') {
     await hub.touch();
     return json(response, 200, { now: Date.now(), status: hub.status });
+  }
+  if (path === '/api/players') {
+    await hub.touch();
+    return json(response, 200, { players: hub.players });
   }
   return json(response, 404, { error: 'Not found' });
 }

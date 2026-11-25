@@ -14,6 +14,8 @@
     <span id="status" class="status">connecting…</span>
     <span id="mode" class="muted"></span>
     <span id="shown" class="muted"></span>
+    <button id="story-toggle" type="button" aria-pressed="false">Story</button>
+    <label class="check">Follow <select id="follow"><option value="">nobody</option></select></label>
     <button id="pause" type="button">Pause</button>
     <button id="signout" type="button">Sign out</button>
   </div>
@@ -37,6 +39,10 @@
   </div>
 </header>
 <main id="log" tabindex="0"></main>
+<section id="story" hidden>
+  <article id="story-now"></article>
+  <div id="story-trail"></div>
+</section>
 <button id="latest" type="button" hidden>↓ latest</button>
 <script src="/logs.js"></script>
 </body>

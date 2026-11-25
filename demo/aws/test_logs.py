@@ -481,7 +481,7 @@ def test_the_poller_stops_when_nobody_is_connected_and_restarts_on_demand():
 def test_data_routes_need_the_presenter_and_return_200_with_the_key():
     out = run_scenario(r"""
       fill(); await serve();
-      const routes = ['/events', '/api/status', '/viewer', '/logs.js', '/logs.css'];
+      const routes = ['/events', '/api/status', '/api/players', '/viewer', '/logs.js', '/logs.css'];
       const denied = {}, allowed = {};
       for (const path of routes) {
         denied[path] = (await call('GET', path)).status;
@@ -494,7 +494,7 @@ def test_data_routes_need_the_presenter_and_return_200_with_the_key():
       await withKey.until(text => text.includes('event: hello'));
       result({ denied, allowed, wrong, bad, streamDenied: stream.status, streamAllowed: withKey.status });
     """)
-    assert out['denied'] == {'/events': 403, '/api/status': 403, '/viewer': 303, '/logs.js': 403, '/logs.css': 403}
+    assert out['denied'] == {'/events': 403, '/api/status': 403, '/api/players': 403, '/viewer': 303, '/logs.js': 403, '/logs.css': 403}
     assert set(out['allowed'].values()) == {200}
     assert out['wrong'] == 403 and out['bad'] == 403
     assert out['streamDenied'] == 403 and out['streamAllowed'] == 200
@@ -506,7 +506,7 @@ def test_signed_out_requests_to_every_other_route_learn_nothing():
       const index = (await call('GET', '/')).text;
       const version = path => new RegExp(`${path.replace('.', '\\.')}\\?v=([0-9a-f]{10})`).exec(index)?.[1];
       const paths = ['/viewer', '/logs.js', `/logs.js?v=${'0'.repeat(10)}`, '/logs.css', '/logs.css?v=abc', '/stream', '/stream?debug=1',
-                     '/events', '/events?after=0&debug=1', '/api/status', '/nope', '/api/logout'];
+                     '/events', '/events?after=0&debug=1', '/api/status', '/api/players', '/nope', '/api/logout'];
       const replies = [];
       for (const path of paths) replies.push([path, 'GET', await call('GET', path)]);
       replies.push(['/api/logout', 'POST', await call('POST', '/api/logout', { headers: { 'x-rehearsal-action': '1' } })]);
@@ -578,17 +578,20 @@ def test_sign_in_cookie_opens_the_viewer_and_sign_out_closes_it_and_failures_are
     assert out['last'] == 429
 
 
-def test_status_and_events_never_carry_names_or_tokens():
+def test_status_never_carries_names_and_nothing_carries_tokens_or_hashes():
     out = run_scenario(r"""
       fill(); await serve();
       const events = await call('GET', '/events?debug=1', { headers: KEY });
       const status = await call('GET', '/api/status', { headers: KEY });
+      const players = await call('GET', '/api/players', { headers: KEY });
       const stream = await open('/stream?debug=1');
-      await stream.until(text => text.includes('event: status'));
-      result({ events: events.text, status: status.text, stream: stream.text, snapshot: snapshot(arena()) });
+      await stream.until(text => text.includes('event: story'));
+      result({ events: events.text, status: status.text, players: players.text, stream: stream.text, snapshot: snapshot(arena()) });
     """)
-    for blob in (out['events'], out['status'], out['stream']):
-        for secret in ('Zelda', 'Yuri', 'Xena', 'token', 'ffffffff', 'teams_data'):
+    for secret in ('Zelda', 'Yuri', 'Xena', 'teams_data'):
+        assert secret not in out['status'], 'the status snapshot has counts only'
+    for blob in (out['events'], out['status'], out['players'], out['stream']):
+        for secret in ('token', 'ffffffff', 'eeeeeeee', 'dddddddd', 'teams_data'):
             assert secret not in blob
     assert out['snapshot'] == {'run8': '01234567', 'phase': 'open', 'round': 'growth', 'players': 3, 'picked': 2}
     assert json.loads(out['status'])['status'] == out['snapshot']
@@ -609,7 +612,7 @@ def test_events_returns_now_events_and_status_with_the_overlap_rule_and_debug_fi
         cache: reply.headers.get('cache-control'),
       });
     """)
-    assert out['keys'] == ['now', 'events', 'status'] and out['nowClose'] and out['status'] == 'open'
+    assert out['keys'] == ['now', 'events', 'status', 'story'] and out['nowClose'] and out['status'] == 'open'
     assert out['hasDebug'] and not out['quietDebug']
     assert out['afterIds'] == out['expected'] and len(out['afterIds']) > 5
     assert out['cache'] == 'no-store'
@@ -830,3 +833,251 @@ def test_live_tail_lines_reach_sse_clients_immediately_not_on_the_next_poll():
     assert out['latency'] < 1000, 'the next poll is 5 s away'
     assert out['before'] == out['after'] and out['before']['tails'] == 1
     assert out['idIsTs'] and out['event']['tag'] == 'EVENT' and out['event']['text'] == 'judge x: live over sse'
+
+
+# ---------------------------------------------------------------- story, follow and the roster
+
+# A game after the launch round closed and the growth round opened. Times are offsets from `base` in ms.
+STORY_SEED = r"""
+const base = T - 60000;
+const ev = (id, type, at, extra = {}) => ({ EventId: id, EventType: type, EventTimestamp: new Date(base + at), ...extra });
+aws.history = [
+  ev(1, 'ExecutionStarted', 0),
+  ev(2, 'ChainedInvokeStarted', 1000, { Id: 'a', Name: 'launch-shop' }), ev(3, 'ChainedInvokeSucceeded', 10800, { Id: 'a', Name: 'launch-shop' }),
+  ev(4, 'ChainedInvokeStarted', 11000, { Id: 'b', Name: 'migrate-careful' }), ev(5, 'ChainedInvokeSucceeded', 22400, { Id: 'b', Name: 'migrate-careful' }),
+  ev(6, 'ChainedInvokeStarted', 11000, { Id: 'c', Name: 'migrate-fast' }), ev(7, 'ChainedInvokeSucceeded', 22600, { Id: 'c', Name: 'migrate-fast' }),
+  ev(8, 'ChainedInvokeStarted', 23000, { Id: 'd', Name: 'compare-careful' }), ev(9, 'ChainedInvokeSucceeded', 30000, { Id: 'd', Name: 'compare-careful' }),
+  ev(10, 'ChainedInvokeStarted', 23000, { Id: 'e', Name: 'compare-fast' }), ev(11, 'ChainedInvokeSucceeded', 30000, { Id: 'e', Name: 'compare-fast' }),
+  ev(12, 'InvocationCompleted', 30500),
+  ev(13, 'CallbackStarted', 31000, { Id: 'f', Name: 'await-close-launch' }), ev(14, 'CallbackSucceeded', 40000, { Id: 'f', Name: 'await-close-launch' }),
+  ev(15, 'StepSucceeded', 40600, { Id: 'g', Name: 'publish-results-launch', SubType: 'Step' }),
+  ev(16, 'InvocationCompleted', 40700), ev(17, 'InvocationCompleted', 41000),
+  ev(18, 'CallbackStarted', 41500, { Id: 'h', Name: 'await-close-growth' }),
+];
+const row = (id, name, rank, extra = {}) => ({ id, name, house: false, bot: false, rank, option: 'medium', roll: 12, risk: 35, hit: false,
+  event: 'Demand was normal this round', cumulative_cents: 519700 + rank, evidence: 'modelled', ...extra });
+const results = { round: 'launch', market: 112, rows: [row('t1', 'Zelda Zebra', 2), row('t2', 'Yuri Yak', 1, { risk: 0 }), row('t3', 'Xena Xerus', 3),
+  { ...row('bot1', 'Bot Lambo', 4), bot: true }, { ...row('house', 'House', 5), house: true }] };
+aws.items.set(`results#${RUN}#launch`, { pk: s(`results#${RUN}#launch`), data: s(JSON.stringify(results)) });
+Object.assign(aws.items.get('arena'), {
+  results_round: s('launch'),
+  launch_data: s(JSON.stringify({ source: 'real', charges: 1, checkout_statuses: [201, 200], cart_status: 200 })),
+  evidence_data: s(JSON.stringify({ careful: { source: 'real', cart_kept: true }, fast: { source: 'real', cart_kept: false } })),
+});
+const extraLines = [
+  { id: 'web-start', t: base - 5000, tag: 'WEB', text: 'Presenter pressed Start: 3 players in the room', detail: { players: 3 } },
+  { id: 'web-close-launch', t: base + 39900, tag: 'WEB', text: 'closed', detail: { round: 'launch', picked: 3, players: 3 } },
+];
+aws.items.get(`timeline#${RUN}`).lines.L.push(...extraLines.map(line => s(JSON.stringify(line))));
+"""
+
+
+def test_story_cards_say_what_the_system_is_doing_with_numbers_taken_from_the_data():
+    out = run_scenario(STORY_SEED + r"""
+      const hub = hubFor(() => T);
+      await hub.poll();
+      result(hub.storyCards());
+    """)
+    cards = {card['stage']: card for card in out}
+    assert list(cards) == ['lobby', 'start', 'launch', 'migrations', 'checks', 'open-launch', 'close-launch', 'open-growth']
+    assert [card['seq'] for card in out] == sorted(card['seq'] for card in out)
+    assert [card['id'] for card in out] == [f'st:01234567:{stage}' for stage in cards]
+    assert cards['lobby']['text'] == ("The lobby closed with 3 players. Until Start, nothing runs in AWS: "
+                                      "the Web Function only answers phones.")
+    assert cards['start']['text'] == "The Web Function started one Durable execution: the game's memory for the whole night."
+    assert cards['launch']['text'] == ('Durable asked an Event judge, which booted a MicroVM running the real PHP shop. '
+                                       'It sold a mug, charged exactly once, and the VM was destroyed (9.8 s).')
+    assert cards['migrations']['text'] == ('Two Event judges, two MicroVMs in parallel: careful copies every table, '
+                                           'fast skips the carts (11.4 s / 11.6 s).')
+    assert cards['checks']['text'] == ("Two fresh VMs restore each database and look for Maya's cart: "
+                                       'careful KEPT it, fast LOST it.')
+    assert cards['close-launch']['text'] == ("Close woke the workflow: it drew the market (112%), rolled everyone's dice, "
+                                             'scored 3 players and published, in 0.6 s. Then it went back to sleep.')
+    assert cards['open-launch']['text'].startswith('Round 1 was open: 3/3 picked.')
+    assert cards['open-growth']['text'] == ("Round 2 is open. Durable is suspended, waiting for the presenter's Close. "
+                                            'No code is running and nothing is billed. 2/3 picked.')
+    # The numbers, each one from the fixture: the history's timestamps, the launch and results items, the roster.
+    assert cards['lobby']['numbers'] == {'players': 3}
+    assert cards['launch']['numbers'] == {'seconds': 9.8, 'charges': 1}
+    assert cards['migrations']['numbers'] == {'careful_s': 11.4, 'fast_s': 11.6}
+    assert cards['close-launch']['numbers'] == {'round': 1, 'market': 112, 'players': 3, 'seconds': 0.6}
+    assert cards['open-growth']['numbers'] == {'round': 2, 'picked': 2, 'players': 3}
+    # No sentence carries a number its card does not list.
+    for card in out:
+        shown = {str(value) for value in card['numbers'].values()}
+        for token in re.findall(r'\d+(?:\.\d+)?', card['text']):
+            assert token in shown, (card['stage'], token, card['text'])
+
+
+def test_a_number_that_is_not_in_the_data_is_left_out_of_the_sentence():
+    out = run_scenario(STORY_SEED + r"""
+      aws.history = aws.history.filter(e => e.Name !== 'publish-results-launch' && !/^(migrate|launch)/.test(e.Name ?? ''));
+      delete aws.items.get('arena').launch_data;
+      aws.items.delete(`results#${RUN}#launch`);
+      const hub = hubFor(() => T);
+      await hub.poll();
+      result(hub.storyCards());
+    """)
+    cards = {card['stage']: card for card in out}
+    assert 'launch' in cards and 'migrations' in cards, 'the timeline evidence lines still say these ran'
+    assert cards['launch']['text'] == 'Durable asked an Event judge, which booted a MicroVM running the real PHP shop.'
+    assert cards['launch']['numbers'] == {}
+    assert cards['migrations']['text'].endswith('fast skips the carts.') and cards['migrations']['numbers'] == {}
+    assert cards['close-launch']['text'] == ("Close woke the workflow: it is drawing the market, rolling everyone's dice and scoring.")
+    assert cards['close-launch']['numbers'] == {'round': 1}
+
+
+def test_final_card_counts_runs_and_microvms_from_the_history():
+    out = run_scenario(STORY_SEED + r"""
+      aws.history.push(ev(19, 'ExecutionSucceeded', 59000));
+      aws.items.get('arena').phase = s('final');
+      const hub = hubFor(() => T);
+      await hub.poll();
+      result(hub.storyCards().filter(card => card.stage === 'final'));
+    """)
+    [card] = out
+    assert card['text'] == 'Game over. One Durable execution, 3 short runs of our code, 5 MicroVMs.'
+    assert card['numbers'] == {'runs': 3, 'microvms': 5}
+
+
+def test_follow_lines_come_from_picks_and_result_rows_and_use_no_gendered_pronouns():
+    out = run_scenario(STORY_SEED + r"""
+      const hub = hubFor(() => T);
+      await hub.poll();
+      const cards = Object.fromEntries(hub.storyCards().map(card => [card.stage, card]));
+      result({ growth: cards['open-growth'].players, launch: cards['close-launch'].players, players: hub.players });
+    """)
+    assert out['growth']['t1'] == {
+        'lines': ["Zelda Zebra picked Careful migration: their shop is the real VM that kept Maya's cart."], 'pick': 'careful'}
+    assert out['growth']['t3']['lines'] == ["Xena Xerus picked Fast migration: their shop is the real VM that lost Maya's cart."]
+    assert 't2' not in out['growth'], 'nobody who has not picked has a pick line'
+    assert out['launch']['t1']['lines'] == [
+        "Zelda Zebra rolled 12 against Medium server's 35: Demand was normal this round.",
+        'Zelda Zebra is 2nd on $5,197 (evidence: modelled).']
+    assert out['launch']['t2']['lines'][0] == 'Yuri Yak: Demand was normal this round.', 'no dice line when there is no risk'
+    assert out['players'] == [{'id': 't3', 'name': 'Xena Xerus'}, {'id': 't2', 'name': 'Yuri Yak'}, {'id': 't1', 'name': 'Zelda Zebra'}]
+    for lines in [out['growth'], out['launch']]:
+        for entry in lines.values():
+            for line in entry['lines']:
+                assert not re.search(r"\b(his|her|hers|he|she|him)\b", line), line
+
+
+def test_launch_and_migration_log_lines_know_their_stage_and_option():
+    out = run_scenario(r"""
+      const lines = [
+        [EVALUATOR, '[EVENT] compare careful: VM running, endpoint ready in 3.21 s'],
+        [EVALUATOR, '[VM] 1a2b3c4d migrate fast: PHP shop ready in 1.92 s'],
+        [MICROVM, '[1a2b3c4d launch -] PHP shop ready in 1.92 s'],
+        [EVALUATOR, '[PHP] GET /cart 404 12 ms'],
+      ];
+      result(lines.map(([group, message], i) => fromCloudWatch(group, cwEvent(i, i, message)).detail));
+    """)
+    assert out[0] == {'stage': 'compare', 'option': 'careful'}
+    assert out[1] == {'stage': 'migrate', 'option': 'fast'}
+    assert out[2] == {'stage': 'launch'}
+    assert out[3] == {'method': 'GET', 'path': '/cart', 'status': 404, 'ms': 12}, 'a PHP line has no label: the page places it by time'
+
+
+def test_roster_diffing_joins_renames_picks_changes_and_removals():
+    out = run_scenario(r"""
+      const { parseRoster, diffRoster } = await import('./logs.mjs');
+      const roster = (...players) => parseRoster({ teams_data: s(JSON.stringify(players.map(([id, name, picks]) => ({ id, name, token_hash: 'f'.repeat(64), picks })))) });
+      const map = players => new Map(players.map(player => [player.id, player]));
+      const at = 1000, run8 = '01234567';
+      const kinds = events => events.map(event => [event.id.replace('pl:01234567:', ''), event.level, event.text]);
+      const base = roster(['a', 'Ann', {}], ['b', 'Bob', {}]);
+      const silent = diffRoster(undefined, base, { run8, at, announceJoins: false });
+      const lobby = diffRoster(undefined, base, { run8, at, announceJoins: true });
+      const joined = diffRoster(map(base), roster(['a', 'Ann', {}], ['b', 'Bob', {}], ['c', 'Cy', {}]), { run8, at });
+      const renamed = diffRoster(map(base), roster(['a', 'Anna', {}], ['b', 'Bob', {}]), { run8, at });
+      const picked = diffRoster(map(base), roster(['a', 'Ann', { growth: 'careful' }], ['b', 'Bob', {}]), { run8, at });
+      const changed = diffRoster(map(roster(['a', 'Ann', { growth: 'careful' }])), roster(['a', 'Ann', { growth: 'fast' }]), { run8, at });
+      const removed = diffRoster(map(base), roster(['a', 'Ann', {}]), { run8, at });
+      const same = diffRoster(map(base), base, { run8, at });
+      const again = diffRoster(map(base), roster(['a', 'Ann', { growth: 'careful' }], ['b', 'Bob', {}]), { run8, at: 9999 });
+      result({ silent, lobby: kinds(lobby), joined: kinds(joined), renamed: kinds(renamed), picked: kinds(picked), changed: kinds(changed),
+               removed: kinds(removed), same, sameIds: picked.map(e => e.id).join() === again.map(e => e.id).join(), detail: picked[0].detail, tag: picked[0].tag,
+               text: JSON.stringify([lobby, joined, renamed, picked, changed, removed]) });
+    """)
+    assert out['silent'] == [] and out['same'] == []
+    assert out['lobby'] == [['a:join', 'info', 'Ann joined (2 players)'], ['b:join', 'info', 'Bob joined (2 players)']]
+    assert out['joined'] == [['c:join', 'info', 'Cy joined (3 players)']]
+    [renamed] = out['renamed']
+    assert re.fullmatch(r'a:ren:[0-9a-f]{8}', renamed[0]) and renamed[2] == 'Ann renamed to Anna'
+    assert out['picked'] == [['a:pick:growth', 'debug', 'Ann picked Careful migration in Growth']]
+    [changed] = out['changed']
+    assert re.fullmatch(r'a:pick:growth:[0-9a-f]{8}', changed[0])
+    assert changed[2] == 'Ann changed their pick in Growth from Careful migration to Fast migration'
+    assert out['removed'] == [['b:rm', 'info', 'Bob was removed (1 players left)']]
+    assert out['sameIds'], 'the same change gets the same id wherever it is seen'
+    assert out['detail'] == {'player': 'a', 'round': 'growth', 'option': 'careful'} and out['tag'] == 'PLAYER'
+    assert 'token' not in out['text'] and 'ffffffff' not in out['text']
+
+
+def test_the_hub_follows_the_roster_over_time_and_serves_players_without_tokens():
+    out = run_scenario(r"""
+      aws.items.delete(`timeline#${RUN}`);
+      const item = () => aws.items.get('arena');
+      const set = players => { item().teams_data = s(JSON.stringify(players)); };
+      item().phase = s('ready');
+      delete item().execution_arn;
+      set([{ id: 'a', name: 'Ann', token_hash: 'f'.repeat(64), picks: {} }]);
+      const hub = hubFor(() => T);
+      await hub.poll();
+      set([{ id: 'a', name: 'Anna', token_hash: 'f'.repeat(64), picks: {} }, { id: 'b', name: 'Bob', token_hash: 'e'.repeat(64), picks: {} }]);
+      await hub.poll();
+      item().phase = s('open'); item().round = s('launch');
+      set([{ id: 'a', name: 'Anna', picks: { launch: 'small' } }, { id: 'b', name: 'Bob', picks: { launch: 'large' } }]);
+      await hub.poll();
+      set([{ id: 'a', name: 'Anna', picks: { launch: 'medium' } }]);
+      await hub.poll();
+      const text = hub.eventsAfter(undefined, true).filter(e => e.tag === 'PLAYER').map(e => e.text);
+      const card = hub.storyCards().at(-1);
+      result({ text, players: hub.players, card: [card.stage, card.text, card.numbers], blob: JSON.stringify([hub.eventsAfter(undefined, true), hub.storyCards(), hub.players]) });
+    """)
+    assert sorted(out['text']) == sorted([
+        'Ann joined (1 players)', 'Bob joined (2 players)', 'Ann renamed to Anna', 'Anna picked Small server in Launch',
+        'Bob picked Large server in Launch', 'Anna changed their pick in Launch from Small server to Medium server',
+        'Bob was removed (1 players left)'])
+    assert out['players'] == [{'id': 'a', 'name': 'Anna'}]
+    assert out['card'][0] == 'open-launch' and out['card'][2] == {'round': 1, 'picked': 1, 'players': 1}
+    assert 'token' not in out['blob'] and 'ffffffff' not in out['blob'] and 'eeeeeeee' not in out['blob']
+
+
+def test_players_route_lists_id_and_name_only_and_needs_the_presenter():
+    out = run_scenario(r"""
+      fill(); await serve();
+      const signedOut = await call('GET', '/api/players');
+      const reply = await call('GET', '/api/players', { headers: KEY });
+      result({ signedOut: [signedOut.status, signedOut.text], reply: [reply.status, reply.body], text: reply.text });
+    """)
+    assert out['signedOut'][0] == 403
+    for leak in ('Zelda', 'Yuri', 'Xena', 'players'):
+        assert leak not in out['signedOut'][1]
+    assert out['reply'][0] == 200
+    assert out['reply'][1] == {'players': [{'id': 't3', 'name': 'Xena Xerus'}, {'id': 't2', 'name': 'Yuri Yak'}, {'id': 't1', 'name': 'Zelda Zebra'}]}
+    assert 'token' not in out['text'] and 'picks' not in out['text']
+
+
+def test_story_cards_stream_as_story_events_without_ids_and_are_replaced_when_numbers_change():
+    out = run_scenario(r"""
+      fill(); await serve();
+      const stream = await open('/stream?debug=1');
+      await stream.until(text => text.includes('event: story'));
+      const cardsOf = () => stream.messages().filter(m => m.event === 'story');
+      const first = cardsOf().map(m => JSON.parse(m.data));
+      const growth = first.find(card => card.stage === 'open-growth');
+      const teamsNow = JSON.parse(aws.items.get('arena').teams_data.S);
+      teamsNow[1].picks = { growth: 'fast' };
+      aws.items.get('arena').teams_data = s(JSON.stringify(teamsNow));
+      await stream.until(() => cardsOf().map(m => JSON.parse(m.data)).some(card => card.stage === 'open-growth' && card.numbers.picked === 3));
+      const all = cardsOf();
+      const poll = await call('GET', '/events', { headers: KEY });
+      result({ stages: first.map(card => card.stage), picked: growth.numbers.picked, hasId: all.some(m => 'id' in m),
+               later: all.map(m => JSON.parse(m.data)).filter(card => card.stage === 'open-growth').map(card => [card.id, card.numbers.picked]),
+               polled: poll.body.story.map(card => [card.id, card.stage]) });
+    """)
+    assert out['stages'][0] == 'lobby' and out['stages'][-1] == 'open-growth' and out['picked'] == 2
+    assert out['hasId'] is False, 'story frames must not move the Last-Event-ID cursor'
+    assert out['later'][0] == ['st:01234567:open-growth', 2] and out['later'][-1] == ['st:01234567:open-growth', 3]
+    assert ['st:01234567:open-growth', 'open-growth'] in out['polled'], 'the polling fallback carries the same cards'

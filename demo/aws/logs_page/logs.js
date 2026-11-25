@@ -27,6 +27,7 @@ const state = {
   offTags: new Set(),                       // tags switched off; new tags start on
   levels: new Set(['info', 'warn', 'error']), // debug hidden by default
   q: '', regex: false, paused: false,
+  story: false, follow: '',                 // the projector view, and the player it follows (a player id)
 };
 const rows = [];            // {ev, el, hay, tag, level, hidden}
 const seen = new Set();     // ids of every event shown or held; bounded with the lines
@@ -46,6 +47,8 @@ function saveHash() {
   p.set('lv', LEVELS.filter((l) => state.levels.has(l)).join(','));
   if (state.q) p.set('q', state.q);
   if (state.regex) p.set('re', '1');
+  if (state.story) p.set('story', '1');
+  if (state.follow) p.set('follow', state.follow);
   history.replaceState(null, '', '#' + p.toString());
 }
 function loadHash() {
@@ -56,6 +59,10 @@ function loadHash() {
   state.regex = p.get('re') === '1';
   qEl.value = state.q;
   reEl.checked = state.regex;
+  state.story = p.get('story') === '1';
+  state.follow = p.get('follow') || '';
+  applyStoryMode();
+  syncFollow();
 }
 
 // ---- filtering
@@ -235,9 +242,144 @@ function ingest(list) {
     if (lastTs === null || ev.ts > lastTs) lastTs = ev.ts;
     if (seen.has(ev.id)) continue;
     seen.add(ev.id);
+    collectDetail(ev);
     incoming.push(ev);
   }
   if (incoming.length && flushTimer === null) flushTimer = setTimeout(flush, 60);
+}
+
+// ---- story: one large card for what the system is doing now, a trail of the last few, and a followed player
+const TRAIL = 6;
+const STAGE_CARD = { launch: 'launch', migrate: 'migrations', compare: 'checks' };
+const VM_STAGES = new Set(['launch', 'migrations', 'checks']);
+const DETAIL_TAGS = new Set(['VM', 'PHP', 'EVENT', 'MICROVM']);
+const cards = new Map();      // card id -> card; the server re-sends a card with the same id when its numbers change
+const lineEvents = [];        // VM, PHP and EVENT log lines, kept to show under the card of their stage
+const openCards = new Set();  // cards whose detail the presenter expanded
+const storyEl = $('story'), nowEl = $('story-now'), trailEl = $('story-trail'), toggleEl = $('story-toggle'), followEl = $('follow');
+let storyRun = null, storyTimer = null, playersKey = '';
+
+function scheduleStory() {
+  if (state.story && storyTimer === null) storyTimer = setTimeout(renderStory, 120);
+}
+function addCards(list) {
+  if (!Array.isArray(list)) return;
+  for (const card of list) {
+    if (!card || typeof card.id !== 'string' || !Number.isFinite(card.seq)) continue;
+    const run = card.id.split(':')[1];
+    if (run !== storyRun) { cards.clear(); storyRun = run; }   // a reset starts a new story
+    cards.set(card.id, card);
+  }
+  scheduleStory();
+}
+function collectDetail(ev) {
+  if (!DETAIL_TAGS.has(ev.tag)) return;
+  lineEvents.push(ev);
+  if (lineEvents.length > 3000) lineEvents.shift();
+  scheduleStory();
+}
+function sortedCards() { return [...cards.values()].sort((a, b) => a.seq - b.seq); }
+/** careful or fast, from the followed player's Growth pick; null when they have not picked either. */
+function followedOption() {
+  if (!state.follow) return null;
+  for (const card of cards.values()) {
+    const mine = card.stage === 'open-growth' && card.players && card.players[state.follow];
+    if (mine && (mine.pick === 'careful' || mine.pick === 'fast')) return mine.pick;
+  }
+  return null;
+}
+/** The log lines that belong under a card: by the stage in their own label, else (VM/PHP) by time. */
+function attached(card, list) {
+  if (!VM_STAGES.has(card.stage)) return [];
+  const next = list.find((other) => VM_STAGES.has(other.stage) && other.seq > card.seq);
+  const mine = followedOption();
+  const out = [];
+  for (const ev of lineEvents) {
+    const stage = ev.detail && ev.detail.stage;
+    if (stage) {
+      if (STAGE_CARD[stage] !== card.stage) continue;
+    } else if (ev.tag === 'VM' || ev.tag === 'PHP') {
+      if (ev.ts < card.ts - 2000 || (next && ev.ts >= next.ts - 2000)) continue;
+    } else continue;
+    const option = ev.detail && ev.detail.option;
+    if (mine && option && option !== mine) continue;
+    out.push(ev);
+  }
+  return out.slice(-60);
+}
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+function detailsFor(card, list) {
+  const events = attached(card, list);
+  if (!events.length) return null;
+  const box = el('details', 'card-detail');
+  box.open = openCards.has(card.id);
+  box.addEventListener('toggle', () => { if (box.open) openCards.add(card.id); else openCards.delete(card.id); });
+  box.append(el('summary', '', `${events.length} log line${events.length === 1 ? '' : 's'}`));
+  for (const ev of events) {
+    const row = el('div', 'dl');
+    const tag = el('span', 'tag', ev.tag);
+    tag.style.setProperty('--c', TAG_COLOURS[ev.tag] || '#c9d1d9');
+    row.append(el('span', 't', formatTime(ev.ts)), tag, el('span', 'txt', ev.text));
+    box.append(row);
+  }
+  return box;
+}
+function followBox(card, cls) {
+  const mine = state.follow && card.players && card.players[state.follow];
+  if (!mine || !mine.lines || !mine.lines.length) return null;
+  const box = el('div', cls);
+  for (const line of mine.lines) box.append(el('div', '', line));
+  return box;
+}
+function renderStory() {
+  storyTimer = null;
+  if (!state.story) return;
+  const list = sortedCards();
+  nowEl.replaceChildren();
+  trailEl.replaceChildren();
+  if (!list.length) { nowEl.append(el('div', 'text', 'Waiting for the game…')); return; }
+  const current = list[list.length - 1];
+  nowEl.append(el('div', 'stage', current.title), el('div', 'text', current.text));
+  for (const part of [followBox(current, 'follow'), detailsFor(current, list)]) if (part) nowEl.append(part);
+  for (const card of list.slice(-1 - TRAIL, -1).reverse()) {
+    const past = el('div', 'past');
+    past.append(el('div', 'stage', card.title), el('div', 'text', card.text));
+    for (const part of [followBox(card, 'follow'), detailsFor(card, list)]) if (part) past.append(part);
+    trailEl.append(past);
+  }
+}
+function applyStoryMode() {
+  document.body.classList.toggle('story', state.story);
+  storyEl.hidden = !state.story;
+  toggleEl.setAttribute('aria-pressed', String(state.story));
+  if (state.story) renderStory();
+}
+function syncFollow() {
+  if (state.follow && ![...followEl.options].some((option) => option.value === state.follow)) {
+    followEl.append(Object.assign(document.createElement('option'), { value: state.follow, textContent: 'player…' }));
+  }
+  followEl.value = state.follow;
+  scheduleStory();
+}
+async function loadPlayers() {
+  try {
+    const response = await fetch('/api/players', { credentials: 'same-origin', cache: 'no-store' });
+    if (response.status === 403) { signedOut(); return; }
+    if (!response.ok) return;
+    const { players } = await response.json();
+    if (!Array.isArray(players)) return;
+    const key = JSON.stringify(players);
+    if (key === playersKey) return;   // rebuilding would close a picker the presenter has open
+    playersKey = key;
+    followEl.replaceChildren(Object.assign(document.createElement('option'), { value: '', textContent: 'nobody' }));
+    for (const player of players) followEl.append(Object.assign(document.createElement('option'), { value: player.id, textContent: player.name }));
+    syncFollow();
+  } catch (e) { /* the next refresh tries again */ }
 }
 
 // ---- game status bar
@@ -303,6 +445,7 @@ function startStream() {
     setHealth('up');
   });
   source.addEventListener('status', (m) => { try { setGame(JSON.parse(m.data)); } catch (e) { /* ignore */ } });
+  source.addEventListener('story', (m) => { try { addCards([JSON.parse(m.data)]); } catch (e) { /* ignore */ } });
   source.onmessage = (m) => {
     try { ingest([JSON.parse(m.data)]); } catch (e) { /* ignore */ }
   };
@@ -343,6 +486,7 @@ async function pollOnce(gen) {
       const reply = await response.json();
       transport.backoff = 0;
       ingest(reply.events);
+      addCards(reply.story);
       setGame(reply.status);
       setHealth('up');
     } else {
@@ -412,6 +556,8 @@ function init() {
   reEl.addEventListener('change', () => { state.regex = reEl.checked; applyFilters(); });
   pauseEl.addEventListener('click', togglePause);
   signoutEl.addEventListener('click', signOut);
+  toggleEl.addEventListener('click', () => { state.story = !state.story; applyStoryMode(); saveHash(); });
+  followEl.addEventListener('change', () => { state.follow = followEl.value; saveHash(); scheduleStory(); });
   latestEl.addEventListener('click', scrollToEnd);
   logEl.addEventListener('scroll', () => { if (atBottom()) latestEl.hidden = true; });
   window.addEventListener('hashchange', () => { loadHash(); syncChips(); applyFilters(); });
@@ -424,5 +570,7 @@ function init() {
   updateCounts();
   startStream();
   checkAuth();
+  loadPlayers();
+  setInterval(loadPlayers, 5000);
 }
 init();

@@ -1,3 +1,4 @@
+import { ROUNDS } from './game.mjs';
 import { createHash } from 'node:crypto';
 import { GetItemCommand } from '@aws-sdk/client-dynamodb';
 import { GetDurableExecutionHistoryCommand } from '@aws-sdk/client-lambda';
@@ -277,11 +278,20 @@ export function sourceOf(group, tag) {
   return { WEB: 'web', WORKFLOW: 'workflow', EVENT: 'evaluator', MICROVM: 'vm' }[groupTag(group)];
 }
 
+const STAGE_IN_TEXT = /(?:^|\[|\s)(launch|migrate|compare)(?:\s+(careful|fast|-))?(?=[\]:\s]|$)/;
+
+/** Which launch, migrate or compare stage (and option) a VM, PHP, EVENT or MicroVM line is about, from its own label. */
+export function stageOf(text) {
+  const match = STAGE_IN_TEXT.exec(String(text).slice(0, 80));
+  return match ? { stage: match[1], ...(match[2] && match[2] !== '-' && { option: match[2] }) } : undefined;
+}
+
 /** A CloudWatch event -> an event, or undefined when it is noise. Id and ts come from the log line itself. */
 export function fromCloudWatch(group, raw) {
   const line = classify(groupTag(group), raw.message);
   if (!line) return undefined;
-  return make(cloudWatchId(group, raw), Number(raw.timestamp), line.tag, line.level, sourceOf(group, line.tag), line.text, line.detail);
+  const detail = ['VM', 'PHP', 'EVENT', 'MICROVM'].includes(line.tag) && !line.detail.stage ? { ...line.detail, ...stageOf(line.text) } : line.detail;
+  return make(cloudWatchId(group, raw), Number(raw.timestamp), line.tag, line.level, sourceOf(group, line.tag), line.text, detail);
 }
 
 /** `arn:aws:logs:<region>:<account>:log-group:<name>[:*]` or `<account>:<name>` -> `<name>`. */
@@ -379,6 +389,225 @@ export function snapshot(item) {
   };
 }
 
+// ---------------------------------------------------------------- roster, story cards and follow lines
+
+const ROUND_LIST = ROUNDS.map(round => round.id);
+const ROUND = new Map(ROUNDS.map(round => [round.id, round]));
+const optionLabel = (round, option) => ROUND.get(round)?.options.find(candidate => candidate.id === option)?.label ?? String(option);
+const roundName = round => String(ROUND.get(round)?.title ?? round).split('·').pop().trim();
+const ordinal = n => { const suffix = ['th', 'st', 'nd', 'rd'], v = n % 100; return `${n}${suffix[(v - 20) % 10] || suffix[v] || suffix[0]}`; };
+const dollars = cents => `${cents < 0 ? '-' : ''}$${Math.abs(Math.round(cents / 100)).toLocaleString('en-US')}`;
+const sentence = text => (/[.!?]$/.test(text) ? text : `${text}.`);
+const hash8 = text => createHash('sha1').update(text).digest('hex').slice(0, 8);
+const earliest = (...values) => { const known = values.filter(Number.isFinite); return known.length ? Math.min(...known) : undefined; };
+
+/** The roster as the log may show it: id, display name and picks. Never token_hash, never anything else. */
+export function parseRoster(item) {
+  const roster = jsonOf(item?.teams_data?.S ?? '[]');
+  return (Array.isArray(roster) ? roster : []).filter(player => isRecord(player) && typeof player.id === 'string').map(player => ({
+    id: player.id, name: String(player.name ?? '?').slice(0, 40),
+    picks: Object.fromEntries(Object.entries(isRecord(player.picks) ? player.picks : {}).filter(([, option]) => typeof option === 'string')),
+  }));
+}
+
+function playerEvent(run8, player, kind, at, level, text, detail) {
+  return make(`pl:${run8}:${player}:${kind}`, at, 'PLAYER', level, 'arena', text, { player, ...detail });
+}
+
+/** What changed between two rosters of one run. `previous` is a Map id -> player, or undefined for the first look. */
+export function diffRoster(previous, players, { run8, at, announceJoins }) {
+  const out = [];
+  if (!previous) {
+    if (announceJoins) {
+      players.forEach(player => out.push(playerEvent(run8, player.id, 'join', at, 'info', `${player.name} joined (${players.length} players)`, {})));
+    }
+    return out;
+  }
+  const ids = new Set(players.map(player => player.id));
+  for (const player of players) {
+    const before = previous.get(player.id);
+    if (!before) {
+      out.push(playerEvent(run8, player.id, 'join', at, 'info', `${player.name} joined (${players.length} players)`, {}));
+      continue;
+    }
+    if (before.name !== player.name) {
+      out.push(playerEvent(run8, player.id, `ren:${hash8(`${before.name}>${player.name}`)}`, at, 'info', `${before.name} renamed to ${player.name}`, {}));
+    }
+    for (const [round, option] of Object.entries(player.picks)) {
+      const old = before.picks[round];
+      if (old === option) continue;
+      const where = `in ${roundName(round)}`;
+      out.push(old === undefined
+        ? playerEvent(run8, player.id, `pick:${round}`, at, 'debug', `${player.name} picked ${optionLabel(round, option)} ${where}`, { round, option })
+        : playerEvent(run8, player.id, `pick:${round}:${hash8(`${old}>${option}`)}`, at, 'debug',
+          `${player.name} changed their pick ${where} from ${optionLabel(round, old)} to ${optionLabel(round, option)}`, { round, option, was: old }));
+    }
+  }
+  for (const [id, before] of previous) {
+    if (!ids.has(id)) out.push(playerEvent(run8, id, 'rm', at, 'info', `${before.name} was removed (${players.length} players left)`, {}));
+  }
+  return out;
+}
+
+/** The published rows of a results item, cut down to what the lines need. */
+export function parseResults(item) {
+  const data = jsonOf(item?.data?.S ?? '');
+  if (!isRecord(data) || !Array.isArray(data.rows)) return undefined;
+  const num = value => (Number.isFinite(value) ? value : undefined);
+  return {
+    market: num(data.market),
+    rows: data.rows.filter(row => isRecord(row) && !row.house && typeof row.id === 'string').map(row => ({
+      id: row.id, name: String(row.name ?? '?').slice(0, 40), bot: Boolean(row.bot), option: String(row.option ?? ''),
+      roll: num(row.roll), risk: num(row.risk), event: typeof row.event === 'string' ? row.event : '',
+      rank: num(row.rank), cumulative_cents: num(row.cumulative_cents), evidence: typeof row.evidence === 'string' ? row.evidence : '',
+    })),
+  };
+}
+
+/** One player's lines about one round's result: dice against risk, then rank and running total. */
+export function rowLines(row, round) {
+  const out = [];
+  if (row.risk > 0 && row.roll !== undefined) {
+    out.push(sentence(`${row.name} rolled ${row.roll} against ${optionLabel(round, row.option)}'s ${row.risk}${row.event ? `: ${row.event}` : ''}`));
+  } else if (row.event) {
+    out.push(sentence(`${row.name}: ${row.event}`));
+  }
+  if (Number.isInteger(row.rank) && row.cumulative_cents !== undefined) {
+    out.push(sentence(`${row.name} is ${ordinal(row.rank)} on ${dollars(row.cumulative_cents)}${row.evidence ? ` (evidence: ${row.evidence})` : ''}`));
+  }
+  return out;
+}
+
+function pickLine(player, round, option, evidence) {
+  let line = `${player.name} picked ${optionLabel(round, option)}`;
+  const result = evidence?.[option];
+  if (round === 'growth' && isRecord(result) && result.source === 'real' && typeof result.cart_kept === 'boolean') {
+    line += `: their shop is the real VM that ${result.cart_kept ? 'kept' : 'lost'} Maya's cart`;
+  }
+  return sentence(line);
+}
+
+const SEQ = { lobby: 0, start: 1, launch: 2, migrations: 3, checks: 4, final: 100 };
+
+/** Which operations Durable has started and finished, by name, with the history's own timestamps. */
+function operations(history) {
+  const ops = new Map();
+  let runs = 0, microvms = 0, ended, begun;
+  for (const event of history) {
+    const at = stamp(event.EventTimestamp), kind = String(event.EventType);
+    if (kind === 'InvocationCompleted') runs++;
+    if (kind === 'ChainedInvokeStarted') microvms++;
+    if (kind === 'ExecutionSucceeded') ended = at;
+    if (kind === 'ExecutionStarted') begun = at;
+    if (!event.Name) continue;
+    const op = ops.get(event.Name) ?? {};
+    if (kind.endsWith('Started')) op.started = Math.min(op.started ?? at, at);
+    if (kind.endsWith('Succeeded')) op.succeeded = Math.max(op.succeeded ?? at, at);
+    ops.set(event.Name, op);
+  }
+  return { ops, runs, microvms, ended, begun };
+}
+const seconds1 = (from, to) => (Number.isFinite(from) && Number.isFinite(to) && to >= from ? Math.round((to - from) / 100) / 10 : undefined);
+
+/**
+ * The story cards of the current run, in order. Every number comes from a field of the arena item, the Durable
+ * history, the timeline lines or a results item; a number that is not there is left out of the sentence.
+ * `firstSeen` (a Map) pins the time of a card that has no timestamp in the data.
+ */
+export function buildStory({ item, players, history, lines, results, firstSeen, at }) {
+  const runId = item?.run_id?.S;
+  if (!runId) return [];
+  const run8 = runId.slice(0, 8), phase = item.phase?.S, round = item.round?.S;
+  const { ops, runs, microvms, ended, begun } = operations(history);
+  const byId = new Map(lines.filter(isRecord).map(line => [line.id, line]));
+  const launch = jsonOf(item.launch_data?.S), evidence = jsonOf(item.evidence_data?.S);
+  const cards = [];
+  const add = (stage, seq, candidate, title, text, numbers = {}, byPlayer) => {
+    const id = `st:${run8}:${stage}`;
+    if (!Number.isFinite(candidate)) { if (!firstSeen.has(id)) firstSeen.set(id, at); candidate = firstSeen.get(id); }
+    cards.push({ id, ts: candidate, seq, stage, title, text, numbers, ...(byPlayer && { players: byPlayer }) });
+  };
+  const started = phase !== 'ready';
+  const webStart = byId.get('web-start');
+  const joined = started ? webStart?.detail?.players : players.length;
+  add('lobby', SEQ.lobby, undefined, 'Lobby', started
+    ? `The lobby closed${Number.isInteger(joined) ? ` with ${joined} players` : ''}. Until Start, nothing runs in AWS: the Web Function only answers phones.`
+    : `Players are joining: ${players.length} so far. Nothing is running in AWS yet. The Web Function only answers phones.`,
+  Number.isInteger(joined) ? { players: joined } : {});
+  if (started) {
+    add('start', SEQ.start, begun ?? webStart?.t, 'Start', "The Web Function started one Durable execution: the game's memory for the whole night.");
+  }
+  const shop = ops.get('launch-shop');
+  if (shop || byId.has('launch')) {
+    const clauses = [];
+    const real = isRecord(launch) && launch.source === 'real';
+    if (real && Array.isArray(launch.checkout_statuses) && launch.checkout_statuses.length) clauses.push('sold a mug');
+    if (real && launch.charges === 1) clauses.push('charged exactly once');
+    else if (real && Number.isInteger(launch.charges)) clauses.push(`charged ${launch.charges} times`);
+    if (shop?.succeeded !== undefined) clauses.push('the VM was destroyed');
+    const secs = seconds1(shop?.started, shop?.succeeded);
+    const outcome = clauses.length ? `It ${clauses.length > 1 ? `${clauses.slice(0, -1).join(', ')}, and ${clauses.at(-1)}` : clauses[0]}` : '';
+    const fallback = isRecord(launch) && launch.source && !real ? ' The real run did not complete, so recorded evidence is used.' : '';
+    add('launch', SEQ.launch, shop?.started ?? byId.get('launch')?.t, 'Launch shop',
+      `Durable asked an Event judge, which booted a MicroVM running the real PHP shop.${outcome ? ` ${sentence(outcome + (secs !== undefined ? ` (${secs} s)` : ''))}` : ''}${fallback}`,
+      { ...(secs !== undefined && { seconds: secs }), ...(real && Number.isInteger(launch.charges) && { charges: launch.charges }) });
+  }
+  const careful = ops.get('migrate-careful'), fast = ops.get('migrate-fast');
+  if (careful || fast || byId.has('migrate-careful') || byId.has('migrate-fast')) {
+    const a = seconds1(careful?.started, careful?.succeeded), b = seconds1(fast?.started, fast?.succeeded);
+    const timing = a !== undefined && b !== undefined ? ` (${a} s / ${b} s)` : a !== undefined ? ` (careful ${a} s)` : b !== undefined ? ` (fast ${b} s)` : '';
+    add('migrations', SEQ.migrations, earliest(careful?.started, fast?.started, byId.get('migrate-careful')?.t), 'Migrations',
+      `Two Event judges, two MicroVMs in parallel: careful copies every table, fast skips the carts${timing}.`,
+      { ...(a !== undefined && { careful_s: a }), ...(b !== undefined && { fast_s: b }) });
+  }
+  const checkedC = ops.get('compare-careful'), checkedF = ops.get('compare-fast');
+  if (checkedC || checkedF || byId.has('compare-careful') || byId.has('compare-fast')) {
+    const verdict = option => (isRecord(evidence?.[option]) && typeof evidence[option].cart_kept === 'boolean'
+      ? `${option} ${evidence[option].cart_kept ? 'KEPT' : 'LOST'} it` : undefined);
+    const said = [verdict('careful'), verdict('fast')].filter(Boolean);
+    add('checks', SEQ.checks, earliest(checkedC?.started, checkedF?.started, byId.get('compare-careful')?.t), 'Checks',
+      `Two fresh VMs restore each database and look for Maya's cart${said.length ? `: ${said.join(', ')}` : ''}.`);
+  }
+  ROUND_LIST.forEach((r, index) => {
+    const number = index + 1, current = round === r && ['open', 'closing'].includes(phase);
+    const wait = ops.get(`await-close-${r}`), published = ops.get(`publish-results-${r}`);
+    const result = results.get(r);
+    if (current || wait || result || byId.has(`open-${r}`)) {
+      const closed = byId.get(`web-close-${r}`)?.detail ?? byId.get(`close-${r}`)?.detail;
+      const picked = current ? players.filter(player => player.picks[r]).length : closed?.picked;
+      const total = current ? players.length : closed?.players;
+      const counts = Number.isInteger(picked) && Number.isInteger(total) ? `${picked}/${total} picked` : undefined;
+      const byPlayer = {};
+      for (const player of players) {
+        if (player.picks[r]) byPlayer[player.id] = { lines: [pickLine(player, r, player.picks[r], evidence)], pick: player.picks[r] };
+      }
+      add(`open-${r}`, 10 + 2 * index, wait?.started ?? byId.get(`open-${r}`)?.t, `Round ${number} open`,
+        current
+          ? `Round ${number} is open. Durable is suspended, waiting for the presenter's Close. No code is running and nothing is billed.${counts ? ` ${counts}.` : ''}`
+          : `Round ${number} was open${counts ? `: ${counts}` : ''}. Durable was suspended, waiting for the presenter's Close, and nothing was billed.`,
+        { round: number, ...(Number.isInteger(picked) && { picked }), ...(Number.isInteger(total) && { players: total }) }, byPlayer);
+    }
+    if (wait?.succeeded !== undefined || (current && phase === 'closing') || result) {
+      const secs = seconds1(wait?.succeeded, published?.succeeded);
+      const scored = result?.rows.filter(row => !row.bot).length;
+      const unit = ROUND.get(r)?.market?.unit ?? '';
+      const byPlayer = {};
+      for (const row of result?.rows ?? []) byPlayer[row.id] = { lines: rowLines(row, r) };
+      add(`close-${r}`, 11 + 2 * index, wait?.succeeded, `Round ${number} closed`,
+        published?.succeeded !== undefined || result
+          ? `Close woke the workflow: it drew the market${result?.market !== undefined ? ` (${result.market}${unit})` : ''}, rolled everyone's dice, scored${scored !== undefined ? ` ${scored}` : ''} players and published${secs !== undefined ? `, in ${secs} s` : ''}. Then it went back to sleep.`
+          : "Close woke the workflow: it is drawing the market, rolling everyone's dice and scoring.",
+        { round: number, ...(result?.market !== undefined && { market: result.market }), ...(scored !== undefined && { players: scored }), ...(secs !== undefined && { seconds: secs }) }, byPlayer);
+    }
+  });
+  if (phase === 'final' || ended !== undefined) {
+    const facts = ['One Durable execution', ...(runs ? [`${runs} short runs of our code`] : []), ...(microvms ? [`${microvms} MicroVMs`] : [])];
+    add('final', SEQ.final, ended ?? byId.get('final')?.t, 'Game over', `Game over. ${facts.join(', ')}.`,
+      { ...(runs && { runs }), ...(microvms && { microvms }) });
+  }
+  return cards.sort((a, b) => a.seq - b.seq);
+}
+
 // ---------------------------------------------------------------- the shared hub
 
 const byTime = (a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -405,6 +634,9 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
   const tail = { active: false, gen: 0, controller: undefined, check: undefined, sleep: undefined, wake: undefined };
   let lastFilterAt = -Infinity;
   const listeners = new Set();
+  const resultsCache = new Map();     // run#round -> parsed results (immutable once published)
+  const firstSeen = new Map();        // card id -> time first seen, for cards the data does not time
+  let roster = { run: undefined, players: undefined }, latestPlayers = [], cards = [], storyChanged = [], cardJson = new Map();
   const durable = new Map();          // arn -> complete history of a finished execution
   let sorted = [], dirty = false, status = snapshot(undefined);
   let connections = 0, lastTouch = -Infinity, timer, running = false, inflight, polls = 0, lastDone = -Infinity;
@@ -465,11 +697,38 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
     // Only this game's workflow: the ARN names a function, and the role may read no other.
     const named = item?.execution_arn?.S;
     const arn = named && (!workflowFunction || named.includes(`:function:${workflowFunction}:`)) ? named : undefined;
+    const round = item?.results_round?.S;
+    const wanted = round ? ROUND_LIST.slice(0, ROUND_LIST.indexOf(round) + 1) : [];
     const [lines, steps] = await Promise.all([
       runId ? getItem(`timeline#${runId}`).then(row => (row?.lines?.L ?? []).map(entry => jsonOf(entry.S))) : [],
       arn ? history(arn) : [],
+      ...wanted.map(async r => {
+        const key = `${runId}#${r}`;
+        if (!resultsCache.has(key)) {
+          const parsed = parseResults(await getItem(`results#${runId}#${r}`));
+          if (parsed) { if (resultsCache.size > 16) resultsCache.clear(); resultsCache.set(key, parsed); }
+        }
+      }),
     ]);
-    return [...(runId ? fromTimeline(runId, lines) : []), ...(arn ? fromDurable(arn, steps) : [])];
+    const events = [...(runId ? fromTimeline(runId, lines) : []), ...(arn ? fromDurable(arn, steps) : [])];
+    if (!runId) { cards = []; storyChanged = []; return events; }
+    const run8 = runId.slice(0, 8), players = parseRoster(item), at = now();
+    const results = new Map(wanted.filter(r => resultsCache.has(`${runId}#${r}`)).map(r => [r, resultsCache.get(`${runId}#${r}`)]));
+    if (roster.run !== runId) roster = { run: runId, players: undefined };
+    events.push(...diffRoster(roster.players, players, { run8, at, announceJoins: item.phase?.S === 'ready' }));
+    roster = { run: runId, players: new Map(players.map(player => [player.id, player])) };
+    latestPlayers = players;
+    for (const [r, result] of results) {
+      const done = stamp(steps.find(event => event.Name === `publish-results-${r}` && /Succeeded$/.test(event.EventType))?.EventTimestamp ?? NaN);
+      for (const row of result.rows) {
+        if (!row.bot && Number.isFinite(done)) events.push(playerEvent(run8, row.id, `res:${r}`, done, 'debug', rowLines(row, r).join(' '), { round: r }));
+      }
+    }
+    cards = buildStory({ item, players, history: steps, lines, results, firstSeen, at });
+    const next = new Map(cards.map(card => [card.id, JSON.stringify(card)]));
+    storyChanged = cards.filter(card => cardJson.get(card.id) !== next.get(card.id));
+    cardJson = next;
+    return events;
   }
 
   async function groupTask(group) {
@@ -503,9 +762,9 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
       `${source} unavailable: ${error?.name ?? 'Error'}`, {});
   }
 
-  function notify(added, snapshotNow) {
+  function notify(added, snapshotNow, story) {
     for (const listener of [...listeners]) {
-      try { listener(added, snapshotNow); } catch { listeners.delete(listener); }
+      try { listener(added, snapshotNow, story); } catch { listeners.delete(listener); }
     }
   }
 
@@ -529,7 +788,9 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
     prune();
     polls++;
     lastDone = now();
-    notify(added.filter(event => buffer.has(event.id)), status);
+    const changedCards = storyChanged;
+    storyChanged = [];
+    notify(added.filter(event => buffer.has(event.id)), status, changedCards);
   }
 
   // ---- Live Tail: one session per environment, results pushed to clients as they arrive
@@ -663,6 +924,10 @@ export function createHub({ db, lambda, logs, table, groups, workflowFunction, a
       return out;
     },
     get status() { return status; },
+    /** Every story card of the current run, in order. */
+    storyCards() { return cards; },
+    /** The roster for the Follow picker: id and display name only. */
+    get players() { return latestPlayers.map(({ id, name }) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name)); },
     get polls() { return polls; },
     get active() { return running; },
     poll,
