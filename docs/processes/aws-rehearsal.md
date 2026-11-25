@@ -296,4 +296,25 @@ Managed Instances is not part of any deployment. See
 
 ## Go/no-go measurements
 
-To be recorded after the go/no-go run.
+Recorded 25 November 2026, 02:38–02:43 UTC, against `fourround` in Sydney
+(first deploy took 5 min 40 s). A throwaway script drove the public endpoint
+like phones from one host: 98 players joining over 10 s (a third with blank
+names, a third with 20-character emoji names), two late joiners in Growth, one
+player who never picks, every phone polling `/api/state` every 3 s + 0–1 s, each
+round's picks spread over 8 s with a third changing their minds, one pick racing
+each Close, wrong-round and `autoscale`-after-`stay` picks (all refused with 409).
+The presenter routes were driven with the SSM presenter key. Two full games,
+then a game Reset mid-Growth, then a fresh full game:
+
+| Check | Pass mark | Measured |
+|:--|:--|:--|
+| Presenter errors | 0 | 0 |
+| Phone 5xx and 429 | < 1% | 5 × 429 in 8,651 requests (0.06%), all polls; no 5xx |
+| Start → Round 1 open (real Launch, two migrations, two checks) | — | 24.8–26.0 s |
+| Close → results on `/api/state` | p95 ≤ 5 s | median 0.61 s, p95 0.88 s (watcher polling every 0.25 s; a phone adds up to one 3–4 s poll) |
+| Largest DynamoDB item | < 200 KB | 46.9 KB (the arena item while a round is closing) |
+| Every row's `cumulative_cents` vs an offline `model.score` replay of the checkpointed `plan-<round>` results | equal | 3 games × 402 rows, 0 mismatches |
+
+In the three completed games both migrations' evidence was `real`: careful kept
+Maya's cart (200), fast lost it (404), as expected. The two executions left
+waiting by the Resets were stopped afterwards.
