@@ -225,6 +225,20 @@ In the browser you can toggle tags and levels (`debug` is hidden by default),
 search (optionally with a regex), pause, and expand a line. Filters live in the
 URL hash, and the page keeps 10,000 lines.
 
+**Story and Follow.** **Story** turns the viewer into a projector card that says
+in plain words what the system is doing now (lobby, Start, Launch, migrations,
+checks, round open, Close, final), with a trail of earlier cards below. The
+server builds the cards from the fast sources only: the arena item, Durable
+history, the timeline and the results items. Every number on a card comes from
+one of those events, and a phrase is left out when its number is unknown. The
+VM, PHP and EVENT lines from CloudWatch arrive about 10 s later and fold in
+under the card for their stage. **Follow** picks a player by display name
+(`/api/players`, presenter-only, never a token hash). Their joins, renames and
+picks come from diffing the roster each poll, and their row in each round's
+results (roll against risk, rank, running total, real or modelled) adds a line
+to the matching card. With Follow on, the stage detail shows only the
+migration that player picked. Both settings live in the URL hash.
+
 ## What runs
 
 ```mermaid

@@ -546,7 +546,10 @@ export function buildStory({ item, players, history, lines, results, firstSeen, 
     else if (real && Number.isInteger(launch.charges)) clauses.push(`charged ${launch.charges} times`);
     if (shop?.succeeded !== undefined) clauses.push('the VM was destroyed');
     const secs = seconds1(shop?.started, shop?.succeeded);
-    const outcome = clauses.length ? `It ${clauses.length > 1 ? `${clauses.slice(0, -1).join(', ')}, and ${clauses.at(-1)}` : clauses[0]}` : '';
+    // "It sold a mug, charged exactly once, and the VM was destroyed"; with only the VM clause known: "The VM was destroyed".
+    const vmOnly = clauses.length === 1 && clauses[0] === 'the VM was destroyed';
+    const outcome = !clauses.length ? '' : vmOnly ? 'The VM was destroyed'
+      : `It ${clauses.length > 1 ? `${clauses.slice(0, -1).join(', ')}, and ${clauses.at(-1)}` : clauses[0]}`;
     const fallback = isRecord(launch) && launch.source && !real ? ' The real run did not complete, so recorded evidence is used.' : '';
     add('launch', SEQ.launch, shop?.started ?? byId.get('launch')?.t, 'Launch shop',
       `Durable asked an Event judge, which booted a MicroVM running the real PHP shop.${outcome ? ` ${sentence(outcome + (secs !== undefined ? ` (${secs} s)` : ''))}` : ''}${fallback}`,
