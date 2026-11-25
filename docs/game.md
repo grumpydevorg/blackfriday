@@ -192,7 +192,7 @@ Exists and has been run:
   the real Launch and growth stages in MicroVMs. Up to 100 audience players, the
   house and bots. Go/no-go numbers for this game:
   [AWS game and rehearsal](processes/aws-rehearsal.md#gono-go-measurements).
-  Tonight's rollback tag is `fourround-live-2026-11-25`.
+  The build presented at the talk is tagged `fourround-talk-2026-11-25`.
 - **The live log**, a second, presenter-only Web Function
   (`black-friday-four-logs`) that streams the game's Durable history, timeline
   and CloudWatch lines to a viewer with Story and Follow modes; read-only, and

@@ -58,8 +58,8 @@ resources besides the presenter key and passphrase (selected by
 destroyed on 25 November 2026, artifacts buckets kept, and are redeployed from
 their tags: the one-round **round** (`round-fallback-2026-11-25`) and the
 **rehearsal**, the IAM-only predecessor of both
-(`rehearsal-fallback-2026-11-24b`). Tonight's rollback tag for `fourround` is
-`fourround-live-2026-11-25`. The four-round game:
+(`rehearsal-fallback-2026-11-24b`). The `fourround` build presented at the talk
+is tagged `fourround-talk-2026-11-25`. The four-round game:
 
 ```mermaid
 flowchart LR

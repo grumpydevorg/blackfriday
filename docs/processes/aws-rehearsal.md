@@ -466,3 +466,21 @@ Before this run, one 5-player game's logs in all four `fourround` log groups wer
 searched for `php:`, `receipt`, `token`, `pay_url`, `X-Amz-`, `Signature`,
 `cookie`, the passphrase and the presenter key. The only hit was the apt
 package name `tokenizer.ini` in the image build log.
+
+**Third run, the structured-log build presented at the talk (commit 7d76481),
+06:27–06:31 UTC.** One 5-player game, then one 100-phone game with the same
+script. Launch, careful and fast evidence was `real` in both.
+
+| Check | Pass mark | Measured |
+|:--|:--|:--|
+| Presenter errors | 0 | 0 |
+| Phone 5xx and 429 | < 1% | 0 in 2,300 requests (5 × 409, the deliberate refusals) |
+| Start → Round 1 open | — | 22.9 s |
+| Close → results on `/api/state` | p95 ≤ 2 s | 0.33–0.84 s, p95 0.84 s |
+| Live viewer, 5-player game | every source present, nothing dropped | VM 41, PHP 28, EVENT 54, WORKFLOW 29, DURABLE 52, MICROVM 5; 0 contract-dropped lines; Story one card per stage, one run |
+
+Not run: a forced stage failure. The harness has no injection hook, so the
+recorded-evidence fallback is covered by unit tests only.
+
+The game was then played live at the AWS User Group Adelaide talk on 25 November
+2026: 28 players to the final board.
