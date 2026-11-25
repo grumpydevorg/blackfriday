@@ -434,7 +434,7 @@ def test_vm_and_evaluator_lines_are_timed_by_their_own_clock_within_the_resume_o
       result({ near: at(5000), far: at(10 * 60000), future: at(-9000), ordered: ordered.map(e => [e.detail.seq, e.ts - T]) });
     """)
     assert out['near'] == -5000, 'a VM entry keeps its own time, so the entries of one relay keep their order'
-    assert out['far'] == -60000, 'never older than the resume overlap behind the CloudWatch time'
+    assert out['far'] == -30000, 'clamped to half the resume overlap, so the next resume window still covers it'
     assert out['future'] == 0
     assert out['ordered'] == [[1, -3000], [0, -4000]]
 
@@ -1275,7 +1275,7 @@ def test_story_lines_attach_to_their_card_by_stage_run_and_option_and_follow_fil
       const page = {json.dumps(page)};
       const slice = page.slice(page.indexOf('function attached'), page.indexOf('function el('));
       const consts = page.match(/^const (?:STAGE_CARD|VM_STAGES) = .*;$/gm).join('\\n');
-      const build = new Function('lineEvents', 'storyRun', 'followedOption', `${{consts}}\\n${{slice}}\\nreturn attached;`);
+      const build = new Function('lineEvents', 'storyRun', 'followedOption', 'cards', `${{consts}}\\n${{slice}}\\nreturn attached;`);
       const run = RUN.slice(0, 8);
       const vm = (seq, extra) => jline('VM', vmEntry({{ seq, run, t: T - 50000 + seq * 1000, ...extra }}));
       aws.cw[EVALUATOR] = [
@@ -1292,7 +1292,7 @@ def test_story_lines_attach_to_their_card_by_stage_run_and_option_and_follow_fil
       const lineEvents = hub.eventsAfter(undefined, true).filter(e => e.detail && e.detail.stage);
       const cards = hub.storyCards().filter(card => ['launch', 'migrations', 'checks'].includes(card.stage));
       let mine = null;
-      const attached = build(lineEvents, run, () => mine);
+      const attached = build(lineEvents, run, () => mine, new Map(cards.map(card => [card.id, card])));
       const texts = {{}};
       for (const who of [null, 'careful', 'fast']) {{
         mine = who;

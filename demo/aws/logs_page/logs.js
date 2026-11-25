@@ -294,10 +294,14 @@ function attached(card) {
   if (!VM_STAGES.has(card.stage)) return [];
   const mine = followedOption();
   const out = [];
+  // VM and PHP lines name their run, and timeline lines carry it in their id (tl:<run>:...). EVENT lines name
+  // neither, so they must not predate this run's Launch.
+  const since = (cards.get(`st:${storyRun}:launch`) || {}).ts;
   for (const ev of lineEvents) {
     const d = ev.detail;
     if (STAGE_CARD[d.stage] !== card.stage) continue;
-    if (d.run && d.run !== storyRun) continue;
+    const run = d.run || (ev.id.startsWith('tl:') ? ev.id.split(':')[1] : undefined);
+    if (run ? run !== storyRun : Number.isFinite(since) && !(ev.ts >= since - 5000)) continue;
     if (mine && d.option && d.option !== mine) continue;
     out.push(ev);
   }

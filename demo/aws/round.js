@@ -84,7 +84,10 @@ function badge(source) {
 
 // One ranked line. The working is in the tooltip; the outcome line says what happened and what the dice said.
 // Colour follows the outcome, not the dice: a lost cart is bad even when the roll was safe.
-const bad = row => row.outcome !== 'held';
+// A row from a workflow deployed before `outcome` existed falls back to the dice; anything else is not trusted.
+const OUTCOMES = ['held', 'hit', 'lost_carts'];
+const outcomeOf = row => (OUTCOMES.includes(row.outcome) ? row.outcome : row.hit ? 'hit' : 'held');
+const bad = row => outcomeOf(row) !== 'held';
 function boardRow(state, results, row, own) {
   const line = make('article', '', `row ${bad(row) ? 'hit' : 'ok'}${own ? ' own' : ''}`);
   const name = make('span', row.name, 'name');
@@ -206,7 +209,7 @@ function renderPhone(state) {
     const head = make('p', '', 'option-head');
     head.append(make('span', optionLabel(state, results.round, mine.option), 'option-label'), badge(mine.evidence));
     const nodes = [make('p', `${resultRound?.weeks ?? ''} · result`, 'kicker'), make('h2', `${resultRound?.title ?? 'Last round'}: #${mine.rank} of ${results.board.total}`), head, make('p', mine.event, `event ${bad(mine) ? 'red' : 'green'}`)];
-    if (mine.risk > 0) nodes.push(make('p', `Dice: rolled ${mine.roll} against a risk of ${mine.risk}. ${mine.hit ? 'It hit.' : mine.outcome === 'lost_carts' ? 'The roll was safe, but the migration lost the carts.' : 'You were safe.'}`, 'dice'));
+    if (mine.risk > 0) nodes.push(make('p', `Dice: rolled ${mine.roll} against a risk of ${mine.risk}. ${mine.hit ? 'It hit.' : outcomeOf(mine) === 'lost_carts' ? 'The roll was safe, but the migration lost the carts.' : 'You were safe.'}`, 'dice'));
     if (resultRound) nodes.push(make('p', marketDraw(resultRound, results.market), 'market'));
     nodes.push(stats);
     if (mine.refund_cents) nodes.push(make('p', `Includes ${money(mine.refund_cents)} in refunds.`, 'hint'));
@@ -400,7 +403,7 @@ let behindLines = [];
 const behindHidden = new Set();
 let behindQuery = '';
 const behindCounts = {};
-const known = line => TAGS.includes(line.tag);
+const known = line => TAGS.includes(line.tag) && Number.isFinite(line.t) && typeof line.id === 'string';
 const lineHaystack = line => [clock.format(new Date(line.t)), line.tag, line.level, line.text, ...Object.values(line.detail ?? {}).map(detailValue)].join('\n').toLowerCase();
 
 function behindLine(line) {

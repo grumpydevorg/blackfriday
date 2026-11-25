@@ -309,7 +309,8 @@ export function inspectCloudWatch(group, raw) {
   if (!line) return {};
   if (line.invalid) return { invalid: line.invalid };
   const logged = Number(raw.timestamp);
-  const ts = Number.isFinite(line.at) ? Math.min(logged, Math.max(line.at, logged - OVERLAP_MS)) : logged;
+  // Half the overlap: a line clamped to the floor still sits inside the next resume's `cursor - OVERLAP_MS` window.
+  const ts = Number.isFinite(line.at) ? Math.min(logged, Math.max(line.at, logged - OVERLAP_MS / 2)) : logged;
   return { event: make(cloudWatchId(group, raw), ts, line.tag, line.level, sourceOf(group, line.tag), line.text, line.detail) };
 }
 
@@ -625,8 +626,10 @@ export function buildStory({ item, players, history, lines, results, firstSeen, 
   if (careful || fast || byId.has('migrate-careful') || byId.has('migrate-fast')) {
     const a = seconds1(careful?.started, careful?.succeeded), b = seconds1(fast?.started, fast?.succeeded);
     const timing = a !== undefined && b !== undefined ? ` (${a} s / ${b} s)` : a !== undefined ? ` (careful ${a} s)` : b !== undefined ? ` (fast ${b} s)` : '';
+    const recordedMigrations = REAL_OPTIONS.filter(option => byId.get(`migrate-${option}`)?.detail?.source === 'recorded');
     add('migrations', SEQ.migrations, earliest(careful?.started, fast?.started, byId.get('migrate-careful')?.t), 'Migrations',
-      `Two Event judges, two MicroVMs in parallel: careful copies every table, fast skips the carts${timing}.`,
+      `Two Event judges, two MicroVMs in parallel: careful copies every table, fast skips the carts${timing}.`
+      + (recordedMigrations.length ? ` The real run did not complete for ${recordedMigrations.join(' and ')}, so recorded evidence is used.` : ''),
       { ...(a !== undefined && { careful_s: a }), ...(b !== undefined && { fast_s: b }) });
   }
   const checkedC = ops.get('compare-careful'), checkedF = ops.get('compare-fast');
@@ -637,8 +640,10 @@ export function buildStory({ item, players, history, lines, results, firstSeen, 
       return outcome === 'kept' ? `${option} kept it` : outcome === 'fumbled' ? `${option} fumbled it (carts skipped by design)` : `${option} LOST it (unexpected)`;
     };
     const said = REAL_OPTIONS.map(verdict).filter(Boolean);
+    const recordedChecks = REAL_OPTIONS.filter(option => isRecord(evidence?.[option]) && evidence[option].source === 'recorded');
     add('checks', SEQ.checks, earliest(checkedC?.started, checkedF?.started, byId.get('compare-careful')?.t), 'Checks',
-      `Two fresh VMs restore each database and look for Maya's cart${said.length ? `: ${said.join(', ')}` : ''}.`);
+      `Two fresh VMs restore each database and look for Maya's cart${said.length ? `: ${said.join(', ')}` : ''}.`
+      + (recordedChecks.length ? ` The real check did not complete for ${recordedChecks.join(' and ')}, so recorded evidence is used.` : ''));
   }
   ROUND_LIST.forEach((r, index) => {
     const number = index + 1, current = round === r && ['open', 'closing'].includes(phase);
@@ -682,7 +687,8 @@ export function buildStory({ item, players, history, lines, results, firstSeen, 
 
 // ---------------------------------------------------------------- the shared hub
 
-const byTime = (a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+// Same millisecond: the VM's own sequence number keeps a PHP line and its stage line in the order they happened.
+const byTime = (a, b) => a.ts - b.ts || (a.detail?.seq ?? 0) - (b.detail?.seq ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 /**
  * One poller per environment, shared by every connection. It runs only while somebody is connected or
