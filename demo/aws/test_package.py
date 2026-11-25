@@ -251,12 +251,28 @@ def test_the_real_default_package_kinds_exclude_the_logs_package(monkeypatch):
 
 
 @pytest.mark.parametrize('deployment', ['rehearsal', 'round'])
-@pytest.mark.parametrize('command', ['deploy_logs', 'destroy_logs'])
+@pytest.mark.parametrize('command', ['deploy_logs', 'destroy_logs', 'deploy_web_only'])
 def test_the_logs_commands_refuse_other_deployments_before_touching_aws(monkeypatch, deployment, command):
     operate = load_operate(monkeypatch, deployment)
     monkeypatch.setattr(operate, 'account_session', lambda: pytest.fail('must refuse before AWS'))
     with pytest.raises(SystemExit, match='fourround'):
         getattr(operate, command)()
+
+
+def test_deploy_web_only_ships_the_web_package_and_changes_no_stack(monkeypatch, capsys):
+    operate = load_operate(monkeypatch, 'fourround')
+    built, uploads, webs = [], [], []
+    monkeypatch.setattr(operate, 'account_session', lambda: type('S', (), {
+        'client': lambda self, name: type('C', (), {'upload_file': lambda self, *a: uploads.append(a)})()})())
+    monkeypatch.setattr(operate, 'packages', lambda out, kinds: built.append(kinds) or {'web': ('packages/web/abc.zip', out / 'web.zip')})
+    monkeypatch.setattr(operate, 'stack_outputs', lambda session, stack: {'Bucket': 'game-artifacts'} if stack == operate.ARTIFACTS else pytest.fail(stack))
+    monkeypatch.setattr(operate, 'cloudformation_deploy', lambda *a, **k: pytest.fail('no stack change'))
+    monkeypatch.setattr(operate, 'deploy_web', lambda session, bucket, key, **kw: webs.append((bucket, key, kw)) or 'https://x')
+    monkeypatch.setattr(operate, 'retain_web_logs', lambda session: None)
+    operate.deploy_web_only()
+    assert built == [('web',)]
+    assert [u[1:] for u in uploads] == [('game-artifacts', 'packages/web/abc.zip')]
+    assert webs == [('game-artifacts', 'packages/web/abc.zip', {})], 'the game function, with its default config'
 
 
 def test_deploy_logs_deploys_its_own_stack_bucket_and_function_and_nothing_of_the_games(monkeypatch, capsys):

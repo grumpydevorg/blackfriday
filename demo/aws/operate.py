@@ -439,6 +439,21 @@ def deploy(*, keep_failed: bool = False) -> None:
     print(json.dumps({**stack_outputs(session, STACK), 'StageUrl': url}, indent=2))
 
 
+def deploy_web_only() -> None:
+    """Ship a page-only change: build and upload just the web package and point the game's Web Function at it.
+    No stack change, so the workflow, evaluator and image versions stay as they are."""
+    require_fourround('deploy-web')
+    session = account_session()
+    with TemporaryDirectory(prefix='black-friday-web-') as work:
+        artifacts = packages(Path(work), ('web',))
+        bucket = stack_outputs(session, ARTIFACTS)['Bucket']
+        key, path = artifacts['web']
+        session.client('s3').upload_file(str(path), bucket, key)
+    url = deploy_web(session, bucket, key)
+    retain_web_logs(session)
+    print(json.dumps({'StageUrl': url, 'WebKey': key}, indent=2))
+
+
 def require_fourround(command: str) -> None:
     if DEPLOYMENT != 'fourround':
         raise SystemExit(f'{command} serves the four-round game only (BLACK_FRIDAY_DEPLOYMENT=fourround)')
@@ -667,6 +682,7 @@ def main() -> None:
     logs_command = commands.add_parser(
         'deploy-logs', help='Deploy the presenter-only live log as its own Web Function and stack (fourround only)')
     logs_command.add_argument('--keep-failed', action='store_true', help='Preserve failed stack resources for diagnosis')
+    commands.add_parser('deploy-web', help="Deploy only the game's Web Function code, no stack change (fourround only)")
     commands.add_parser('destroy-logs', help='Delete only the live log: its function, log groups, stack and bucket')
     stage = commands.add_parser('present', help='Proxy to the selected deployment (IAM rehearsal, keyed round)')
     stage.add_argument('--port', type=int, default={'rehearsal': 8767, 'round': 8768, 'fourround': 8770}[DEPLOYMENT])
@@ -681,6 +697,8 @@ def main() -> None:
         deploy_logs(keep_failed=args.keep_failed)
     elif args.command == 'destroy-logs':
         destroy_logs()
+    elif args.command == 'deploy-web':
+        deploy_web_only()
     elif args.command == 'deploy':
         deploy(keep_failed=args.keep_failed)
     elif args.command == 'passphrase':

@@ -488,6 +488,26 @@ function toggleBehindLine(head) {
 
 if (host) {
   buildBehindFilter();
+  // Full-screen QR for the room. Client-side only: the same /api/host/qr.svg, shown as large as the screen allows.
+  const overlay = $('qr-overlay');
+  const openQr = () => {
+    if (!$('qr').getAttribute('src')) return;   // not signed in or no public URL yet
+    $('qr-big').src = $('qr').getAttribute('src');
+    $('qr-big-url').textContent = ($('public-url').textContent || '').replace(/^https:\/\//, '');
+    overlay.hidden = false;
+    overlay.requestFullscreen?.().catch(() => {});   // the overlay still covers the page if fullscreen is refused
+  };
+  const closeQr = () => {
+    if (overlay.hidden) return;
+    overlay.hidden = true;
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  };
+  $('qr-full').addEventListener('click', openQr);
+  $('qr-open').addEventListener('click', openQr);
+  overlay.addEventListener('click', closeQr);
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') closeQr(); });
+  // Esc in fullscreen exits fullscreen without a keydown reaching the page: close the overlay with it.
+  document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement) closeQr(); });
   $('login').addEventListener('submit', async event => {
     event.preventDefault();
     await act(async () => { await api('host/login', { body: { passphrase: $('passphrase').value } }); $('passphrase').value = ''; }, 'login-error');

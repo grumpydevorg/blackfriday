@@ -12,8 +12,8 @@
 <section id="scoreboard" hidden><h2 id="board-title">Board</h2><div id="scores" class="scores"></div><p id="more" class="muted"></p></section>
 <section id="evidence-section" class="panel" hidden><h2>Evidence</h2><div id="evidence" class="evidence"></div></section>
 <p class="execution">Durable execution <code id="execution">Not started</code></p>
-</section><aside class="host-side"><section class="panel join-card"><h2>Scan. Join. Play.</h2><img id="qr" alt="QR code to the public player page" width="200" height="200"><p><a id="public-url" href="#"></a></p></section>
+</section><aside class="host-side"><section class="panel join-card"><h2>Scan. Join. Play.</h2><button id="qr-open" class="qr-open" type="button" title="Show the QR code full screen"><img id="qr" alt="QR code to the public player page" width="200" height="200"></button><p><a id="public-url" href="#"></a></p><button id="qr-full" class="secondary" type="button">Full screen</button></section>
 <section class="panel"><h2>Players</h2><p id="capacity" class="muted"></p><ul id="teams"></ul></section></aside></div>
 <details id="behind" class="panel behind"><summary>Behind the scenes</summary><p class="muted behind-note">What the game is doing on AWS, as it happens. Click a line for details.</p><div class="behind-filter"><div id="behind-tags" class="behind-tags" role="group" aria-label="Show lines by tag"></div><input id="behind-search" class="behind-search" type="search" placeholder="Filter lines" aria-label="Filter lines" autocomplete="off" spellcheck="false"></div><div id="behind-log" class="behind-log" role="log" aria-live="off"></div><p id="behind-status" class="muted behind-status" role="status"></p></details>
 <button id="logout" class="secondary" type="button">Sign out</button></div>
-</main></body></html>
+<div id="qr-overlay" class="qr-overlay" role="dialog" aria-modal="true" aria-label="Join the game" hidden><p class="qr-overlay-title">Scan. Join. Play.</p><img id="qr-big" class="qr-big" alt="QR code to the public player page"><p id="qr-big-url" class="qr-big-url"></p><p class="qr-overlay-hint">Esc or click to close</p></div>
