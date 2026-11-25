@@ -113,7 +113,9 @@ process on the Mac itself is trusted, as it already is for 8770. Without
 
 The page shows the public URL as text and a QR code, the players and whether they
 have picked for the open round, the round's forecast and market range, the
-execution ARN, and three buttons:
+execution ARN, and three buttons. **Full screen** under the QR (or a click on the
+QR) shows the QR as large as the screen allows, with the public URL in large
+text and "Scan. Join. Play.", in browser fullscreen; Esc or a click closes it.
 
 1. **Start.** Only before the game starts. Starts the version-pinned Durable
    execution, which runs the real Launch and both migrations and checks, then
@@ -320,7 +322,11 @@ CloudFormation's `AWS::Lambda::WebFunction` cannot create one any more: since
 November 2026 `CreateWebFunction` needs its first revision and endpoint in the
 same call. Web Function names are unique across all Regions in an account.
 `uv run aws/operate.py package <output>` builds the deployment archives without
-AWS.
+AWS. For a change to the pages or the game Web Function's code alone,
+`BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py deploy-web` builds and
+uploads only the web package and creates a new revision of `black-friday-four`.
+It makes no stack change, so the workflow, evaluator and image keep their
+versions.
 
 ### The frozen deployments
 
