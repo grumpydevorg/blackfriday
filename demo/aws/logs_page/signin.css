@@ -1,0 +1,13 @@
+:root { color-scheme: dark; --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3; --dim: #8b949e; --error: #ff7b72;
+  --mono: ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace; }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { display: grid; place-items: center; background: var(--bg); color: var(--text); font: 18px/1.4 var(--mono); }
+main { width: min(28em, 92vw); background: var(--panel); border: 2px solid var(--line); border-radius: 10px; padding: 24px; }
+h1 { font-size: 20px; letter-spacing: .08em; margin: 0 0 18px; }
+label { display: block; color: var(--dim); margin-bottom: 6px; }
+input { width: 100%; font: inherit; color: var(--text); background: var(--bg); border: 2px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+input:focus { outline: none; border-color: #58a6ff; }
+button { margin-top: 14px; font: inherit; cursor: pointer; color: var(--text); background: #1f6feb; border: 2px solid #58a6ff; border-radius: 6px; padding: 4px 18px; }
+button:disabled { opacity: .5; cursor: default; }
+#message { min-height: 1.4em; margin: 12px 0 0; color: var(--error); }

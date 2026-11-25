@@ -161,6 +161,196 @@ def test_the_passphrase_command_sets_the_shared_parameter_for_round_and_fourroun
         load_operate(monkeypatch, 'rehearsal').passphrase()
 
 
+# --- the live log ---------------------------------------------------------------------------------------------
+
+
+LOGS_FILES = {
+    'index.mjs', 'logs.mjs', 'host_auth.mjs', 'game.mjs', 'rounds.json',
+    'logs_page/signin.html', 'logs_page/signin.js', 'logs_page/signin.css',
+    'logs_page/index.html', 'logs_page/logs.js', 'logs_page/logs.css',
+}
+ACCOUNT = '123456789012'
+WORKFLOW_ARN = f'arn:aws:lambda:ap-southeast-2:{ACCOUNT}:function:black-friday-four-workflow:7'
+
+
+def test_the_logs_package_is_exactly_the_contract_files_and_modules(monkeypatch, tmp_path):
+    files, trees = definitions(monkeypatch, tmp_path)['logs']
+    assert set(files) == LOGS_FILES
+    assert files['index.mjs'] == AWS_DIR / 'logs_web.mjs'
+    assert files['rounds.json'] == AWS_DIR / 'rounds.json'
+    assert set(trees) == {'node_modules/'}
+    for name, path in files.items():
+        assert path.is_file(), name
+    sources = ''.join(path.read_text() for name, path in files.items() if name.endswith('.mjs'))
+    needed = set(re.findall(r"from '\./([\w.-]+)'", sources)) | set(re.findall(r"new URL\('\./([\w./-]+)'", sources))
+    assert not {name for name in needed if '.' in name} - set(files), 'a file the logs function loads is not packaged'
+    package = json.loads((AWS_DIR / 'package.json').read_text())['dependencies']
+    assert package['@aws-sdk/client-cloudwatch-logs'] == package['@aws-sdk/client-lambda'] == '3.1175.0'
+
+
+class RecordingSession:
+    def __init__(self, uploads):
+        self.uploads = uploads
+
+    def client(self, name):
+        uploads = self.uploads
+        if name == 'ssm':
+            return type('Ssm', (), {'get_parameter': lambda self, **kw: {'Parameter': {'Value': 'k'}}})()
+        assert name == 's3'
+        return type('S3', (), {
+            'upload_file': lambda self, path, bucket, key: uploads.append((bucket, key)),
+            'head_object': lambda self, **kw: {'VersionId': 'v1'},
+        })()
+
+
+def stub_aws(monkeypatch, operate):
+    """Replace every AWS touchpoint of deploy and deploy_logs; return what they were asked to do."""
+    seen = {'uploads': [], 'packages': [], 'stacks': [], 'web': []}
+    monkeypatch.setattr(operate, 'ACCOUNT', ACCOUNT)
+    monkeypatch.setattr(operate, 'account_session', lambda: RecordingSession(seen['uploads']))
+    monkeypatch.setattr(operate, 'available_base_version', lambda session: '1')
+
+    def fake_packages(out, *args):
+        seen['packages'].append(args)
+        kinds = args[0] if args else operate.GAME_PACKAGES
+        return {kind: (f'packages/{kind}/{"0" * 64}.zip', out / f'{kind}.zip') for kind in kinds}
+
+    def fake_stack_outputs(session, stack):
+        return {
+            operate.STACK: {'RunTable': 'tbl', 'WorkflowVersion': WORKFLOW_ARN, 'WebRole': 'role/web'},
+            operate.ARTIFACTS: {'Bucket': 'game-bucket'},
+            operate.LOGS_STACK: {'Bucket': 'logs-bucket', 'LogsRole': 'role/logs'},
+        }[stack]
+
+    monkeypatch.setattr(operate, 'packages', fake_packages)
+    monkeypatch.setattr(operate, 'stack_outputs', fake_stack_outputs)
+    monkeypatch.setattr(operate, 'cloudformation_deploy', lambda template, stack, **kw: seen['stacks'].append((template, stack, kw)))
+    monkeypatch.setattr(operate, 'deploy_web', lambda session, bucket, key, **kw: seen['web'].append((bucket, key, kw)) or 'https://x')
+    monkeypatch.setattr(operate, 'retain_web_logs', lambda session, *function: seen.setdefault('retained', []).append(function))
+    return seen
+
+
+def test_deploy_builds_and_uploads_only_the_game_packages(monkeypatch, capsys):
+    operate = load_operate(monkeypatch, 'fourround')
+    seen = stub_aws(monkeypatch, operate)
+    operate.deploy()
+    assert operate.GAME_PACKAGES == ('image', 'worker', 'workflow', 'web')
+    assert seen['packages'] == [()], 'deploy must use the default (game) package kinds'
+    assert [key.split('/')[1] for _, key in seen['uploads']] == ['image', 'worker', 'workflow', 'web']
+    assert {bucket for bucket, _ in seen['uploads']} == {'game-bucket'}
+    assert [stack for _, stack, _ in seen['stacks']] == ['BlackFridayFourRoundArtifacts', 'BlackFridayFourRound']
+    assert [(bucket, key.split('/')[1]) for bucket, key, _ in seen['web']] == [('game-bucket', 'web')]
+    assert seen['web'][0][2] == {}, 'the game deployment passes no overrides to deploy_web'
+
+
+def test_the_real_default_package_kinds_exclude_the_logs_package(monkeypatch):
+    operate = load_operate(monkeypatch, 'fourround')
+    import inspect
+    assert inspect.signature(operate.packages).parameters['kinds'].default == ('image', 'worker', 'workflow', 'web')
+    assert 'logs' not in operate.GAME_PACKAGES and operate.LOGS_PACKAGES == ('logs',)
+
+
+@pytest.mark.parametrize('deployment', ['rehearsal', 'round'])
+@pytest.mark.parametrize('command', ['deploy_logs', 'destroy_logs'])
+def test_the_logs_commands_refuse_other_deployments_before_touching_aws(monkeypatch, deployment, command):
+    operate = load_operate(monkeypatch, deployment)
+    monkeypatch.setattr(operate, 'account_session', lambda: pytest.fail('must refuse before AWS'))
+    with pytest.raises(SystemExit, match='fourround'):
+        getattr(operate, command)()
+
+
+def test_deploy_logs_deploys_its_own_stack_bucket_and_function_and_nothing_of_the_games(monkeypatch, capsys):
+    operate = load_operate(monkeypatch, 'fourround')
+    seen = stub_aws(monkeypatch, operate)
+    operate.deploy_logs()
+    assert seen['packages'] == [(('logs',),)]
+    [(template, stack, parameters)] = seen['stacks']
+    assert (template, stack) == ('logs.yaml', 'BlackFridayFourRoundLogs')
+    assert parameters['RunTableArn'] == f'arn:aws:dynamodb:ap-southeast-2:{ACCOUNT}:table/tbl'
+    assert parameters['WorkflowFunctionName'] == 'black-friday-four-workflow'
+    assert parameters['WorkflowLogGroup'] == '/aws/lambda/black-friday-four-workflow'
+    assert (parameters['PresenterParameter'], parameters['PassphraseParameter']) == (
+        '/black-friday/round/presenter-key', '/black-friday/round/presenter-passphrase')
+    assert seen['uploads'] == [('logs-bucket', f'packages/logs/{"0" * 64}.zip')]
+    [(bucket, key, web)] = seen['web']
+    assert (bucket, web['function'], web['role']) == ('logs-bucket', 'black-friday-four-logs', 'role/logs')
+    assert (web['timeout'], web['concurrency']) == (900, 64)
+    assert web['limits'] == {'scalingConfig': {'maxEnvironments': 3}, 'throttleConfig': {'rateLimit': 20}}
+    environment = web['environment']
+    assert environment['AWS_LAMBDA_NODEJS_ENTRYPOINT'] == 'index.mjs'
+    assert environment['RUN_TABLE'] == 'tbl'
+    assert environment['WORKFLOW_FUNCTION'] == 'black-friday-four-workflow'
+    assert environment['LOG_GROUPS'].split(',') == [
+        '/aws/lambda/web/black-friday-four', '/aws/lambda/black-friday-four-workflow',
+        '/aws/lambda/black-friday-four-evaluator', '/aws/lambda-microvms/black-friday-four-shop']
+    assert 'PUBLIC_HOST' not in environment, 'deploy_web adds the function\'s own domain once the endpoint exists'
+    assert seen['retained'] == [('black-friday-four-logs',)]
+    assert 'https://x' in capsys.readouterr().out
+
+
+def test_deploy_web_without_overrides_keeps_the_game_service_config(monkeypatch):
+    operate = load_operate(monkeypatch, 'fourround')
+    calls = {}
+
+    class NotFound(Exception):
+        pass
+
+    web = type('Web', (), {
+        'exceptions': type('E', (), {'ResourceNotFoundException': NotFound}),
+        'get_web_function_endpoint': lambda self, **kw: (_ for _ in ()).throw(NotFound()),
+        'create_web_function': lambda self, **kw: calls.update(kw) or {'revision': {'revisionId': 'r1'}},
+        'get_web_function_revision': lambda self, **kw: {
+            'buildConfig': {'codeConfig': {'s3Object': {'bucket': 'b', 'key': 'k', 'versionId': 'v1'}}},
+            'serviceConfig': calls['revisionConfig']['serviceConfig'] | {
+                'environmentVariables': {**calls['revisionConfig']['serviceConfig']['environmentVariables'],
+                                         'PUBLIC_HOST': 'x.on.aws'}},
+        },
+        'update_web_function_endpoint': lambda self, **kw: calls.setdefault('update', kw),
+    })()
+    session = type('S', (), {'client': lambda self, name: web if name == 'lambda-web' else type('S3', (), {
+        'head_object': lambda self, **kw: {'VersionId': 'v1'}})()})()
+    monkeypatch.setattr(operate, 'stack_outputs', lambda session, stack: {
+        'WebRole': 'role/web', 'RunTable': 'tbl', 'WorkflowVersion': WORKFLOW_ARN})
+    monkeypatch.setattr(operate, 'wait_web', lambda *a, **kw: {
+        'domainName': 'x.on.aws', 'state': 'Active', 'revisionWeights': [{'revisionId': 'r1'}]})
+    assert operate.deploy_web(session, 'b', 'k') == 'https://x.on.aws'
+    assert calls['functionName'] == 'black-friday-four'
+    service = calls['revisionConfig']['serviceConfig']
+    assert service['executionRoleArn'] == 'role/web'
+    assert (service['timeoutSeconds'], service['maxConcurrencyPerEnvironment']) == (15, 8)
+    assert service['environmentVariables'] == {
+        'AWS_LAMBDA_NODEJS_ENTRYPOINT': 'index.mjs', 'RUN_TABLE': 'tbl', 'WORKFLOW_ARN': WORKFLOW_ARN,
+        'PRESENTER_PARAMETER': '/black-friday/round/presenter-key',
+        'PASSPHRASE_PARAMETER': '/black-friday/round/presenter-passphrase',
+    }
+    endpoint = calls['endpointConfig']
+    assert endpoint['scalingConfig'] == {'maxEnvironments': 10} and endpoint['throttleConfig'] == {'rateLimit': 100}
+    assert (endpoint['endpointType'], endpoint['authType']) == ('HomeRegion', 'ApplicationManaged')
+    assert calls['revisionConfig']['buildConfig']['runtimeConfig'] == {'runtime': 'nodejs24.x'}
+
+
+def test_logs_yaml_gives_the_role_only_the_contract_read_actions_and_leaves_the_game_templates_alone():
+    template = (AWS_DIR / 'logs.yaml').read_text()
+    role = template[template.index('  LogsRole:'):template.index('Outputs:')]
+    actions = set()
+    for line in role.splitlines():
+        match = re.match(r'\s+Action: (.+)$', line)
+        if match and 'sts:AssumeRole' not in line:
+            actions |= set(re.findall(r'[a-z0-9]+:[A-Za-z*]+', match.group(1)))
+    assert actions == {
+        'logs:FilterLogEvents', 'lambda:GetDurableExecution', 'lambda:GetDurableExecutionHistory',
+        'dynamodb:GetItem', 'ssm:GetParameter', 'ssm:GetParameters', 'kms:Decrypt',
+    }
+    assert 'service-role/AWSLambdaBasicExecutionRole' in role
+    for forbidden in ('UpdateItem', 'PutItem', 'DeleteItem', 'lambda:Invoke', 'SendDurableExecutionCallback',
+                      'dynamodb:Query', 'dynamodb:Scan', 's3:', 'Resource: \'*\'', 'Resource: "*"'):
+        assert forbidden not in role, forbidden
+    assert 'LogsRole: {Value: !GetAtt LogsRole.Arn}' in template
+    # Its own bucket and policy: the game's artifact bucket policy is not extended.
+    assert "packages/logs/*" in template and 'web-function/${LogsFunctionName}/revision/*' in template
+    assert 'LogsFunctionName' not in (AWS_DIR / 'artifacts.yaml').read_text()
+
+
 # --- the presenter proxy --------------------------------------------------------------------------------------
 
 

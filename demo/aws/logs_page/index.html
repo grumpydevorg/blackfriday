@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>BLACK FRIDAY · live log</title>
+<link rel="stylesheet" href="/logs.css">
+</head>
+<body>
+<header id="bar">
+  <div class="line">
+    <h1>BLACK FRIDAY live log</h1>
+    <span id="status" class="status">connecting…</span>
+    <span id="mode" class="muted"></span>
+    <span id="shown" class="muted"></span>
+    <button id="pause" type="button">Pause</button>
+    <button id="signout" type="button">Sign out</button>
+  </div>
+  <div class="line game" id="game">
+    <span class="label">Game</span>
+    <span id="g-run" class="muted">run –</span>
+    <span id="g-phase" class="muted">phase –</span>
+    <span id="g-round" class="muted">round –</span>
+    <span id="g-players" class="muted">players –</span>
+    <span id="g-picked" class="muted">picked –</span>
+  </div>
+  <div class="line">
+    <span class="label">Tags</span>
+    <div id="tags" class="chips"></div>
+  </div>
+  <div class="line">
+    <span class="label">Level</span>
+    <div id="levels" class="chips"></div>
+    <input id="q" type="search" placeholder="search tag, source, text" autocomplete="off" spellcheck="false">
+    <label class="check"><input id="re" type="checkbox"> regex</label>
+  </div>
+</header>
+<main id="log" tabindex="0"></main>
+<button id="latest" type="button" hidden>↓ latest</button>
+<script src="/logs.js"></script>
+</body>
+</html>

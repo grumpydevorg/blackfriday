@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Presenter-only live log for the BLACK FRIDAY four-round game. Read-only role and its own code bucket; the game stacks are not touched.
+Parameters:
+  RunTableArn: {Type: String}
+  WorkflowFunctionName: {Type: String, Default: black-friday-four-workflow}
+  # The Web Function is created by operate.py through the Lambda Web API (see rehearsal.yaml), so its name is a
+  # parameter here: the bucket policy below names it as a constructed string, not a reference.
+  LogsFunctionName: {Type: String, Default: black-friday-four-logs}
+  WebLogGroup: {Type: String, Default: /aws/lambda/web/black-friday-four}
+  WorkflowLogGroup: {Type: String, Default: /aws/lambda/black-friday-four-workflow}
+  EvaluatorLogGroup: {Type: String, Default: /aws/lambda/black-friday-four-evaluator}
+  ShopLogGroup: {Type: String, Default: /aws/lambda-microvms/black-friday-four-shop}
+  PresenterParameter: {Type: String, Default: /black-friday/round/presenter-key}
+  PassphraseParameter: {Type: String, Default: /black-friday/round/presenter-passphrase}
+Resources:
+  Packages:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      Tags:
+        - {Key: project, Value: black-friday-demo}
+  PackagesPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Packages
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LogsRevisionSource
+            Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: [s3:GetObject, s3:GetObjectVersion]
+            Resource: !Sub '${Packages.Arn}/packages/logs/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:web-function/${LogsFunctionName}/revision/*'
+          - Sid: TransportSecurity
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt Packages.Arn, !Sub '${Packages.Arn}/*']
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+                aws:PrincipalIsAWSService: 'false'
+  LogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ReadTheGameLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: logs:FilterLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WebLogGroup}:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WorkflowLogGroup}:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${EvaluatorLogGroup}:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ShopLogGroup}:*'
+              - Effect: Allow
+                Action: [lambda:GetDurableExecution, lambda:GetDurableExecutionHistory]
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${WorkflowFunctionName}:*/durable-execution/*'
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !Ref RunTableArn
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PresenterParameter}'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PassphraseParameter}'
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+                    kms:EncryptionContext:PARAMETER_ARN:
+                      - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PresenterParameter}'
+                      - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PassphraseParameter}'
+Outputs:
+  LogsRole: {Value: !GetAtt LogsRole.Arn}
+  Bucket: {Value: !Ref Packages}
