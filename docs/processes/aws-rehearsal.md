@@ -1,22 +1,22 @@
 # AWS game and rehearsal
 
-One deployment is live in Sydney (`ap-southeast-2`): **fourround**, the four-round
-game. The one-round `round` deployment and the `rehearsal` deployment were
-destroyed on 25 November 2026 (their artifacts buckets were kept); redeploy
-either from its tag ([the frozen deployments](#the-frozen-deployments)).
+Nothing is deployed. All three deployments below were destroyed on 25 November
+2026, after the talk, with their artifacts buckets and the presenter key and
+passphrase; redeploy any of them from its tag
+([the frozen deployments](#the-frozen-deployments)) after setting a new
+presenter key and passphrase.
 
 | Deployment | What it is | Endpoint | Presenter page | Now |
 |:--|:--|:--|:--|:--|
-| **fourround** | The four-round game: everyone in the room plays, up to 100 players plus the house, and bots if the room is thin | Public (`ApplicationManaged`): players open it on their phones | <http://127.0.0.1:8770/host> | Deployed. Rollback tag for the 25 November talk: `fourround-live-2026-11-25` |
+| **fourround** | The four-round game: everyone in the room plays, up to 100 players plus the house, and bots if the room is thin | Public (`ApplicationManaged`): players open it on their phones | <http://127.0.0.1:8770/host> | Destroyed; tag `fourround-talk-2026-11-25` (the build played at the talk) |
 | **round** | The one-round game it replaced (up to 200 teams, one Growth round) | Public | <http://127.0.0.1:8768/host> | Destroyed; tag `round-fallback-2026-11-25` |
 | **rehearsal** | Nobody plays: the presenter compares two releases | IAM only | <http://127.0.0.1:8767/> | Destroyed; tag `rehearsal-fallback-2026-11-24b` |
 
 Select one with `BLACK_FRIDAY_DEPLOYMENT=fourround`, `round` or `rehearsal` (the
 default). They share no stacks, functions, tables or Web Function, so one can
 change or be torn down without touching the others. `fourround` and `round`
-share one thing on purpose: the presenter key and passphrase in SSM, which
-outlive every teardown. The [local demo](local-play.md) needs no AWS account and
-is the last fallback.
+shared one thing on purpose: the presenter key and passphrase in SSM, which
+`destroy` leaves in place. The [local demo](local-play.md) needs no AWS account.
 
 | | Stack | Artifacts stack | Web Function |
 |:--|:--|:--|:--|
@@ -396,7 +396,13 @@ The one-round game's rules and runbook are in its own tag's copy of this file.
 
 ## Teardown
 
-When no run should resume, stop the presenter, then, for one deployment:
+When no run should resume, stop the presenter. A game waiting for a Close or a
+Reset keeps its Durable execution running for up to 23 h, and CloudFormation
+cannot delete the workflow version under it, so stop those first
+(`aws lambda list-durable-executions-by-function --function-name
+black-friday-four-workflow --statuses RUNNING`, then `aws lambda
+stop-durable-execution --durable-execution-arn …` for each). Then, for one
+deployment:
 
 ```sh
 BLACK_FRIDAY_DEPLOYMENT=fourround uv run aws/operate.py destroy-logs         # the live log first: its function, log groups, stack and bucket
@@ -539,7 +545,5 @@ talk.
 - Add a failure-injection hook to the go/no-go harness and force one stage
   failure in AWS; the recorded-evidence fallback has only run in unit tests.
 - Old games in the run table never expire: add a TTL.
-- The one-round and rehearsal artifacts buckets are kept; delete them when the
-  fallback tags are no longer needed.
 - The `four-round` commits made on rick-dev are unsigned: re-sign or
   squash-merge into `main`.

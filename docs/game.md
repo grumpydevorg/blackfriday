@@ -186,13 +186,14 @@ The five kinds of Lambda and what each does in BLACK FRIDAY are in the
 
 Exists and has been run:
 
-- **The four-round game** (above) in Sydney as the `fourround` deployment, the
-  only deployment now present: a public player page and a keyed presenter page
+- **The four-round game** (above) in Sydney as the `fourround` deployment,
+  played live at the talk on 25 Nov 2026: a public player page and a keyed presenter page
   on one Web Function (`black-friday-four`), a version-pinned Durable game, and
   the real Launch and growth stages in MicroVMs. Up to 100 audience players, the
   house and bots. Go/no-go numbers for this game:
   [AWS game and rehearsal](processes/aws-rehearsal.md#gono-go-measurements).
-  The build presented at the talk is tagged `fourround-talk-2026-11-25`.
+  The build presented at the talk is tagged `fourround-talk-2026-11-25`;
+  destroyed after the talk with its live log and artifacts bucket.
 - **The live log**, a second, presenter-only Web Function
   (`black-friday-four-logs`) that streams the game's Durable history, timeline
   and CloudWatch lines to a viewer with Story and Follow modes; read-only, and
@@ -202,11 +203,11 @@ Exists and has been run:
   paths in a single Growth round. It was measured in Sydney on 24 Nov 2026
   (Launch 9–11 s, Close 10–14 s, shoppers about 11 s, 40 teams a full round, 200
   joins in 7.1 s). Those numbers belong to that game, not the four-round one.
-  Destroyed on 25 Nov 2026, artifacts bucket kept; redeploy it from the tag.
+  Destroyed on 25 Nov 2026, artifacts bucket too; redeploy it from the tag.
 - An AWS rehearsal (Oregon, then Sydney since 23 Nov 2026), frozen at tag
   `rehearsal-fallback-2026-11-24b`: from one Launch checkpoint, two Growth
   migrations both passed `/health`; only one kept a saved cart. Destroyed on
-  25 Nov 2026, artifacts bucket kept; redeploy it from the tag.
+  25 Nov 2026, artifacts bucket too; redeploy it from the tag.
 - Git submission intake: push to `submit/round-1`, signed webhook, exact SHA
   queued, archive pinned and hashed, frozen export.
 - One reviewed PHP fixture at a frozen commit ran in a real MicroVM and earned

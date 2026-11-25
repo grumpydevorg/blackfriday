@@ -52,14 +52,14 @@ load balancer, VPC or NAT gateway. The team's side of the built game is not a
 cloud at all: each player picks options, and [`model.py`](../demo/aws/model.py)
 computes the shop (see [game.md](game.md#economics)).
 
-One deployment is live: the **four-round game** (`fourround`), with no shared
-resources besides the presenter key and passphrase (selected by
-`BLACK_FRIDAY_DEPLOYMENT`). Two earlier deployments of the same shape were
-destroyed on 25 November 2026, artifacts buckets kept, and are redeployed from
-their tags: the one-round **round** (`round-fallback-2026-11-25`) and the
-**rehearsal**, the IAM-only predecessor of both
-(`rehearsal-fallback-2026-11-24b`). The `fourround` build presented at the talk
-is tagged `fourround-talk-2026-11-25`. The four-round game:
+Nothing is deployed now. The **four-round game** (`fourround`) was played live
+at the talk and destroyed afterwards on 25 November 2026; it shared no resources
+besides the presenter key and passphrase (selected by `BLACK_FRIDAY_DEPLOYMENT`).
+Two earlier deployments of the same shape were destroyed the same day. Each is
+redeployed from its tag: the four-round game from `fourround-talk-2026-11-25`,
+the one-round **round** from `round-fallback-2026-11-25`, and the **rehearsal**,
+the IAM-only predecessor of both, from `rehearsal-fallback-2026-11-24b`. The
+four-round game:
 
 ```mermaid
 flowchart LR

@@ -24,17 +24,17 @@ is where the five kinds of Lambda come in:
 
 ## Status
 
-This is a working prototype, not a hosted tournament. The four-round game can
-be played live in AWS (the `fourround` deployment, the only one now present): up
-to 100 audience players join on their phones, with or without a name, and pick
-one of three options per round, each with their own dice roll, while the presenter
-runs the rounds. A House player and labelled bots fill the board. Only Launch
+This is a working prototype, not a hosted tournament. The four-round game was
+played live in AWS at the talk on 25 November 2026 (the `fourround`
+deployment): up to 100 audience players join on their phones, with or without
+a name, and pick one of three options per round, each with their own dice roll,
+while the presenter runs the rounds. A House player and labelled bots fill the board. Only Launch
 (one real MicroVM sale) and the two growth migrations (careful and fast, each
 checked in its own MicroVM) are real; they run once after Start, before Round 1
 opens. Demand, capacity, costs, Black Friday and Christmas are modelled, and
 Christmas `commit` is Managed Instances-like pricing that is modelled, not
-measured. The earlier one-round game and the rehearsal were destroyed on
-25 November 2026 and can be redeployed from their tags
+measured. Every deployment, including that one, was destroyed after the talk;
+each can be redeployed from its tag
 ([how](docs/processes/aws-rehearsal.md#the-frozen-deployments)). What has been
 run, and with what limits, is recorded in
 [`docs/game.md`](docs/game.md#what-exists-today-and-what-is-proposed).
