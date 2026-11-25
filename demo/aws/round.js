@@ -251,6 +251,15 @@ function renderEvidence(state) {
   });
   $('evidence').replaceChildren(...cards);
 }
+// Presenter callouts: what each round uses, in plain words. Static text; the risk comes from rounds.json.
+const riskOf = (round, id) => round.options.find(option => option.id === id)?.risk;
+const ROUND_NOTES = {
+  launch: () => 'Before this round opened, Durable sent an Event judge to boot a MicroVM running the real PHP shop: it sold one mug, charged exactly once, saved Maya\'s cart, and the VM was destroyed. The server size picked now sets each shop\'s capacity for the rest of the game. Scoring is modelled, in one Durable step after Close.',
+  growth: round => `Real: both migrations already ran, each in its own MicroVM, before Round 1. Careful copied every table and kept Maya's cart; fast skipped the carts and lost it. Pick fast and roll under ${riskOf(round, 'fast') ?? 'the risk'}: your shop gets the real broken result, and customers who lost a cart rarely come back.`,
+  blackfriday: () => 'Modelled: a sudden spike of several times normal traffic. Autoscale only works on a shared database (careful or fast in Round 2). Queue never turns anyone away but confirms slowly, and retries can charge twice. Close wakes Durable, which scores every shop in one step and goes back to sleep.',
+  christmas: () => 'Modelled: steady demand, and customers come back to check their orders. Anyone whose cart was lost earlier is gone for good. "Commit" is priced like Lambda Managed Instances: modelled pricing, not a measurement.',
+};
+
 function renderHost(state) {
   const phase = state.phase;
   const live = ['open', 'closing'].includes(phase);
@@ -266,6 +275,7 @@ function renderHost(state) {
     $('round-forecast').textContent = round.forecast;
     $('round-market').textContent = marketRange(round);
     renderHostOptions(round);
+    $('round-callout').textContent = ROUND_NOTES[round.id]?.(round) ?? '';
   }
 
   const results = state.results;
@@ -488,6 +498,18 @@ function toggleBehindLine(head) {
 
 if (host) {
   buildBehindFilter();
+  // Explanations: callouts the presenter can switch off; the choice is kept on this device.
+  const EXPLAIN_KEY = 'black-friday-explain';
+  const setExplain = on => {
+    document.body.classList.toggle('explain-off', !on);
+    $('explain').setAttribute('aria-pressed', String(on));
+    $('explain').textContent = `Explanations: ${on ? 'on' : 'off'}`;
+    try { localStorage.setItem(EXPLAIN_KEY, on ? 'on' : 'off'); } catch { /* private mode: the choice lasts for this page */ }
+  };
+  let saved = null;
+  try { saved = localStorage.getItem(EXPLAIN_KEY); } catch { /* ignore */ }
+  setExplain(saved !== 'off');
+  $('explain').addEventListener('click', () => setExplain(document.body.classList.contains('explain-off')));
   // Full-screen QR for the room. Client-side only: the same /api/host/qr.svg, shown as large as the screen allows.
   const overlay = $('qr-overlay');
   const openQr = () => {

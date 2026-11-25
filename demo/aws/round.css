@@ -196,3 +196,11 @@ body[data-host] .evidence-card .option-label{font-size:.95rem}
 .qr-big-url{margin:0;font-size:clamp(1.4rem,4.5vh,3.6rem);font-weight:700;color:#ffad68;overflow-wrap:anywhere;text-align:center;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .qr-overlay-hint{margin:0;font-size:clamp(.8rem,1.6vh,1.1rem);color:#8b949e}
+
+/* Presenter callouts: click to read; "Explanations: off" hides them all */
+.callout{margin:.6rem 0 0;border-left:3px solid #ffad68;background:#0d1626;border-radius:0 .4rem .4rem 0;padding:.35rem .7rem}
+.callout summary{cursor:pointer;font-weight:750;color:#ffad68;font-size:.92rem}
+.callout-body{margin:.4rem 0 .2rem;padding-left:1.1rem;font-size:.95rem;line-height:1.45;color:#dbe4f0}
+p.callout-body{padding-left:0}
+.callout-body li{margin:.25rem 0}
+body.explain-off .callout{display:none}
