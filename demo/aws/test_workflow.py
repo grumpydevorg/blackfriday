@@ -97,12 +97,19 @@ def compare_result(option, cart_kept):
 
 
 class FakeDB:
-    """Records every UpdateItem; `fail` conditional-fails the arena writes whose phase matches."""
+    """Records every UpdateItem; `fail` conditional-fails the arena writes whose phase matches.
+    Timeline writes are kept apart in `timeline_calls`, with whether a step was running when each arrived."""
 
     def __init__(self):
         self.calls, self.fail_phase = [], None
+        self.timeline_calls, self.timeline_error, self.context = [], None, None
 
     def update_item(self, **kwargs):
+        if kwargs['Key']['pk']['S'].startswith('timeline#'):
+            self.timeline_calls.append({**kwargs, 'in_step': self.context.in_step if self.context else None})
+            if self.timeline_error:
+                raise self.timeline_error
+            return
         self.calls.append(kwargs)
         phase = kwargs['ExpressionAttributeValues'].get(':phase', {}).get('S')
         if phase is not None and phase == self.fail_phase:
@@ -115,6 +122,10 @@ class FakeDB:
         return {call['Key']['pk']['S']: json.loads(call['ExpressionAttributeValues'][':data']['S'])
                 for call in self.calls if call['Key']['pk']['S'].startswith('results#')}
 
+    def timeline_lines(self):
+        return [json.loads(item['S']) for call in self.timeline_calls
+                for item in call['ExpressionAttributeValues'][':new']['L']]
+
 
 def values(call):
     return {key: value['S'] for key, value in call['ExpressionAttributeValues'].items()}
@@ -126,7 +137,7 @@ class FakeContext:
     def __init__(self, checkpoints, rooms, workflow, fail=(), launch_fails=False, db=None):
         self.checkpoints, self.rooms, self.workflow = checkpoints, rooms, workflow
         self.fail, self.launch_fails, self.db = set(fail), launch_fails, db
-        self.ops, self.invoked, self.step_calls = [], [], []
+        self.ops, self.invoked, self.step_calls, self.in_step = [], [], [], False
         self.execution_context = types.SimpleNamespace(durable_execution_arn='arn:durable')
 
     def operation(self, kind, name):
@@ -136,7 +147,11 @@ class FakeContext:
         self.operation('step', name)
         self.step_calls.append(name)
         if name not in self.checkpoints:
-            self.checkpoints[name] = json.loads(json.dumps(function(None)))
+            self.in_step = True
+            try:
+                self.checkpoints[name] = json.loads(json.dumps(function(None)))
+            finally:
+                self.in_step = False
         return self.checkpoints[name]
 
     def create_callback(self, name, config):
@@ -192,6 +207,7 @@ def run(workflow, monkeypatch, checkpoints=None, rooms=None, rolls=None, db=None
     if draws is not None:
         monkeypatch.setattr(workflow.secrets, 'randbelow', lambda bound: next(draws) % bound)
     context = FakeContext({} if checkpoints is None else checkpoints, rooms or rooms_for(), workflow, db=db, **options)
+    db.context = context
     result = workflow.handler({'id': RUN}, context)
     return context, db, result
 
@@ -409,3 +425,147 @@ def test_the_real_model_plays_four_rounds_with_a_garbage_row(monkeypatch):
     names = [name for _, name in context.ops]
     assert len(names) == len(set(names))
     assert len([call for call in db.arena() if values(call)[':phase'] == 'final']) == 1
+
+
+# ---- The presenter's Behind-the-scenes timeline ----------------------------------------------------------------
+
+EXPECTED_IDS = ['registered', 'launch', 'migrate-careful', 'migrate-fast', 'compare-careful', 'compare-fast',
+                *[f'{kind}-{round_id}' for round_id in ROUND_IDS for kind in ('open', 'close', 'plan', 'score', 'results')],
+                'final']
+LINE_KEYS = {'id', 't', 'tag', 'text', 'detail', 'log_group'}
+DETAIL_KEYS = {'duration_s', 'vm_id', 'execution_arn', 'round', 'option', 'cart_status', 'charges', 'market', 'players',
+               'picked', 'source', 'checkout_status', 'checkout_ms', 'bots', 'best_option', 'leader', 'run_id'}
+
+
+def test_timeline_lines_are_appended_only_inside_steps_with_the_contract_expression(workflow, monkeypatch):
+    monkeypatch.setenv('AWS_LAMBDA_LOG_GROUP_NAME', '/aws/lambda/durable')
+    _, db, _ = run(workflow, monkeypatch)
+    assert db.timeline_calls and all(call['in_step'] is True for call in db.timeline_calls)
+    for call in db.timeline_calls:
+        assert call['Key'] == {'pk': {'S': f'timeline#{RUN}'}}
+        assert call['UpdateExpression'] == 'SET run_id = :run, lines = list_append(if_not_exists(lines, :empty), :new)'
+        assert call['ConditionExpression'] == 'attribute_not_exists(lines) OR size(lines) < :cap'
+        assert call['ExpressionAttributeValues'][':cap'] == {'N': '300'}
+        assert call['ExpressionAttributeValues'][':empty'] == {'L': []}
+        assert call['ExpressionAttributeValues'][':run'] == {'S': RUN}
+        assert all(set(item) == {'S'} for item in call['ExpressionAttributeValues'][':new']['L'])
+
+
+def test_every_expected_id_appears_exactly_once_in_a_normal_run(workflow, monkeypatch):
+    _, db, _ = run(workflow, monkeypatch)
+    ids = [item['id'] for item in db.timeline_lines()]
+    assert sorted(ids) == sorted(EXPECTED_IDS)
+    assert ids[0] == 'registered' and ids[-1] == 'final'
+    assert ids.index('compare-fast') < ids.index('open-launch')
+    for round_id in ROUND_IDS:
+        assert ids.index(f'open-{round_id}') < ids.index(f'close-{round_id}') < ids.index(f'results-{round_id}')
+
+
+def test_the_evidence_lines_get_their_own_checkpointed_step_before_round_one(workflow, monkeypatch):
+    context, _, _ = run(workflow, monkeypatch)
+    order = [name for _, name in context.ops]
+    assert order.index('check-every-option') < order.index('timeline-evidence') < order.index('publish-open-launch')
+    assert len(order) == len(set(order))
+
+
+def test_every_line_has_only_allowed_keys_and_no_secrets(workflow, monkeypatch):
+    monkeypatch.setenv('AWS_LAMBDA_LOG_GROUP_NAME', '/aws/lambda/durable')
+    flow = load_workflow(monkeypatch, stub_model())
+    monkeypatch.setattr(flow, 'EVALUATOR', 'arn:aws:lambda:ap-southeast-2:123456789012:function:evaluator:$LATEST')
+    rooms = rooms_for([{**ROOM[0], 'token': 'secret-token', 'token_hash': 'hash', 'action_token': 'act'}, *ROOM[1:]])
+    _, db, _ = run(flow, monkeypatch, rooms=rooms)
+    lines = db.timeline_lines()
+    assert lines
+    for item in lines:
+        assert set(item) <= LINE_KEYS and {'id', 't', 'tag', 'text'} <= set(item)
+        assert item['tag'] in {'GAME', 'DURABLE', 'EVENT', 'MICROVM', 'WEB'}
+        assert isinstance(item['t'], int) and len(item['text']) <= 100
+        assert set(item.get('detail', {})) <= DETAIL_KEYS
+    blob = json.dumps(lines).lower()
+    for word in ('token', 'cookie', 'passphrase', 'presenter', 'callback', 'cb-await', 'secret', 'hash'):
+        assert word not in blob
+    groups = {item['id']: item.get('log_group') for item in lines}
+    assert groups['registered'] == groups['open-launch'] == groups['final'] == '/aws/lambda/durable'
+    assert groups['launch'] == groups['migrate-careful'] == groups['compare-fast'] == '/aws/lambda/evaluator'
+
+
+def test_log_group_is_omitted_when_unknown(workflow, monkeypatch):
+    monkeypatch.delenv('AWS_LAMBDA_LOG_GROUP_NAME', raising=False)
+    _, db, _ = run(workflow, monkeypatch)  # EVALUATOR_ARN is 'arn:evaluator:1' here: no function name to parse
+    assert all('log_group' not in item for item in db.timeline_lines())
+
+
+def test_the_evidence_and_round_texts_are_human_and_durations_come_from_the_evaluator(monkeypatch):
+    module = real_model()
+    flow = load_workflow(monkeypatch, module)
+    rooms = {round_id: [player('Ada Byron', option=[o['id'] for r in module.ROUNDS if r['id'] == round_id
+                                                      for o in r['options']][-1]),
+                        player('Grace Hopper', option=None), player('House', house=True)] for round_id in ROUND_IDS}
+    _, db, _ = run(flow, monkeypatch, rooms=rooms)
+    lines = {item['id']: item for item in db.timeline_lines()}
+    assert lines['registered']['text'] == 'Execution registered'
+    assert lines['launch']['text'] == 'Launch shop (real MicroVM)'  # the fake launch reports no checkout statuses
+    assert lines['compare-careful']['text'] == 'Careful migration check: cart kept (200)'
+    assert lines['compare-fast']['text'] == 'Fast migration check: cart LOST (200)'
+    assert lines['compare-careful']['detail']['checkout_ms'] == 40
+    assert lines['compare-careful']['detail']['duration_s'] == 0.04
+    assert lines['migrate-careful']['detail']['vm_id'] == 'vm-migrate-careful'
+    assert 'duration_s' not in lines['launch'].get('detail', {})
+    assert lines['open-growth']['text'] == 'Round 2 · Growth open'
+    assert lines['close-launch']['text'] == 'Close received: 1/2 picked'
+    assert lines['close-launch']['detail'] == {'round': 'launch', 'players': 2, 'picked': 1}
+    assert lines['plan-launch']['text'].startswith('Market draw ') and lines['plan-launch']['text'].count('%') == 1
+    assert 'Bot ' in lines['plan-launch']['text'] and lines['plan-launch']['detail']['bots']
+    assert lines['plan-blackfriday']['text'].split(';')[0].endswith('×')
+    assert lines['score-launch']['text'].startswith('Best option ') and '; leader ' in lines['score-launch']['text']
+    assert lines['results-launch']['text'] == 'Results published'
+    assert lines['final']['text'] == 'Final results published'
+
+
+def test_a_failed_launch_and_migrations_still_get_their_lines_with_the_source_recorded(workflow, monkeypatch):
+    _, db, _ = run(workflow, monkeypatch, launch_fails=True, fail={('migrate', 'careful'), ('migrate', 'fast')})
+    lines = {item['id']: item for item in db.timeline_lines()}
+    assert sorted(item['id'] for item in db.timeline_lines()) == sorted(EXPECTED_IDS)
+    assert lines['launch']['detail']['source'] == 'recorded' and 'recorded' in lines['launch']['text']
+    for option in ('careful', 'fast'):
+        assert lines[f'migrate-{option}']['detail']['source'] == 'recorded'
+        assert lines[f'compare-{option}']['detail']['source'] == 'recorded'
+        assert 'vm_id' not in lines[f'compare-{option}']['detail']
+        assert 'duration_s' not in lines[f'compare-{option}']['detail']
+    assert lines['compare-fast']['text'] == 'Fast migration check (recorded): cart LOST (404)'
+
+
+def test_a_full_replay_writes_no_timeline_lines(workflow, monkeypatch):
+    checkpoints = {}
+    _, first, _ = run(workflow, monkeypatch, checkpoints=checkpoints)
+    assert first.timeline_calls
+    _, again, _ = run(workflow, monkeypatch, checkpoints=checkpoints)
+    assert again.timeline_calls == [] and again.calls == []
+
+
+@pytest.mark.parametrize('error', [
+    RuntimeError('timeline table exploded'),
+    ClientError({'Error': {'Code': 'ProvisionedThroughputExceededException'}}, 'UpdateItem'),
+    ClientError({'Error': {'Code': 'ConditionalCheckFailedException'}}, 'UpdateItem'),
+])
+def test_a_failing_timeline_write_never_fails_or_changes_the_game(workflow, monkeypatch, error):
+    clean_context, clean, _ = run(workflow, monkeypatch, rolls=[7] * 100)
+    db = FakeDB()
+    db.timeline_error = error
+    context, db, result = run(workflow, monkeypatch, db=db, rolls=[7] * 100)
+    assert db.timeline_calls and result == {'id': RUN, 'execution_arn': 'arn:durable'}
+    assert db.calls == clean.calls and db.results() == clean.results()
+    assert context.ops == clean_context.ops
+    assert len([call for call in db.arena() if values(call)[':phase'] == 'final']) == 1
+
+
+def test_a_line_that_cannot_be_built_is_swallowed_too(workflow, monkeypatch):
+    def broken(*args):
+        raise ValueError('cannot build')
+
+    monkeypatch.setattr(workflow, 'results_lines', broken)
+    monkeypatch.setattr(workflow, 'evidence_lines', broken)
+    _, db, _ = run(workflow, monkeypatch)
+    assert len(db.results()) == 4
+    assert sorted(item['id'] for item in db.timeline_lines()) == sorted(
+        ['registered', *[f'open-{r}' for r in ROUND_IDS], 'final'])

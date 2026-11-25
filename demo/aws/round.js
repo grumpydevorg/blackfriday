@@ -371,6 +371,85 @@ const limitName = event => {
   if (letters.length > NAME_LIMIT) event.target.value = letters.slice(0, NAME_LIMIT).join('');
 };
 
+// Behind the scenes: a presenter-only drawer that polls the timeline only while it is open.
+// It shares api() with the game but keeps its own timer and never touches the game's polling.
+const BEHIND_POLL_MS = 2000;
+const LOGS_URL = 'https://ap-southeast-2.console.aws.amazon.com/cloudwatch/home?region=ap-southeast-2#logsV2:log-groups/log-group/';
+const clock = new Intl.DateTimeFormat('en-AU', { timeZone: 'Australia/Adelaide', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+const TAGS = ['GAME', 'DURABLE', 'EVENT', 'MICROVM', 'WEB'];
+// The logsV2 fragment encodes the group name twice over: percent-encode, then escape each % as $25.
+const logGroupUrl = group => `${LOGS_URL}${encodeURIComponent(group).replaceAll('%', '$25')}`;
+const detailValue = value => (value !== null && typeof value === 'object' ? JSON.stringify(value) : String(value));
+let behindTimer, behindInflight = false, behindGeneration = 0, behindSignature = '';
+const behindOpen = new Set();
+let behindLines = [];
+
+function behindLine(line) {
+  const open = behindOpen.has(line.id);
+  const tag = TAGS.includes(line.tag) ? line.tag : 'EVENT';
+  const item = make('div', '', `bline${open ? ' open' : ''}`);
+  item.dataset.id = line.id;
+  const head = make('div', '', 'bhead');
+  head.tabIndex = 0;
+  head.setAttribute('role', 'button');
+  head.setAttribute('aria-expanded', String(open));
+  head.append(make('time', clock.format(new Date(line.t)), 'btime'), make('span', tag, `btag btag-${tag.toLowerCase()}`), make('span', line.text, 'btext'));
+  item.append(head);
+  if (open) {
+    const body = make('div', '', 'bbody');
+    const entries = Object.entries(line.detail ?? {});
+    if (entries.length) {
+      const list = make('dl');
+      for (const [name, value] of entries) list.append(make('dt', name.replaceAll('_', ' ')), make('dd', detailValue(value)));
+      body.append(list);
+    } else body.append(make('p', 'No further detail.', 'muted'));
+    if (line.log_group) {
+      const link = make('a', 'Open logs in CloudWatch');
+      link.href = logGroupUrl(line.log_group);
+      link.target = '_blank';
+      link.rel = 'noopener';
+      body.append(link, make('code', line.log_group, 'bgroup'));
+    }
+    item.append(body);
+  }
+  return item;
+}
+function renderBehind(lines) {
+  const box = $('behind-log');
+  const signature = JSON.stringify([lines, [...behindOpen]]);
+  if (signature === behindSignature) return;
+  behindSignature = signature;
+  behindLines = lines;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+  const top = box.scrollTop;
+  box.replaceChildren(...lines.map(behindLine));
+  box.scrollTop = atBottom ? box.scrollHeight : top;
+  $('behind-status').textContent = lines.length ? '' : 'Nothing yet. Lines appear as the game runs.';
+}
+async function behindPoll() {
+  clearTimeout(behindTimer);
+  if (!$('behind').open || behindInflight) return;
+  behindInflight = true;
+  const generation = behindGeneration;
+  let again = true;
+  try {
+    const data = await api('host/timeline');
+    if (generation === behindGeneration) {
+      renderBehind(Array.isArray(data.lines) ? data.lines : []);
+    }
+  } catch (error) {
+    // A 429 just waits for the next tick; a 403 means signed out, so stop until the drawer is reopened.
+    if (error.status === 403) again = false;
+    else if (error.status !== 429 && generation === behindGeneration) $('behind-status').textContent = error.message;
+  } finally { behindInflight = false; }
+  if (again && generation === behindGeneration && $('behind').open) behindTimer = setTimeout(behindPoll, BEHIND_POLL_MS);
+}
+function toggleBehindLine(head) {
+  const id = head.parentElement.dataset.id;
+  if (!behindOpen.delete(id)) behindOpen.add(id);
+  renderBehind(behindLines);
+}
+
 if (host) {
   $('login').addEventListener('submit', async event => {
     event.preventDefault();
@@ -381,6 +460,20 @@ if (host) {
     $('qr').removeAttribute('src');
     clearTimeout(timer);
     signedOut();
+  });
+  $('behind').addEventListener('toggle', () => {
+    behindGeneration += 1;
+    clearTimeout(behindTimer);
+    behindInflight = false;
+    if ($('behind').open) behindPoll();
+  });
+  $('behind-log').addEventListener('click', event => {
+    const head = event.target.closest('.bhead');
+    if (head) toggleBehindLine(head);
+  });
+  $('behind-log').addEventListener('keydown', event => {
+    const head = event.target.closest?.('.bhead');
+    if (head && event.target === head && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); toggleBehindLine(head); }
   });
   $('start').addEventListener('click', () => act(() => api('host/start', { action: true })));
   $('close').addEventListener('click', () => act(() => api('host/close', { action: true, headers: { 'X-Rehearsal-Round': current.round } })));

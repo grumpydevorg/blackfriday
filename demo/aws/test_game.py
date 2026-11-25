@@ -46,7 +46,10 @@ function condition(expression, item, values) {
     const token = take();
     if (token === '(') { const result = or(); take(); return result; }
     if (token.startsWith('attribute_')) { take(); const name = take(); take(); return (name in item) === (token === 'attribute_exists'); }
-    const left = operand(token), op = take();
+    let left;
+    if (token === 'size') { take(); const name = take(); take(); left = item[name] && { N: String(item[name].L?.length ?? item[name].S.length) }; }
+    else left = operand(token);
+    const op = take();
     if (op === 'IN') {
       take();
       const list = [];
@@ -62,10 +65,29 @@ function condition(expression, item, values) {
 }
 function applyUpdate(expression, item, values) {
   for (const [, verb, rest] of expression.matchAll(/\b(SET|REMOVE|ADD)\b([^]*?)(?=\b(?:SET|REMOVE|ADD)\b|$)/g)) {
-    for (const part of rest.split(',').map(text => text.trim()).filter(Boolean)) {
+    const top = [];
+    for (let depth = 0, from = 0, at = 0; at <= rest.length; at++) {
+      if (rest[at] === '(') depth++;
+      else if (rest[at] === ')') depth--;
+      else if (at === rest.length || (rest[at] === ',' && depth === 0)) { top.push(rest.slice(from, at)); from = at + 1; }
+    }
+    const evaluate = source => {
+      const call = /^(list_append|if_not_exists)\((.*)\)$/.exec(source);
+      if (call) {
+        const args = []; let depth = 0, from = 0;
+        for (let at = 0; at <= call[2].length; at++) {
+          if (call[2][at] === '(') depth++;
+          else if (call[2][at] === ')') depth--;
+          else if (at === call[2].length || (call[2][at] === ',' && depth === 0)) { args.push(evaluate(call[2].slice(from, at).trim())); from = at + 1; }
+        }
+        return call[1] === 'list_append' ? { L: [...args[0].L, ...args[1].L] } : (item[call[2].split(',')[0].trim()] ?? args[1]);
+      }
+      return source.startsWith(':') ? values[source] : item[source];
+    };
+    for (const part of top.map(text => text.trim()).filter(Boolean)) {
       if (verb === 'SET') {
-        const [name, source] = part.split('=').map(text => text.trim());
-        item[name] = structuredClone(source.startsWith(':') ? values[source] : item[source]);
+        const at = part.indexOf('=');
+        item[part.slice(0, at).trim()] = structuredClone(evaluate(part.slice(at + 1).trim()));
       } else if (verb === 'REMOVE') delete item[part];
       else { const [name, token] = part.split(/\s+/); item[name] = { N: String(Number(item[name]?.N ?? 0) + Number(values[token].N)) }; }
     }
@@ -77,6 +99,7 @@ export const aws = {
   status: 'RUNNING', callbackError: undefined,
   async send(command) {
     const { input } = command, name = command.constructor.name;
+    if (aws.failTimeline && name === 'UpdateItemCommand' && input.Key.pk.S.startsWith('timeline#')) throw Object.assign(new Error('x'), { name: 'ProvisionedThroughputExceededException' });
     if (name === 'InvokeCommand') { log.invokes.push(input); return { DurableExecutionArn: 'arn:aws:lambda:ap-southeast-2:1:function:wf:1/durable-execution/run/abc' }; }
     if (name === 'GetDurableExecutionCommand') return { Status: aws.status };
     if (name === 'SendDurableExecutionCallbackSuccessCommand') {
@@ -509,4 +532,129 @@ def test_a_failed_or_timed_out_execution_is_reported_and_closes_the_game():
       Object.assign(arena(), { phase: s('expired'), expired_action: s('close'), round: s('growth') });
       assert.equal((await state()).body.phase, 'expired');
       assert.match((await state()).body.message, /expired/);
+    """)
+
+
+def test_the_timeline_route_is_presenter_only_and_phones_never_see_it():
+    scenario(r"""
+      const run = arena().run_id.S;
+      const a = await join('Anna');
+      for (const headers of [{}, { 'x-rehearsal-action': '1' }, as(a), { 'x-presenter-key': 'wrong' }]) {
+        assert.equal((await call('GET', '/api/host/timeline', { headers })).status, 403);
+      }
+      const empty = await call('GET', '/api/host/timeline', { headers: PRESENTER });
+      assert.equal(empty.status, 200);
+      assert.deepEqual(empty.body, { run_id: run, lines: [] });
+      assert.equal((await hostPost('start')).status, 200);
+      const shown = await call('GET', '/api/host/timeline', { headers: PRESENTER });
+      assert.equal(shown.body.run_id, run);
+      assert.deepEqual(shown.body.lines.map(line => line.id), ['web-start']);
+      assert.equal(shown.body.lines[0].tag, 'WEB');
+      assert.deepEqual(shown.body.lines[0].detail, { players: 1, run_id: run });
+      assert.ok(shown.body.lines[0].text.length <= 100 && Number.isInteger(shown.body.lines[0].t));
+      for (const response of [await state(a), await state(), await call('GET', '/api/host/state', { headers: PRESENTER })]) {
+        assert.ok(!/timeline|web-start|lines/.test(response.text ?? JSON.stringify(response.body)), 'no timeline data in state');
+      }
+    """)
+
+
+def test_start_close_and_reset_each_append_exactly_one_web_line():
+    scenario(r"""
+      const lines = run => (items.get(`timeline#${run}`)?.lines.L ?? []).map(entry => JSON.parse(entry.S));
+      const first = arena().run_id.S;
+      const a = await join('Anna'), b = await join('Ben');
+      assert.equal((await hostPost('start', { run: 'wrong' })).status, 409);
+      assert.deepEqual(lines(first), [], 'a refused Start writes nothing');
+      assert.equal((await hostPost('start')).status, 200);
+      assert.equal((await hostPost('start')).status, 409);
+      assert.deepEqual(lines(first).map(line => line.id), ['web-start']);
+      openRound('launch');
+      assert.equal((await pick(a, 'launch', 'large')).status, 200);
+      assert.equal((await hostPost('close', { round: 'growth' })).status, 409);
+      assert.deepEqual(lines(first).map(line => line.id), ['web-start'], 'a refused Close writes nothing');
+      assert.equal((await hostPost('close', { round: 'launch' })).status, 200);
+      assert.equal((await hostPost('close', { round: 'launch' })).status, 409);
+      const written = lines(first);
+      assert.deepEqual(written.map(line => line.id), ['web-start', 'web-close-launch']);
+      assert.deepEqual(written[1].detail, { round: 'launch', picked: 1, players: 2 });
+      assert.ok(written.every(line => line.tag === 'WEB' && !('log_group' in line)));
+      assert.ok(!JSON.stringify(written).match(/token|callback|cb-/i));
+      const reset = await hostPost('reset');
+      assert.equal(reset.status, 200);
+      const second = reset.body.id;
+      assert.notEqual(second, first);
+      assert.deepEqual(lines(second).map(line => line.id), ['web-reset'], 'Reset writes into the new run');
+      assert.deepEqual(lines(second)[0].detail, { run_id: second });
+      assert.equal(lines(first).length, 2, 'the old run is left alone');
+      assert.deepEqual((await call('GET', '/api/host/timeline', { headers: PRESENTER })).body.lines.map(line => line.id), ['web-reset']);
+    """)
+
+
+def test_the_timeline_cap_drops_late_lines_without_an_error():
+    scenario(r"""
+      const run = arena().run_id.S;
+      const full = count => items.set(`timeline#${run}`, { pk: s(`timeline#${run}`), run_id: s(run), lines: { L: Array.from({ length: count }, (_, at) => s(JSON.stringify({ id: `x${at}` }))) } });
+      full(299);
+      assert.equal((await hostPost('start')).status, 200);
+      const last = items.get(`timeline#${run}`).lines.L;
+      assert.equal(last.length, 300);
+      assert.equal(JSON.parse(last[299].S).id, 'web-start');
+      openRound('launch');
+      assert.equal((await hostPost('close', { round: 'launch' })).status, 200, 'over the cap: dropped, not an error');
+      assert.equal(items.get(`timeline#${run}`).lines.L.length, 300);
+      assert.equal(log.callbacks.length, 1);
+      assert.equal((await call('GET', '/api/host/timeline', { headers: PRESENTER })).body.lines.length, 300);
+    """)
+
+
+def test_a_failing_timeline_write_changes_no_response():
+    scenario(r"""
+      aws.failTimeline = true;
+      const a = await join('Anna');
+      const start = await hostPost('start');
+      assert.equal(start.status, 200);
+      assert.equal(start.body.phase, 'starting');
+      assert.equal(log.invokes.length, 1);
+      openRound('launch');
+      const closed = await hostPost('close', { round: 'launch' });
+      assert.equal(closed.status, 200);
+      assert.equal(closed.body.phase, 'closing');
+      assert.equal(log.callbacks.length, 1, 'the callback still goes out');
+      const reset = await hostPost('reset');
+      assert.equal(reset.status, 200);
+      assert.equal(reset.body.phase, 'ready');
+      assert.ok([...items.keys()].every(pk => !pk.startsWith('timeline#')));
+      assert.deepEqual((await call('GET', '/api/host/timeline', { headers: PRESENTER })).body.lines, []);
+    """)
+
+
+def test_pages_ask_for_assets_by_content_hash_and_the_url_serves_them():
+    scenario(r"""
+      const { readFileSync } = await import('node:fs');
+      const asset = name => readFileSync(new URL(`./${name}`, import.meta.url), 'utf8');
+      const fetched = path => fetch(`http://${process.env.AWS_LAMBDA_HTTP_ENDPOINT}${path}`).then(async response => ({ response, text: await response.text() }));
+      const hashes = [];
+      for (const path of ['/', '/host']) {
+        const { response, text } = await fetched(path);
+        assert.equal(response.status, 200);
+        assert.match(response.headers.get('content-security-policy'), /script-src 'self'/);
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+        const script = /<script src="\/round\.js\?v=([0-9a-f]+)" defer><\/script>/.exec(text);
+        const style = /<link rel="stylesheet" href="\/round\.css\?v=([0-9a-f]+)">/.exec(text);
+        assert.ok(script && style, `${path} references versioned assets`);
+        assert.ok(!text.includes('"/round.js"') && !text.includes('"/round.css"'));
+        hashes.push([script[1], style[1]]);
+      }
+      assert.deepEqual(hashes[0], hashes[1]);
+      const [js, css] = hashes[0];
+      for (const [path, file, type] of [[`/round.js?v=${js}`, 'round.js', 'text/javascript'], ['/round.js', 'round.js', 'text/javascript'],
+          [`/round.css?v=${css}`, 'round.css', 'text/css'], ['/round.css', 'round.css', 'text/css']]) {
+        const { response, text } = await fetched(path);
+        assert.equal(response.status, 200, path);
+        assert.equal(text, asset(file), path);
+        assert.ok(response.headers.get('content-type').startsWith(type), path);
+        assert.equal(response.headers.get('cache-control'), 'public, max-age=3600', path);
+      }
+      assert.equal((await fetched('/round.js?v=anything')).response.status, 200);
+      assert.equal((await fetched('/nope.js?v=1')).response.status, 404);
     """)

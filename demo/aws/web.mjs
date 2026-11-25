@@ -1,4 +1,4 @@
-import { randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { gzipSync } from 'node:zlib';
@@ -29,13 +29,55 @@ const callbackLease = 20_000;
 const id = () => randomUUID().replaceAll('-', '');
 const terminal = new Set(['final', 'expired', 'failed']);
 const immutable = { 'Cache-Control': 'public, max-age=3600' };
+// The two assets live at fixed URLs with an hour of cache: the pages ask for them by content hash so a
+// redeploy cannot pair an old script with new HTML. The bare URL serves the same bytes.
+const roundJs = readFileSync(new URL('./round.js', import.meta.url));
+const roundCss = readFileSync(new URL('./round.css', import.meta.url));
+const digest = bytes => createHash('sha256').update(bytes).digest('hex').slice(0, 10);
+const versioned = new Map([['/round.css', digest(roundCss)], ['/round.js', digest(roundJs)]]);
+function page(name, file) {
+  let html = file.toString();
+  for (const [path, hash] of versioned) {
+    const reference = new RegExp(`(?:href|src)="${path.replace('.', '\\.')}"`);
+    if (!reference.test(html)) throw new Error(`${name} does not reference ${path}`);
+    html = html.replace(reference, match => match.replace(path, `${path}?v=${hash}`));
+  }
+  return Buffer.from(html);
+}
 const staticFiles = new Map([
-  ['/', ['text/html; charset=utf-8', readFileSync(new URL('./player.html', import.meta.url))]],
-  ['/host', ['text/html; charset=utf-8', readFileSync(new URL('./host.html', import.meta.url))]],
-  ['/round.js', ['text/javascript; charset=utf-8', readFileSync(new URL('./round.js', import.meta.url)), immutable]],
-  ['/round.css', ['text/css; charset=utf-8', readFileSync(new URL('./round.css', import.meta.url)), immutable]],
+  ['/', ['text/html; charset=utf-8', page('player.html', readFileSync(new URL('./player.html', import.meta.url)))]],
+  ['/host', ['text/html; charset=utf-8', page('host.html', readFileSync(new URL('./host.html', import.meta.url)))]],
+  ['/round.js', ['text/javascript; charset=utf-8', roundJs, immutable]],
+  ['/round.css', ['text/css; charset=utf-8', roundCss, immutable]],
   ['/art/cloud-surge.jpg', ['image/jpeg', readFileSync(new URL('./art/cloud-surge.jpg', import.meta.url)), immutable]],
 ]);
+
+// Presenter-only "Behind the scenes" lines, best effort: a failed write is logged and never changes a response.
+const TIMELINE_CAP = 300;
+async function timeline(runId, line) {
+  try {
+    await db.send(new UpdateItemCommand({
+      TableName: table, Key: { pk: s(`timeline#${runId}`) },
+      UpdateExpression: 'SET run_id = :run, lines = list_append(if_not_exists(lines, :empty), :new)',
+      ConditionExpression: 'attribute_not_exists(lines) OR size(lines) < :cap',
+      ExpressionAttributeValues: {
+        ':run': s(runId), ':cap': n(TIMELINE_CAP), ':empty': { L: [] },
+        ':new': { L: [s(JSON.stringify({
+          t: Date.now(), tag: 'WEB', ...line,
+          ...(process.env.AWS_LAMBDA_LOG_GROUP_NAME && { log_group: process.env.AWS_LAMBDA_LOG_GROUP_NAME }),
+        }))] },
+      },
+    }), { abortSignal: AbortSignal.timeout(3_000) });
+  } catch (error) {
+    if (error.name !== 'ConditionalCheckFailedException') console.error('Timeline write failed', line.id, error.name);
+  }
+}
+async function timelineLines(runId) {
+  const { Item } = await db.send(new GetItemCommand({ TableName: table, Key: { pk: s(`timeline#${runId}`) } }));
+  return (Item?.lines?.L ?? []).flatMap(entry => {
+    try { return [JSON.parse(entry.S)]; } catch { return []; }
+  });
+}
 const loginKey = { pk: { S: 'login' } };
 // At most MAX_FAILURES failed sign-ins per window across every environment: each attempt
 // reserves a slot before the passphrase is compared and a success hands it back.
@@ -158,6 +200,11 @@ async function start(token, row) {
   // Reserve before invoking. Both this response and the first workflow step can
   // record the ARN; neither can overwrite a later stage or a different run.
   const runId = run.run_id.S;
+  // Written before the invoke so it precedes the workflow's own lines.
+  await timeline(runId, {
+    id: 'web-start', text: `Presenter pressed Start: ${playersOf(row).length} players in the room`,
+    detail: { players: playersOf(row).length, run_id: runId },
+  });
   try {
     const { DurableExecutionArn } = await lambda.send(new InvokeCommand({
       FunctionName: workflow, InvocationType: 'Event', DurableExecutionName: runId,
@@ -264,6 +311,14 @@ async function close(token, round, row, state) {
   if (state.phase === 'open') claimed = await closeRound(rosterStore, row, round, lease);
   else if (state.retry_action === 'close') claimed = await retryClose(rosterStore, row, round, lease, now);
   if (!claimed) throw new ActionConflict();
+  if (state.phase === 'open') {
+    const frozen = JSON.parse(claimed.frozen_data.S);
+    const picked = frozen.filter(player => player.picks?.[round]).length;
+    await timeline(state.id, {
+      id: `web-close-${round}`, text: `Presenter closed ${round}: ${picked} of ${frozen.length} players picked`,
+      detail: { round, picked, players: frozen.length },
+    });
+  }
   try {
     await lambda.send(new SendDurableExecutionCallbackSuccessCommand({
       CallbackId: row.callback_id.S,
@@ -426,7 +481,12 @@ async function route(request, response) {
   if (method === 'GET' && url === '/api/host/qr.svg') {
     return send(response, 200, 'image/svg+xml', await QRCode.toString(auth.publicOrigin(), { type: 'svg', margin: 4 }));
   }
-  if (method === 'GET' && staticFiles.has(url)) return send(response, 200, ...staticFiles.get(url));
+  if (method === 'GET' && url === '/api/host/timeline') {
+    const run = (await initialized()).run_id.S;
+    return json(response, 200, { run_id: run, lines: await timelineLines(run) });
+  }
+  const path = url.split('?', 1)[0];
+  if (method === 'GET' && staticFiles.has(path)) return send(response, 200, ...staticFiles.get(path));
   if (method === 'GET' && ['/api/state', '/api/host/state'].includes(url)) {
     return json(response, 200, await view(await recoverStart(await initialized()), headers, presenterRoute, mode));
   }
@@ -446,7 +506,11 @@ async function route(request, response) {
     await start(token, row);
   } else if (action === 'reset') {
     // Force: any phase, as long as the presenter's token names this run.
-    if (token !== row.run_id.S || !await replace(fresh(), 'run_id = :id', { ':id': row.run_id })) throw new ActionConflict();
+    const next = fresh();
+    if (token !== row.run_id.S || !await replace(next, 'run_id = :id', { ':id': row.run_id })) throw new ActionConflict();
+    await timeline(next.run_id.S, {
+      id: 'web-reset', text: 'Presenter reset the game', detail: { run_id: next.run_id.S },
+    });
   } else {
     await close(token, headers['x-rehearsal-round'], row, await describe(row));
   }

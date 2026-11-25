@@ -227,7 +227,8 @@ def proxy(monkeypatch):
 
 def test_the_proxy_forwards_the_four_round_presenter_routes(proxy):
     call, seen = proxy
-    for path in ('/host', '/api/host/state', '/api/host/qr.svg', '/api/state', '/round.js', '/round.css'):
+    for path in ('/host', '/api/host/state', '/api/host/qr.svg', '/api/host/timeline', '/api/state', '/round.js',
+                 '/round.css', '/round.js?v=3f9a1c2b', '/round.css?v=3f9a1c2b'):
         assert call('GET', path) == 200, path
     action = {'X-Rehearsal-Action': '1', 'X-Rehearsal-Run': 'token-1'}
     for path in ('/api/host/start', '/api/host/reset'):
@@ -253,6 +254,8 @@ def test_the_proxy_refuses_what_is_not_a_four_round_route_or_lacks_the_action_he
     assert call('POST', '/api/host/close', {**action, 'Origin': 'http://evil.example'}) == 403
     assert call('GET', '/api/host/start') == 404
     assert call('GET', '/api/launch') == 404
+    assert call('GET', '/round.js?v=../../etc') == 404
+    assert call('GET', '/api/host/timeline?x=1') == 404
     assert seen == []
 
 

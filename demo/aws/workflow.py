@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,155 @@ MIGRATIONS = ('careful', 'fast')
 RECORDED = json.loads(Path(__file__).with_name('rounds.json').read_text())['recorded_evidence']
 # DynamoDB reserved words used as attribute names.
 NAMES = {'round': '#round', 'data': '#data'}
+# The presenter's "Behind the scenes" timeline: one item per run, capped, written only inside Durable steps.
+TIMELINE_CAP = 300
+TIMELINE_DETAIL = frozenset((
+    'duration_s', 'vm_id', 'execution_arn', 'round', 'option', 'cart_status', 'charges', 'market', 'players',
+    'picked', 'source', 'checkout_status', 'checkout_ms', 'bots', 'best_option', 'leader', 'run_id',
+))
+LABELS = {'careful': 'Careful', 'fast': 'Fast'}
+
+
+def evaluator_log_group() -> str | None:
+    parts = EVALUATOR.split(':')
+    return f'/aws/lambda/{parts[6]}' if len(parts) >= 7 and parts[5] == 'function' and parts[6] else None
+
+
+def clean_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    out = {}
+    for key, value in detail.items():
+        if key not in TIMELINE_DETAIL or value is None:
+            continue
+        if isinstance(value, str):
+            value = value[:100]
+        elif isinstance(value, list):
+            value = [str(item)[:100] for item in value][:10]
+        elif not isinstance(value, (bool, int, float)):
+            continue
+        out[key] = value
+    return out
+
+
+def line(line_id: str, tag: str, text: str, detail: dict[str, Any] | None = None, microvm: bool = False) -> dict[str, Any]:
+    group = evaluator_log_group() if microvm else os.environ.get('AWS_LAMBDA_LOG_GROUP_NAME')
+    return {
+        'id': line_id, 'tag': tag, 'text': text[:100],
+        **({'detail': clean_detail(detail)} if detail else {}),
+        **({'log_group': group} if group else {}),
+    }
+
+
+def timeline(run_id: str, make) -> None:
+    """Append lines for this run. Called only inside a checkpointed step, so a replay never repeats a line.
+    Nothing here may change the game: every failure is logged and swallowed."""
+    try:
+        now = int(time.time() * 1000)
+        lines = [{'t': now + index, **item} for index, item in enumerate(make())]
+        if not lines:
+            return
+        DB.update_item(
+            TableName=TABLE,
+            Key={'pk': {'S': f'timeline#{run_id}'}},
+            UpdateExpression='SET run_id = :run, lines = list_append(if_not_exists(lines, :empty), :new)',
+            ConditionExpression='attribute_not_exists(lines) OR size(lines) < :cap',
+            ExpressionAttributeValues={
+                ':run': {'S': run_id}, ':cap': {'N': str(TIMELINE_CAP)}, ':empty': {'L': []},
+                ':new': {'L': [{'S': json.dumps(item, separators=(',', ':'))} for item in lines]},
+            },
+        )
+    except ClientError as error:
+        if error.response['Error']['Code'] != 'ConditionalCheckFailedException':  # the cap was reached: ignore
+            print(json.dumps({'timeline_error': repr(error)}))
+    except Exception as error:  # noqa: BLE001 - the timeline never fails the game
+        print(json.dumps({'timeline_error': repr(error)}))
+
+
+def round_title(round_id: str) -> str:
+    for rnd in getattr(model, 'ROUNDS', ()):
+        if rnd.get('id') == round_id and isinstance(rnd.get('title'), str):
+            return rnd['title']
+    return f'Round {model.ROUND_IDS.index(round_id) + 1} · {round_id.capitalize()}'
+
+
+def option_label(round_id: str, option: str) -> str:
+    for rnd in getattr(model, 'ROUNDS', ()):
+        if rnd.get('id') == round_id:
+            for item in rnd.get('options', ()):
+                if item.get('id') == option:
+                    return str(item.get('label') or option)
+    return option
+
+
+def money(cents: Any) -> str:
+    return f'-${-cents / 100:,.0f}' if cents < 0 else f'${cents / 100:,.0f}'
+
+
+def leader_of(scored: dict[str, Any]) -> tuple[str | None, str | None]:
+    rows = scored.get('rows') or []
+    top = rows[0] if rows and isinstance(rows[0], dict) else None
+    if not top or not isinstance(top.get('name'), str):
+        return None, None
+    cents = top.get('cumulative_cents')
+    return top['name'], money(cents) if isinstance(cents, int) else None
+
+
+def evidence_lines(launch_data: dict[str, Any], evidence: dict[str, Any], notes: dict[str, Any]) -> list[dict[str, Any]]:
+    out = []
+    real = launch_data.get('source') == 'real'
+    statuses = launch_data.get('checkout_statuses')
+    statuses = statuses if isinstance(statuses, list) and len(statuses) == 2 else None
+    charges = launch_data.get('charges')
+    text = 'Launch shop (real MicroVM)' if real else 'Launch shop (recorded fallback)'
+    extra = ([f'checkout {statuses[0]}→{statuses[1]}'] if statuses and real else []) + (
+        [f'{charges} charge{"" if charges == 1 else "s"}'] if isinstance(charges, int) and real else [])
+    out.append(line('launch', 'MICROVM' if real else 'DURABLE', ': '.join(filter(None, [text, ', '.join(extra)])), {
+        'source': launch_data.get('source'), 'vm_id': notes.get('launch_vm'), 'charges': charges if real else None,
+        'checkout_status': statuses[1] if statuses and real else None,
+        'cart_status': launch_data.get('cart_status') if real else None,
+    }, microvm=real))
+    for option in MIGRATIONS:
+        label, ran = LABELS[option], option in notes.get('migrate_vm', {})
+        out.append(line(f'migrate-{option}', 'MICROVM' if ran else 'DURABLE',
+                        f'{label} migration done (real MicroVM)' if ran else f'{label} migration: recorded evidence used',
+                        {'option': option, 'vm_id': notes.get('migrate_vm', {}).get(option),
+                         'source': 'real' if ran else 'recorded'}, microvm=ran))
+    for option in MIGRATIONS:
+        result = evidence[option]
+        real = result.get('source') == 'real'
+        status, kept = result.get('cart_status'), result.get('cart_kept')
+        outcome = f'cart {"kept" if kept else "LOST"}' + (f' ({status})' if isinstance(status, int) else '')
+        ms = result.get('checkout_ms')
+        out.append(line(f'compare-{option}', 'MICROVM' if real else 'DURABLE',
+                        f'{LABELS[option]} migration check{"" if real else " (recorded)"}: {outcome}', {
+                            'option': option, 'source': result.get('source'), 'cart_status': status,
+                            'charges': result.get('charges'), 'checkout_status': result.get('checkout_status'),
+                            'checkout_ms': ms, 'vm_id': result.get('vm_id') if real else None,
+                            'duration_s': round(ms / 1000, 3) if real and isinstance(ms, (int, float)) else None,
+                        }, microvm=real))
+    return out
+
+
+def results_lines(round_id: str, closed: dict[str, Any], scored: dict[str, Any]) -> list[dict[str, Any]]:
+    humans = [row for row in closed.get('players') or [] if isinstance(row, dict) and not row.get('house')]
+    picked = sum(1 for row in humans if row.get('option'))
+    out = [line(f'close-{round_id}', 'EVENT', f'Close received: {picked}/{len(humans)} picked',
+                {'round': round_id, 'players': len(humans), 'picked': picked})]
+    unit = next((rnd['market'].get('unit', '') for rnd in getattr(model, 'ROUNDS', ()) if rnd.get('id') == round_id), '')
+    bots = [bot['name'] for bot in scored.get('bots') or [] if isinstance(bot, dict) and isinstance(bot.get('name'), str)]
+    out.append(line(f'plan-{round_id}', 'GAME',
+                    f'Market draw {scored["market"]}{unit}' + (f'; bots: {", ".join(bots)}' if bots else ''),
+                    {'round': round_id, 'market': scored['market'], 'bots': bots}))
+    options = (scored.get('summary') or {}).get('options') or {}
+    played = {key: value for key, value in options.items()
+              if isinstance(value, dict) and value.get('players') and isinstance(value.get('mean_profit_cents'), int)}
+    best = max(played, key=lambda key: played[key]['mean_profit_cents']) if played else None
+    leader, total = leader_of(scored)
+    parts = ([f'Best option {option_label(round_id, best)}'] if best else []) + (
+        [f'leader {leader}' + (f' {total}' if total else '')] if leader else [])
+    out.append(line(f'score-{round_id}', 'GAME', '; '.join(parts) or 'Round scored',
+                    {'round': round_id, 'best_option': best, 'leader': leader}))
+    out.append(line(f'results-{round_id}', 'GAME', 'Results published', {'round': round_id}))
+    return out
 
 
 def register(run_id: str, arn: str) -> None:
@@ -44,6 +194,12 @@ def register(run_id: str, arn: str) -> None:
             ':arn': {'S': arn}, ':id': {'S': run_id}, ':starting': {'S': 'starting'},
         },
     )
+
+
+def register_step(run_id: str, arn: str) -> None:
+    register(run_id, arn)
+    timeline(run_id, lambda: [line('registered', 'DURABLE', 'Execution registered',
+                                   {'execution_arn': arn, 'run_id': run_id})])
 
 
 def publish(
@@ -87,6 +243,26 @@ def publish(
     except ClientError as error:
         if error.response['Error']['Code'] != 'ConditionalCheckFailedException':
             raise
+
+
+def publish_results_step(run_id: str, round_id: str, closed: dict[str, Any], scored: dict[str, Any]) -> None:
+    publish_results(run_id, round_id, scored)
+    timeline(run_id, lambda: results_lines(round_id, closed, scored))
+
+
+def publish_final_step(run_id: str, arn: str, last_round: str, scored: dict[str, Any]) -> None:
+    publish(run_id, arn, ('closing',), 'final', {'results_round': last_round}, expect_round=last_round)
+    timeline(run_id, lambda: [line('final', 'GAME', 'Final results published', {'leader': leader_of(scored)[0]})])
+
+
+def publish_open_step(run_id: str, arn: str, round_id: str, previous: dict[str, Any] | None,
+                      fields: dict[str, str], callback_id: str) -> None:
+    publish(
+        run_id, arn, ('starting',) if previous is None else ('closing',), 'open',
+        {**fields, 'round': round_id, 'callback_id': callback_id},
+        expect_round=None if previous is None else previous['round'],
+    )
+    timeline(run_id, lambda: [line(f'open-{round_id}', 'GAME', f'{round_title(round_id)} open', {'round': round_id})])
 
 
 def publish_results(run_id: str, round_id: str, scored: dict[str, Any]) -> None:
@@ -141,18 +317,22 @@ def fork_options(context: DurableContext, run_id: str, action: str, stage: str, 
     return {branch['id']: branch for branch in branches.get_results()}
 
 
-def real_evidence(run_id: str, context: DurableContext) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Launch, then both migrations, then both checks. Any failure falls back to recorded evidence alone."""
+def real_evidence(run_id: str, context: DurableContext) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Launch, then both migrations, then both checks. Any failure falls back to recorded evidence alone.
+    The third value names the MicroVMs that really ran, for the timeline only."""
+    notes: dict[str, Any] = {'migrate_vm': {}}
     try:
         launch = context.invoke(EVALUATOR, {'id': run_id, 'action': 'launch'}, name='launch-shop')
         check_launch(launch)
         shop = launch.get('launch')
         launch_data = {**(shop if isinstance(shop, dict) else {}), 'source': 'real'}
+        notes['launch_vm'] = launch.get('vm_id')
     except Exception as error:  # noqa: BLE001
         print(json.dumps({'fallback': 'launch', 'error': repr(error)}))
         launch_data = {'source': 'recorded'}
     migrations = fork_options(context, run_id, 'migrate', 'migrate', list(MIGRATIONS), check_migrate)
     migrated = [option for option in MIGRATIONS if migrations[option]['ok']]
+    notes['migrate_vm'] = {option: migrations[option]['result'].get('vm_id') for option in migrated}
     # A migration that failed has nothing to check, so that option is recorded without a second MicroVM.
     checks = fork_options(context, run_id, 'compare', 'check', migrated, check_compare) if migrated else {}
     evidence = {}
@@ -162,19 +342,14 @@ def real_evidence(run_id: str, context: DurableContext) -> tuple[dict[str, Any],
             evidence[option] = {**check['result'], 'source': 'real'}
         else:
             evidence[option] = {**RECORDED[option], 'source': 'recorded'}
-    return launch_data, evidence
+    return launch_data, evidence, notes
 
 
 def wait_for_close(context: DurableContext, run_id: str, arn: str, round_id: str, previous: dict[str, Any] | None,
                    fields: dict[str, str]) -> dict[str, Any]:
-    first = previous is None
     callback = context.create_callback(name=f'await-close-{round_id}', config=CALLBACK)
     context.step(
-        lambda _: publish(
-            run_id, arn, ('starting',) if first else ('closing',), 'open',
-            {**fields, 'round': round_id, 'callback_id': callback.callback_id},
-            expect_round=None if first else previous['round'],
-        ),
+        lambda _: publish_open_step(run_id, arn, round_id, previous, fields, callback.callback_id),
         name=f'publish-open-{round_id}',
     )
     try:
@@ -199,9 +374,11 @@ def handler(event: dict[str, Any], context: DurableContext) -> dict[str, str]:
     if not isinstance(run_id, str) or not re.fullmatch('[0-9a-f]{32}', run_id):
         raise ValueError('Invalid rehearsal ID')
     arn = context.execution_context.durable_execution_arn
-    context.step(lambda _: register(run_id, arn), name='register-execution')
+    context.step(lambda _: register_step(run_id, arn), name='register-execution')
     # Every MicroVM runs here, once, before Round 1 opens. Nothing after this line creates one.
-    launch_data, evidence = real_evidence(run_id, context)
+    launch_data, evidence, notes = real_evidence(run_id, context)
+    context.step(lambda _: timeline(run_id, lambda: evidence_lines(launch_data, evidence, notes)),
+                 name='timeline-evidence')
     scored = None
     previous_round = None
     for round_id in model.ROUND_IDS:
@@ -218,11 +395,8 @@ def handler(event: dict[str, Any], context: DurableContext) -> dict[str, str]:
             name=f'plan-{round_id}',
         )
         scored = context.step(lambda _: model.score(round_id, plan, scored, evidence), name=f'score-{round_id}')
-        context.step(lambda _: publish_results(run_id, round_id, scored), name=f'publish-results-{round_id}')
+        context.step(lambda _: publish_results_step(run_id, round_id, closed, scored),
+                     name=f'publish-results-{round_id}')
         previous_round = round_id
-    context.step(
-        lambda _: publish(run_id, arn, ('closing',), 'final', {'results_round': previous_round},
-                          expect_round=previous_round),
-        name='publish-final',
-    )
+    context.step(lambda _: publish_final_step(run_id, arn, previous_round, scored), name='publish-final')
     return {'id': run_id, 'execution_arn': arn}

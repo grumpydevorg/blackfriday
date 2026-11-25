@@ -441,9 +441,14 @@ def present(port: int, tailnet: bool = False) -> None:
     )['Parameter']['Value']
     local_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
     allowed_get = {'/', '/api/state', '/art/cloud-surge.png', '/art/cloud-surge.jpg', '/host', '/api/host/state', '/api/host/qr.svg', '/round.js', '/round.css'}
+    # The four-round pages load their script and styles as /round.js?v=<content hash> so a redeploy never pairs
+    # old JS with new HTML; the presenter's drawer polls /api/host/timeline.
+    versioned_asset = re.compile(r'/round\.(?:js|css)\?v=[0-9a-zA-Z_-]{1,64}')
     # The four-round game's presenter actions all live under /api/host/ (host_auth's rule). Start, Close and Reset
     # are bodyless; remove and logout carry a small JSON body. The older deployments keep their own routes.
     four = DEPLOYMENT == 'fourround'
+    if four:
+        allowed_get.add('/api/host/timeline')
     allowed_post = {f'/api/host/{action}' for action in ('start', 'close', 'reset')} if four else {
         f'/api/{action}' for action in ('launch', 'migrate', 'compare', 'reset')
     }
@@ -478,7 +483,7 @@ def present(port: int, tailnet: bool = False) -> None:
                 ):
                     self.send_error(403)
                     return
-            elif self.path not in allowed_get:
+            elif self.path not in allowed_get and not (four and versioned_asset.fullmatch(self.path)):
                 self.send_error(404)
                 return
             body = self.rfile.read(length) if length > 0 else b''
